@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  shell-check:
+    name: Shell scripts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check all scripts
+        run: |
+          for f in download-widevine.sh fix-drm.sh install.sh uninstall.sh; do
+            echo "Checking $f..."
+            bash -n "$f"
+          done
+
+      - name: Verify OS detection
+        run: |
+          OS=$(uname -s)
+          echo "Running on: $OS ($(uname -m))"
+          bash -c '
+            set -euo pipefail
+            OS=$(uname -s)
+            ARCH=$(uname -m)
+            if [ "$OS" = "Darwin" ]; then
+              if [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then
+                PLATFORM_KEY="Darwin_aarch64-gcc3"
+              elif [ "$ARCH" = "x86_64" ]; then
+                PLATFORM_KEY="Darwin_x86_64-gcc3-u-i386-x86_64"
+              fi
+            elif [ "$OS" = "Linux" ]; then
+              if [ "$ARCH" = "x86_64" ]; then
+                PLATFORM_KEY="Linux_x86_64-gcc3"
+              fi
+            fi
+            echo "Platform key: $PLATFORM_KEY"
+            [ -n "$PLATFORM_KEY" ]
+          '
+
+  download-test:
+    name: WidevineCdm download (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3 curl unzip
+
+      - name: Download WidevineCdm
+        run: bash download-widevine.sh /tmp/WidevineCdm
+
+      - name: Verify downloaded structure
+        run: |
+          test -f /tmp/WidevineCdm/manifest.json
+          test -d /tmp/WidevineCdm/_platform_specific/linux_x64
+          test -f /tmp/WidevineCdm/_platform_specific/linux_x64/libwidevinecdm.so
+          echo "WidevineCdm structure verified:"
+          find /tmp/WidevineCdm -type f
+
+  go-build:
+    name: Tray app build (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libayatana-appindicator3-dev gcc pkg-config
+
+      - name: Build tray app
+        working-directory: linux-app
+        run: |
+          go mod tidy
+          go build -o ../build/neon-tray .
+
+      - name: Verify binary
+        run: file build/neon-tray
+
+  macos-build:
+    name: macOS app build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build macOS app
+        run: bash app/build.sh
+
+      - name: Verify build output
+        run: |
+          test -d build/Neon.app
+          test -f build/Neon.app/Contents/MacOS/Neon
