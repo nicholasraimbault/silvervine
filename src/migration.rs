@@ -308,19 +308,65 @@ pub fn remove_legacy_with(
     cdm_destination: &Path,
 ) -> Result<MigrationOutcome> {
     let mut outcome = MigrationOutcome::default();
-    for art in install.artifacts {
+
+    // Pass 1: batch every elevation-required operation into a single
+    // shell script, then run that script under one `run_as_root_script`
+    // invocation. This turns N sudo/pkexec prompts into exactly one
+    // prompt regardless of how many legacy artifacts are present.
+    //
+    // Failure of any individual sub-command inside the script is
+    // tolerated (`|| true`) — best-effort cleanup that mirrors the
+    // previous per-call behavior. Surfaced errors come from the
+    // elevation itself, not the cleanup ops.
+    let mut root_script: Vec<String> = Vec::new();
+    let mut needs_systemd_reload = false;
+    for art in &install.artifacts {
         match art.kind {
             LegacyKind::MacLaunchDaemon => {
-                unload_and_remove_root(&art.path, "system", &mut outcome)?;
+                let p = sh_quote(&art.path)?;
+                root_script.push(format!(
+                    "launchctl unload -w {p} 2>/dev/null || true; rm -f {p}"
+                ));
+                outcome.removed.push(art.path.clone());
+            }
+            LegacyKind::LinuxSystemdPath => {
+                let p = sh_quote(&art.path)?;
+                root_script.push(format!(
+                    "systemctl disable --now neon-fix-drm.path 2>/dev/null || true; rm -f {p}"
+                ));
+                outcome.removed.push(art.path.clone());
+                needs_systemd_reload = true;
+            }
+            LegacyKind::LinuxSystemdService => {
+                let p = sh_quote(&art.path)?;
+                root_script.push(format!(
+                    "systemctl disable --now neon-fix-drm.service 2>/dev/null || true; rm -f {p}"
+                ));
+                outcome.removed.push(art.path.clone());
+                needs_systemd_reload = true;
+            }
+            // Non-elevated kinds handled in Pass 2.
+            _ => {}
+        }
+    }
+    if needs_systemd_reload {
+        root_script.push("systemctl daemon-reload 2>/dev/null || true".into());
+    }
+    if !root_script.is_empty() {
+        let script = root_script.join("\n");
+        let _ = platform::run_as_root_script(&script);
+    }
+
+    // Pass 2: user-level operations (no elevation).
+    for art in install.artifacts {
+        match art.kind {
+            LegacyKind::MacLaunchDaemon
+            | LegacyKind::LinuxSystemdPath
+            | LegacyKind::LinuxSystemdService => {
+                // Already handled in Pass 1.
             }
             LegacyKind::MacLaunchAgent => {
                 unload_and_remove_user(&art.path, &mut outcome)?;
-            }
-            LegacyKind::LinuxSystemdPath => {
-                disable_and_remove_systemd(&art.path, "neon-fix-drm.path", &mut outcome)?;
-            }
-            LegacyKind::LinuxSystemdService => {
-                disable_and_remove_systemd(&art.path, "neon-fix-drm.service", &mut outcome)?;
             }
             LegacyKind::LinuxAutostart => {
                 remove_user_path(&art.path, &mut outcome)?;
@@ -337,6 +383,19 @@ pub fn remove_legacy_with(
         }
     }
     Ok(outcome)
+}
+
+/// POSIX-shell-quote a path for safe inclusion in a shell command.
+///
+/// Wraps in single quotes and escapes any embedded single quotes via
+/// the standard `'\''` sequence. Returns an error if the path is not
+/// valid UTF-8.
+fn sh_quote(path: &Path) -> Result<String> {
+    let s = path
+        .to_str()
+        .ok_or_else(|| Error::other(format!("path not UTF-8: {}", path.display())))?;
+    let escaped = s.replace('\'', "'\\''");
+    Ok(format!("'{escaped}'"))
 }
 
 /// Result of a [`remove_legacy`] call.
@@ -372,20 +431,6 @@ pub struct SkipReason {
     pub reason: String,
 }
 
-/// `launchctl unload` (system domain) then remove the plist (root).
-fn unload_and_remove_root(plist: &Path, _scope: &str, out: &mut MigrationOutcome) -> Result<()> {
-    let plist_str = plist
-        .to_str()
-        .ok_or_else(|| Error::other(format!("plist path not UTF-8: {}", plist.display())))?;
-    // Best-effort unload — ignore failures here because the daemon may
-    // already be unloaded (system reboot since installed) or the binary
-    // it pointed to may no longer exist.
-    let _ = platform::run_as_root(&["launchctl", "unload", "-w", plist_str]);
-    let _ = platform::run_as_root(&["rm", "-f", plist_str]);
-    out.removed.push(plist.to_path_buf());
-    Ok(())
-}
-
 /// `launchctl unload` then remove the plist — user domain, no
 /// elevation required.
 fn unload_and_remove_user(plist: &Path, out: &mut MigrationOutcome) -> Result<()> {
@@ -403,24 +448,6 @@ fn unload_and_remove_user(plist: &Path, out: &mut MigrationOutcome) -> Result<()
         Error::from(e).with_path_context(format!("could not remove {}", plist.display()))
     })?;
     out.removed.push(plist.to_path_buf());
-    Ok(())
-}
-
-/// `systemctl disable --now <unit>` then `rm` the unit file (root).
-fn disable_and_remove_systemd(
-    unit_path: &Path,
-    unit_name: &str,
-    out: &mut MigrationOutcome,
-) -> Result<()> {
-    let unit_path_str = unit_path
-        .to_str()
-        .ok_or_else(|| Error::other(format!("unit path not UTF-8: {}", unit_path.display())))?;
-    // Best-effort disable. The unit may already be inactive.
-    let _ = platform::run_as_root(&["systemctl", "disable", "--now", unit_name]);
-    let _ = platform::run_as_root(&["rm", "-f", unit_path_str]);
-    // Reload systemd so the removed unit is forgotten.
-    let _ = platform::run_as_root(&["systemctl", "daemon-reload"]);
-    out.removed.push(unit_path.to_path_buf());
     Ok(())
 }
 
