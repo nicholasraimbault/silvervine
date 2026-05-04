@@ -2,15 +2,13 @@
 
 **Lead:** Claude (main session)
 **Team:** `neon-v2`
-**Active phase:** Phase 3 done — Phase 4 (CLI completion) next
+**Active phase:** Phase 5 — Distribution + docs (infra)
 
 ## Current focus
 
-Phase 3 complete. 343 tests passing (210 → 243 after platform → 343 after daemon), all four verification gates green. Both teams committed; working tree clean.
+Phase 4 complete. 456 tests passing (343 → 456, +113). All 13 subcommands wired. EME error-code translator with 14 codes across 5 services. Logging via tracing-subscriber with daily-rotated file appender at ~/.cache/neon/logs/. `neon --help` shows the full subcommand surface.
 
-Phase 3 ran serially (platform → daemon) per guardrails after the noctalia incident — no further desktop disruption. All cargo invocations used `--jobs 2` cap; `cargo tarpaulin` never invoked.
-
-Phase 4 spawns the **cli team** (next): wires up all 13 CLI subcommands (`init`, `setup`, `patch`, `status`, `list-browsers`, `doctor`, `test`, `update`, `repair`, `launch`, `uninstall`, `completion`, `manpage`) to call into the now-complete core-engine + platform + daemon modules. CLI team also implements EME error-code translation and the interactive first-run wizard. Phase 4 is a single-team phase per the orchestration plan.
+Phase 5 spawns infra team (single-team). Scope: final cargo-dist tuning, README rewrite, MIGRATION.md, ROADMAP.md (with V3 localhost-bridge note), CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md, CHANGELOG.md, .github/ISSUE_TEMPLATE/, GitHub repo settings, homebrew-neon final deprecation formula, smoke-test the installer on fresh VMs.
 
 ## Decisions made (recorded for handoff)
 
@@ -29,8 +27,9 @@ Phase 4 spawns the **cli team** (next): wires up all 13 CLI subcommands (`init`,
 | 1 — Core skeleton | **Done** | 8 commits; manifest, browsers, config, error, lockfile shipped; 95.38% coverage on owned modules |
 | 2 — Widevine + patching | **Done** | core-engine 87% / platform 88.7% coverage; 210 tests passing |
 | 2.x — Sudo batching fix | **Done** | migration's 5+ prompts → 1 prompt via `run_as_root_script` |
-| 3 — Daemon + tray + watcher | **Done** | platform: lifecycle + power; daemon: tray + watcher + IPC + notify + hooks + run(); 343 tests; serial spawn worked, no desktop disruption |
-| 4 — CLI completion | Pending | cli team (single-team phase) |
+| 3 — Daemon + tray + watcher | **Done** | platform: lifecycle + power; daemon: tray + watcher + IPC + notify + hooks + run(); 343 tests; serial spawn, no desktop disruption |
+| 4 — CLI completion | **Done** | 13 subcommands wired; EME translator (14 codes); tracing-subscriber logging; 456 tests |
+| 5 — Distribution + docs | In progress | infra team (single-team) |
 | 3 — Daemon | Pending | daemon + platform (parallel) |
 | 4 — CLI completion | Pending | cli sequential |
 | 5 — Distribution + docs | Pending | infra + platform |
