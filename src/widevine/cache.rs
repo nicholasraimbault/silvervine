@@ -158,6 +158,40 @@ pub fn ensure_cdm_for_with(
     Ok(CachedCdm::new(version, target_dir))
 }
 
+/// Resolve the currently-active CDM via the `current` symlink, wrapped
+/// in a [`crate::widevine::provider::LocalFileCdm`] so callers can pass
+/// it to [`crate::patch::patch_browser`] (which takes
+/// `&dyn CdmProvider`).
+///
+/// V3-Phase A scaffolding adapter: the existing [`current`] API stays
+/// in place; this is an additive helper that the CLI / daemon use to
+/// build a `CdmProvider` from the current cache state.
+///
+/// Returns `Ok(None)` if no CDM has been cached yet.
+///
+/// # Errors
+///
+/// See [`current`].
+pub fn current_provider() -> Result<Option<crate::widevine::provider::LocalFileCdm>> {
+    Ok(current()?
+        .as_ref()
+        .map(crate::widevine::provider::LocalFileCdm::from_cached))
+}
+
+/// Test-friendly variant of [`current_provider`] that accepts an
+/// arbitrary cache root.
+///
+/// # Errors
+///
+/// See [`current_in`].
+pub fn current_provider_in(
+    cache_root: &Path,
+) -> Result<Option<crate::widevine::provider::LocalFileCdm>> {
+    Ok(current_in(cache_root)?
+        .as_ref()
+        .map(crate::widevine::provider::LocalFileCdm::from_cached))
+}
+
 /// Resolve the currently-active CDM via the `current` symlink.
 ///
 /// Returns `Ok(None)` if no CDM has been cached yet.
@@ -960,5 +994,29 @@ mod tests {
         // `prune` calls default_cache_root then short-circuits on missing.
         let _ = prune(0);
         let _ = current();
+    }
+
+    /// V3-Phase A scaffolding: `current_provider_in` returns `None` when
+    /// no CDM has been cached, mirroring `current_in`'s contract.
+    #[test]
+    fn current_provider_in_returns_none_when_no_link() {
+        let tmp = TempDir::new().expect("tempdir");
+        let provider = current_provider_in(tmp.path()).expect("ok");
+        assert!(provider.is_none());
+    }
+
+    /// V3-Phase A scaffolding: `current_provider_in` wraps the resolved
+    /// CDM in a `LocalFileCdm` carrying the same version + dir.
+    #[test]
+    fn current_provider_in_wraps_resolved_cdm() {
+        let tmp = TempDir::new().expect("tempdir");
+        make_cached_version(tmp.path(), "5.5.5");
+        advance_current(tmp.path(), "5.5.5").expect("advance");
+        let provider = current_provider_in(tmp.path()).expect("ok").expect("some");
+        assert_eq!(
+            crate::widevine::provider::CdmProvider::version(&provider),
+            "5.5.5"
+        );
+        assert_eq!(provider.source_dir(), tmp.path().join("5.5.5"));
     }
 }
