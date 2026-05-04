@@ -2,102 +2,149 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, v2-rust-rewrite]
   pull_request:
-    branches: [master]
+    branches: [master, v2-rust-rewrite]
+
+# Cancel previous in-flight runs on the same ref to save CI minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: short
+  CARGO_NET_RETRY: 10
 
 jobs:
-  shell-check:
-    name: Shell scripts (${{ matrix.os }})
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Syntax check all scripts
-        run: |
-          for f in download-widevine.sh fix-drm.sh install.sh uninstall.sh; do
-            echo "Checking $f..."
-            bash -n "$f"
-          done
-
-      - name: Verify OS detection
-        run: |
-          OS=$(uname -s)
-          echo "Running on: $OS ($(uname -m))"
-          bash -c '
-            set -euo pipefail
-            OS=$(uname -s)
-            ARCH=$(uname -m)
-            if [ "$OS" = "Darwin" ]; then
-              if [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then
-                PLATFORM_KEY="Darwin_aarch64-gcc3"
-              elif [ "$ARCH" = "x86_64" ]; then
-                PLATFORM_KEY="Darwin_x86_64-gcc3-u-i386-x86_64"
-              fi
-            elif [ "$OS" = "Linux" ]; then
-              if [ "$ARCH" = "x86_64" ]; then
-                PLATFORM_KEY="Linux_x86_64-gcc3"
-              fi
-            fi
-            echo "Platform key: $PLATFORM_KEY"
-            [ -n "$PLATFORM_KEY" ]
-          '
-
-  download-test:
-    name: WidevineCdm download (Linux)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3 curl unzip
-
-      - name: Download WidevineCdm
-        run: bash download-widevine.sh /tmp/WidevineCdm
-
-      - name: Verify downloaded structure
-        run: |
-          test -f /tmp/WidevineCdm/manifest.json
-          test -d /tmp/WidevineCdm/_platform_specific/linux_x64
-          test -f /tmp/WidevineCdm/_platform_specific/linux_x64/libwidevinecdm.so
-          echo "WidevineCdm structure verified:"
-          find /tmp/WidevineCdm -type f
-
-  go-build:
-    name: Tray app build (Linux)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: '1.21'
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libayatana-appindicator3-dev gcc pkg-config
-
-      - name: Build tray app
-        working-directory: linux-app
-        run: |
-          go mod tidy
-          go build -o ../build/neon-tray .
-
-      - name: Verify binary
-        run: file build/neon-tray
-
-  macos-build:
-    name: macOS app build
-    runs-on: macos-latest
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Build macOS app
-        run: bash app/build.sh
-
-      - name: Verify build output
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - name: Install Linux daemon dev deps
+        if: matrix.os == 'ubuntu-latest'
         run: |
-          test -d build/Neon.app
-          test -f build/Neon.app/Contents/MacOS/Neon
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev pkg-config
+      - run: cargo test --all-features --no-fail-fast
+
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources
+          # NOTE: 'advisories' is run via cargo-audit job above. cargo-deny
+          # versions <0.17 fail to parse some CVSS-4.0 advisories; once the
+          # action ships a newer cargo-deny by default, fold 'advisories' here.
+
+  build-release:
+    name: cargo build --release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.os }}
+      - name: Install Linux daemon dev deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev pkg-config
+      - run: cargo build --release --verbose
+
+  coverage:
+    name: tarpaulin coverage
+    runs-on: ubuntu-latest
+    # Allow coverage to fail (will tighten as code lands; spec gate is 70% by ship time).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tarpaulin
+      - name: Install Linux daemon dev deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev pkg-config
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+      - run: cargo tarpaulin --out Xml --workspace --skip-clean --timeout 300
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: cobertura.xml
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  msrv:
+    name: MSRV (1.75)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.75
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: Install Linux daemon dev deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev pkg-config
+      - run: cargo build --verbose
