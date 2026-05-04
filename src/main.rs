@@ -142,6 +142,16 @@ enum Command {
 
     /// Generate the man page in roff format.
     Manpage,
+
+    /// Bridge a URL to a guest VM with hardware-backed Widevine
+    /// (experimental; requires the `experimental-bridge` Cargo feature).
+    ///
+    /// V3-Phase A scaffolding ships this as a stub that returns a
+    /// "queued for V3" error pointing at ROADMAP.md. The real
+    /// implementation (QEMU/KVM + Win11 IoT LTSC + Looking Glass +
+    /// GPU/TPM passthrough) lands after V1.0 stabilizes.
+    #[cfg(feature = "experimental-bridge")]
+    Stream(neon::cli::stream::Args),
 }
 
 /// Reporting opt-in flag for `setup --reporting=...`.
@@ -245,6 +255,8 @@ fn dispatch(cmd: Command, output: cli::OutputOptions) -> neon::Result<()> {
         }
         Command::Completion { shell } => cli::completion::run(shell, Cli::command),
         Command::Manpage => cli::manpage::run(Cli::command),
+        #[cfg(feature = "experimental-bridge")]
+        Command::Stream(args) => cli::stream::run(&args),
     }
 }
 

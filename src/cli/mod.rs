@@ -51,6 +51,12 @@ pub mod test;
 pub mod uninstall;
 pub mod update;
 
+/// `neon stream <url>` — V3 experimental localhost-bridge stub.
+///
+/// Only compiled when the `experimental-bridge` Cargo feature is on.
+#[cfg(feature = "experimental-bridge")]
+pub mod stream;
+
 /// Common output style flags that apply to every subcommand.
 ///
 /// Built once in `main.rs` from the global flags and passed down by
