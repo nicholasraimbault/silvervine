@@ -1,0 +1,78 @@
+{
+  "hashFunction": "sha512",
+  "name": "Widevine-4.10.2934.0",
+  "schema_version": 1000,
+  "vendors": {
+    "gmp-widevinecdm": {
+      "platforms": {
+        "Darwin_aarch64-gcc3": {
+          "fileUrl": "https://edgedl.me.gvt1.com/edgedl/release2/chrome_component/iqgovvpzjwyxc6oxues6222i2a_4.10.2934.0/oimompecagnajdejgnnjijobebaeigek_4.10.2934.0_mac_arm64_pzvnm3hehokauvrs333nzaa4p4.crx3",
+          "mirrorUrls": [
+            "https://www.google.com/dl/release2/chrome_component/iqgovvpzjwyxc6oxues6222i2a_4.10.2934.0/oimompecagnajdejgnnjijobebaeigek_4.10.2934.0_mac_arm64_pzvnm3hehokauvrs333nzaa4p4.crx3"
+          ],
+          "filesize": 17514856,
+          "hashValue": "7b279cf1ff7cc74fd8520e9f50d4a98de4c6cc29262b716bc48121fe0f46cfa314b968bc9915bd949e8cf1078193e9cab94d3d0857c88ecadda5051ace806e83"
+        },
+        "Darwin_x86_64-gcc3": {
+          "alias": "Darwin_x86_64-gcc3-u-i386-x86_64"
+        },
+        "Darwin_x86_64-gcc3-u-i386-x86_64": {
+          "fileUrl": "https://edgedl.me.gvt1.com/edgedl/release2/chrome_component/accitwcyn6flxyukecadxdmkml6a_4.10.2934.0/oimompecagnajdejgnnjijobebaeigek_4.10.2934.0_mac64_b4s45s2ntme4mh2ae442ui3uoa.crx3",
+          "mirrorUrls": [
+            "https://www.google.com/dl/release2/chrome_component/accitwcyn6flxyukecadxdmkml6a_4.10.2934.0/oimompecagnajdejgnnjijobebaeigek_4.10.2934.0_mac64_b4s45s2ntme4mh2ae442ui3uoa.crx3"
+          ],
+          "filesize": 19645302,
+          "hashValue": "d013968c735c6e9aa79b51a2f5867438c7136761c51e23efd9d4babe37d7ab47166b36b1118a5080fef6a4ddd11d88d6f314e7bf492d87886217bd46c33d6b1e"
+        },
+        "Linux_x86_64-gcc3": {
+          "fileUrl": "https://edgedl.me.gvt1.com/edgedl/release2/chrome_component/accssjtqfpf5qicscrptql4jyyxa_4.10.2934.0/oimompecagnajdejgnnjijobebaeigek_4.10.2934.0_linux_ph722a3wl2goebkpserszm6bde.crx3",
+          "mirrorUrls": [
+            "https://www.google.com/dl/release2/chrome_component/accssjtqfpf5qicscrptql4jyyxa_4.10.2934.0/oimompecagnajdejgnnjijobebaeigek_4.10.2934.0_linux_ph722a3wl2goebkpserszm6bde.crx3"
+          ],
+          "filesize": 18257362,
+          "hashValue": "421214210a09a9f9ed8ce482ef857f1c2b29ce1739240d1ec99a61caa3d80db3393752275722bdf5f503489f12a753215fe8a0c82de3aca23780d4ffe5792eb1"
+        },
+        "Linux_x86_64-gcc3-asan": {
+          "alias": "Linux_x86_64-gcc3"
+        },
+        "WINNT_aarch64-msvc-aarch64": {
+          "fileUrl": "https://edgedl.me.gvt1.com/edgedl/release2/chrome_component/j3jerqglrggdcctydo4viuuqni_4.10.2934.0/oimompecagnajdejgnnjijobebaeigek_4.10.2934.0_win_arm64_b6duoc3xh352l22otaq76ygmje.crx3",
+          "mirrorUrls": [
+            "https://www.google.com/dl/release2/chrome_component/j3jerqglrggdcctydo4viuuqni_4.10.2934.0/oimompecagnajdejgnnjijobebaeigek_4.10.2934.0_win_arm64_b6duoc3xh352l22otaq76ygmje.crx3"
+          ],
+          "filesize": 17139276,
+          "hashValue": "2bb335e3644b338a4f23d39e267b5c9be0c2ae76845d3f67004b9ed0d106d7c147cee0aecdacda1a4e91d2f5a2f337c3146f1f8412a872852796fbf0df8778c5"
+        },
+        "WINNT_x86-msvc": {
+          "fileUrl": "https://edgedl.me.gvt1.com/edgedl/release2/chrome_component/b5f6gt7c745ffepy4nwnyldjqa_4.10.2934.0/oimompecagnajdejgnnjijobebaeigek_4.10.2934.0_win32_act3kiwiguu3lqqpv5zdks76qhdq.crx3",
+          "mirrorUrls": [
+            "https://www.google.com/dl/release2/chrome_component/b5f6gt7c745ffepy4nwnyldjqa_4.10.2934.0/oimompecagnajdejgnnjijobebaeigek_4.10.2934.0_win32_act3kiwiguu3lqqpv5zdks76qhdq.crx3"
+          ],
+          "filesize": 18800167,
+          "hashValue": "fc66f48a07ad548fd5bf044aff79a5b4ec46fc958b33887a022ad49230e6c62b50cfbeac6e7ea342f6c4342642f703cab6c2bfb83eae27f35d22050ed4cb3691"
+        },
+        "WINNT_x86-msvc-x64": {
+          "alias": "WINNT_x86-msvc"
+        },
+        "WINNT_x86-msvc-x86": {
+          "alias": "WINNT_x86-msvc"
+        },
+        "WINNT_x86_64-msvc": {
+          "fileUrl": "https://edgedl.me.gvt1.com/edgedl/release2/chrome_component/adbofghzjaen4gxyqi36bdfe7gca_4.10.2934.0/oimompecagnajdejgnnjijobebaeigek_4.10.2934.0_win64_adianl7rztaqzxcgoyp2kroszbfa.crx3",
+          "mirrorUrls": [
+            "https://www.google.com/dl/release2/chrome_component/adbofghzjaen4gxyqi36bdfe7gca_4.10.2934.0/oimompecagnajdejgnnjijobebaeigek_4.10.2934.0_win64_adianl7rztaqzxcgoyp2kroszbfa.crx3"
+          ],
+          "filesize": 19860024,
+          "hashValue": "7b07d200b5a5dfa88e22cc293be9f9fe0f26e3b927ca0222958c08db650590907bba852083562577b49f58edae676594ba4a1d8163bf07f102311a77694c0c8e"
+        },
+        "WINNT_x86_64-msvc-x64": {
+          "alias": "WINNT_x86_64-msvc"
+        },
+        "WINNT_x86_64-msvc-x64-asan": {
+          "alias": "WINNT_x86_64-msvc"
+        }
+      },
+      "version": "4.10.2934.0"
+    }
+  }
+}
