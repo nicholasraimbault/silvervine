@@ -78,7 +78,19 @@ Apple deprecated `codesign --deep` as of macOS 13. V1 still uses it because that
 
 ## V3 stretch goal — `neon localhost-bridge` (experimental)
 
-**Status:** behind a Cargo feature flag `experimental-bridge`. Not in V1 or V2. Build candidate after V2 ships and we have bandwidth.
+**Status:** behind a Cargo feature flag `experimental-bridge`. Architectural scaffolding (feature flag, stub `neon stream` subcommand, `CdmProvider` trait, `bridge` module skeleton) ships in V1.0 alongside V2's stable surface. The real V3 implementation lands incrementally after V1.0 stabilizes.
+
+- Architecture and scaffolding plan: [V3 scaffolding plan](docs/superpowers/specs/2026-05-04-neon-v3-localhost-bridge-scaffolding-plan.md)
+- Six-sub-phase orchestration: [V3 orchestration plan](docs/superpowers/plans/2026-05-04-neon-v3-orchestration-plan.md)
+
+Activated by:
+
+```sh
+cargo install neon --features experimental-bridge
+```
+
+Enables a `neon stream <url>` subcommand. In V1.0 binaries it returns a "queued for V3" stub error pointing back here; subsequent V3 phases (B → C → D → F) fill it in.
+
 
 The L3 ceiling is real. There's no software path to 4K HDR on a de-Googled Chromium fork. But there's a hardware path: a Win11 IoT VM with GPU + TPM passthrough, running Edge or Chrome with a real signed Widevine binary, streamed back to the host via Looking Glass.
 

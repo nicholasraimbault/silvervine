@@ -182,6 +182,44 @@ The codebase is split by team ownership boundary, with each team owning a slice 
 
 Cross-team interfaces are stable; teams don't reach into each other's internals. See the per-team handoff docs for public API contracts.
 
+## Experimental features
+
+Neon ships some features behind Cargo feature flags so they don't bloat the default binary or expose half-finished surface. The current experimental flag is `experimental-bridge`, scaffolding for the V3 localhost-bridge feature (see [ROADMAP.md](ROADMAP.md#v3-stretch-goal-neon-localhost-bridge-experimental) and [the V3 scaffolding plan](docs/superpowers/specs/2026-05-04-neon-v3-localhost-bridge-scaffolding-plan.md)).
+
+### Activating an experimental feature
+
+```sh
+cargo install neon --features experimental-bridge
+```
+
+Or, building from source:
+
+```sh
+cargo build --features experimental-bridge
+cargo test --features experimental-bridge --lib --jobs 2
+```
+
+### What `experimental-bridge` enables (in V1.0 binaries)
+
+- The `neon stream <url>` subcommand becomes visible in `neon --help`.
+- Invoking `neon stream <url>` returns a **stub error** pointing at ROADMAP.md — V1.0 ships only the architectural seam, not the V3 implementation.
+- The `neon::bridge` module is compiled into the library crate; nothing else is reachable yet.
+
+Default builds (no flag) compile **none** of the V3 code; the binary is byte-equivalent to V1.0's stable surface.
+
+### Adding a new experimental feature
+
+When you propose a new experimental feature, add a Cargo feature in this shape:
+
+```toml
+[features]
+default = []
+experimental = []
+experimental-<name> = ["experimental"]
+```
+
+The `experimental` umbrella exists so future flags can require it (e.g. for shared scaffolding). Document the new flag in this section so users know what they're opting into.
+
 ## Code of Conduct
 
 Neon follows the [Contributor Covenant 2.1](CODE_OF_CONDUCT.md). Be excellent to each other.
