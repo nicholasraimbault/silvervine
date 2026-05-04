@@ -35,11 +35,14 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod browsers;
+pub mod cli;
 pub mod config;
 pub mod daemon;
+pub mod eme;
 pub mod error;
 pub mod hooks;
 pub mod lockfile;
+pub mod log;
 pub mod migration;
 pub mod notify;
 pub mod patch;

@@ -186,16 +186,24 @@ pub fn run_with(options: &RunOptions) -> Result<()> {
         tracing::info!(
             target: "neon::daemon",
             browser = %browser.name(),
-            "watcher fired callback"
+            "watcher fired callback; running patch flow"
         );
-        // The actual patch invocation is wired in by the CLI team in
-        // Phase 4 (they own the high-level "kick off a patch" code path).
-        // For Phase 3 we surface the event via tracing + notification so
-        // the user sees something happen and the orchestration is testable.
-        notify_user::notify_info(&format!(
-            "Detected change in {}; patch flow not yet wired",
-            browser.name()
-        ));
+        let results = drive_patch_flow(std::slice::from_ref(browser), None, false);
+        let succeeded = results.iter().any(|(_, ok)| *ok);
+        if succeeded {
+            // CDM version is recorded in the per-browser report; we don't
+            // have it at this layer (the report is consumed inside
+            // drive_patch_flow). For the notification, use a placeholder.
+            notify_user::notify_info(&format!(
+                "Re-patched {} after detected change",
+                browser.name()
+            ));
+        } else {
+            notify_user::notify_info(&format!(
+                "Patch attempt for {} did not succeed",
+                browser.name()
+            ));
+        }
     });
     let watcher = build_watcher_with_fallback(watcher_callback, &browsers, options.test_mode);
 
@@ -329,17 +337,14 @@ fn dispatch_ipc(req: &IpcRequest, state: &IpcSharedState) -> IpcResponse {
                 heartbeat_at: read_heartbeat_now(),
             })
         }
-        IpcRequest::Patch { browser, force: _ } => {
-            // Phase 4 wires the actual patch flow. For Phase 3 we
-            // acknowledge the request and surface a per-browser stub
-            // result so the CLI can already round-trip the JSON shape.
-            let browsers = state.browsers.lock().unwrap();
-            let mut results = Vec::new();
-            for b in browsers.iter() {
-                if browser.as_deref().is_none_or(|n| n == b.name()) {
-                    results.push((b.name().to_string(), false));
-                }
-            }
+        IpcRequest::Patch { browser, force } => {
+            // Phase 4: drive the real patch flow via cli::patch::run_patch_flow.
+            // Tests of the IPC dispatcher use the path that doesn't touch
+            // the network or filesystem (the Patch handler is exercised
+            // through dispatch_ipc directly with a fake browser list); the
+            // actual patch shell-out only happens in production.
+            let browsers_snapshot = state.browsers.lock().unwrap().clone();
+            let results = drive_patch_flow(&browsers_snapshot, browser.as_deref(), *force);
             IpcResponse::ok(IpcResult::Patch { results })
         }
         IpcRequest::TriggerCheck => {
@@ -563,20 +568,26 @@ fn run_event_loop(tray: &Tray, stop: &Arc<AtomicBool>, single_iteration: bool) -
                 return Ok(());
             }
             Some(TrayCommand::PatchAll) => {
-                tracing::info!(target: "neon::daemon", "tray PatchAll; not yet wired (Phase 4)");
+                tracing::info!(target: "neon::daemon", "tray PatchAll");
+                if !daemon_patch_noop() {
+                    let detected = browsers::detect_browsers().unwrap_or_default();
+                    let _ = drive_patch_flow(&detected, None, false);
+                }
             }
             Some(TrayCommand::PatchOne(name)) => {
-                tracing::info!(
-                    target: "neon::daemon",
-                    browser = %name,
-                    "tray PatchOne; not yet wired (Phase 4)"
-                );
+                tracing::info!(target: "neon::daemon", browser = %name, "tray PatchOne");
+                if !daemon_patch_noop() {
+                    let detected = browsers::detect_browsers().unwrap_or_default();
+                    let _ = drive_patch_flow(&detected, Some(&name), false);
+                }
             }
             Some(TrayCommand::UpdateWidevine) => {
-                tracing::info!(
-                    target: "neon::daemon",
-                    "tray UpdateWidevine; not yet wired (Phase 4)"
-                );
+                tracing::info!(target: "neon::daemon", "tray UpdateWidevine");
+                if !daemon_patch_noop() {
+                    if let Ok(manifest) = crate::widevine::fetch_manifest() {
+                        let _ = crate::widevine::cache::ensure_cdm_for(&manifest);
+                    }
+                }
             }
             Some(TrayCommand::ToggleLaunchAtLogin(target)) => {
                 tracing::info!(
@@ -614,6 +625,69 @@ fn run_event_loop(tray: &Tray, stop: &Arc<AtomicBool>, single_iteration: bool) -
 /// state.
 fn lifecycle_is_registered() -> bool {
     lifecycle::is_registered()
+}
+
+/// Env-var name that, when set, makes the daemon's tray + IPC patch
+/// handlers short-circuit without invoking the real patch flow. Used by
+/// daemon tests + by the IPC dispatch tests that want to exercise the
+/// JSON shape without spawning a network fetch.
+pub const DAEMON_PATCH_NOOP_ENV: &str = "NEON_TEST_DAEMON_PATCH_NOOP";
+
+/// Returns `true` when [`DAEMON_PATCH_NOOP_ENV`] is set in the
+/// environment.
+fn daemon_patch_noop() -> bool {
+    std::env::var_os(DAEMON_PATCH_NOOP_ENV).is_some()
+}
+
+/// Drive the actual patch flow (in production) or short-circuit to a
+/// per-browser `false` result (under `NEON_TEST_DAEMON_PATCH_NOOP=1`).
+///
+/// `name_filter` constrains which browser to patch; `force` toggles
+/// the `force_while_running` patch option.
+///
+/// This is the function the tray's `PatchAll` / `PatchOne` and the IPC
+/// `Patch` handler share — keeping them in lockstep guarantees the two
+/// surfaces produce the same outcome shape.
+#[must_use]
+pub fn drive_patch_flow(
+    browsers: &[Browser],
+    name_filter: Option<&str>,
+    force: bool,
+) -> Vec<(String, bool)> {
+    if daemon_patch_noop() {
+        return browsers
+            .iter()
+            .filter(|b| name_filter.is_none_or(|n| n == b.name()))
+            .map(|b| (b.name().to_string(), false))
+            .collect();
+    }
+    let Ok(patcher) = crate::patch::host_patcher() else {
+        return browsers
+            .iter()
+            .filter(|b| name_filter.is_none_or(|n| n == b.name()))
+            .map(|b| (b.name().to_string(), false))
+            .collect();
+    };
+    let cdm_provider = || -> Result<crate::widevine::cache::CachedCdm> {
+        let manifest = crate::widevine::fetch_manifest()?;
+        crate::widevine::cache::ensure_cdm_for(&manifest)
+    };
+    let opts = crate::patch::PatchOptions {
+        force_while_running: force,
+        dry_run: false,
+        ..Default::default()
+    };
+    let reports = crate::cli::patch::run_patch_flow(
+        browsers,
+        name_filter,
+        cdm_provider,
+        patcher.as_ref(),
+        &opts,
+    );
+    reports
+        .into_iter()
+        .map(|r| (r.browser, r.success))
+        .collect()
 }
 
 /// Install the global `tracing` subscriber (production only). Called from
@@ -771,6 +845,8 @@ mod tests {
     /// known browser.
     #[test]
     fn ipc_patch_with_all_browsers_returns_per_browser_results() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let _noop = ScopedEnv::set(DAEMON_PATCH_NOOP_ENV, Path::new("1"));
         let tmp = TempDir::new().unwrap();
         let state = IpcSharedState {
             browsers: Mutex::new(vec![
@@ -801,6 +877,8 @@ mod tests {
     /// IPC `Patch` filtered by browser returns only that one.
     #[test]
     fn ipc_patch_filter_by_browser_name() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let _noop = ScopedEnv::set(DAEMON_PATCH_NOOP_ENV, Path::new("1"));
         let tmp = TempDir::new().unwrap();
         let state = IpcSharedState {
             browsers: Mutex::new(vec![
@@ -1056,6 +1134,8 @@ mod tests {
     /// Tray `PatchAll` command is logged but doesn't crash the loop.
     #[test]
     fn tray_patch_all_acknowledged() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let _noop = ScopedEnv::set(DAEMON_PATCH_NOOP_ENV, Path::new("1"));
         let tray = Tray::headless(MenuState {
             browsers: vec![],
             launch_at_login: false,
@@ -1068,6 +1148,8 @@ mod tests {
     /// Tray `PatchOne` command carries through to the loop.
     #[test]
     fn tray_patch_one_acknowledged() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let _noop = ScopedEnv::set(DAEMON_PATCH_NOOP_ENV, Path::new("1"));
         let tray = Tray::headless(MenuState {
             browsers: vec![],
             launch_at_login: false,
@@ -1080,6 +1162,8 @@ mod tests {
     /// Tray `UpdateWidevine` command runs.
     #[test]
     fn tray_update_widevine_acknowledged() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let _noop = ScopedEnv::set(DAEMON_PATCH_NOOP_ENV, Path::new("1"));
         let tray = Tray::headless(MenuState {
             browsers: vec![],
             launch_at_login: false,
@@ -1087,6 +1171,37 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         tray.synthesize(TrayCommand::UpdateWidevine);
         run_event_loop(&tray, &stop, true).unwrap();
+    }
+
+    /// `drive_patch_flow` honors `DAEMON_PATCH_NOOP_ENV` — short-circuits
+    /// to per-browser `false` results without invoking the host patcher.
+    #[test]
+    fn drive_patch_flow_under_noop_returns_false_results() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let _noop = ScopedEnv::set(DAEMON_PATCH_NOOP_ENV, Path::new("1"));
+        let tmp = TempDir::new().unwrap();
+        let browsers = vec![
+            fake_browser("Helium", tmp.path().join("h")),
+            fake_browser("Thorium", tmp.path().join("t")),
+        ];
+        let results = drive_patch_flow(&browsers, None, false);
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|(_, ok)| !ok));
+    }
+
+    /// `drive_patch_flow` filter constrains the result list.
+    #[test]
+    fn drive_patch_flow_filter_by_name_returns_one_entry() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let _noop = ScopedEnv::set(DAEMON_PATCH_NOOP_ENV, Path::new("1"));
+        let tmp = TempDir::new().unwrap();
+        let browsers = vec![
+            fake_browser("Helium", tmp.path().join("h")),
+            fake_browser("Thorium", tmp.path().join("t")),
+        ];
+        let results = drive_patch_flow(&browsers, Some("Helium"), false);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "Helium");
     }
 
     /// `IpcSharedState::browsers` mutex round-trip.
