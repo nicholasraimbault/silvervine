@@ -2,11 +2,11 @@
 
 **Lead:** Claude (main session)
 **Team:** `neon-v2`
-**Active phase:** Phase 0 — Foundation
+**Active phase:** Phase 1 — Core skeleton
 
 ## Current focus
 
-Phase 0 in progress: infra team is establishing the Cargo workspace, CI matrix, cargo-dist release pipeline, Dependabot/auto-merge config, Cloudflare Worker scaffolding, and security baselines.
+Phase 1 in progress: core-engine team writing manifest parsing, browser detection, custom-paths config, error type, lockfile, and test fixtures. CLI's Phase 1 scope (clap subcommand stubs) was completed by infra during Phase 0; CLI team activates again in Phase 4.
 
 ## Decisions made (recorded for handoff)
 
@@ -19,8 +19,8 @@ Phase 0 in progress: infra team is establishing the Cargo workspace, CI matrix, 
 
 | Phase | Status | Notes |
 |---|---|---|
-| 0 — Foundation | In progress | infra team only |
-| 1 — Core skeleton | Pending | core-engine + cli (parallel) |
+| 0 — Foundation | **Done** | 6 commits on `v2-rust-rewrite`; infra agent reports complete; verified locally (build + fmt + clippy green) |
+| 1 — Core skeleton | In progress | core-engine team (cli scope preempted by infra during Phase 0 stubs) |
 | 2 — Widevine + patching | Pending | core-engine + platform (parallel) |
 | 3 — Daemon | Pending | daemon + platform (parallel) |
 | 4 — CLI completion | Pending | cli sequential |
@@ -29,7 +29,10 @@ Phase 0 in progress: infra team is establishing the Cargo workspace, CI matrix, 
 
 ## Active blockers
 
-None.
+**Pending Nick action items (non-blocking for code work, blocking for full V2 launch):**
+1. Branch protection rules on `master` and `v2-rust-rewrite` — `gh api` commands ready in `docs/superpowers/teams/infra/handoff.md`
+2. Cloudflare Worker deployment — runbook in `cloudflare-worker/README.md`; needs `wrangler login` + D1 setup
+3. (Optional) Re-enable GitHub Issues on the repo; set `CODECOV_TOKEN` secret
 
 ## Decision log
 
