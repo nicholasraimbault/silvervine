@@ -80,6 +80,27 @@ notify = "8"
 # musl static-build story clean and removes a system C library
 # dependency that's not installed on minimal distros.
 tray-icon = { version = "0.23", default-features = false }
+# Interactive prompts for `neon init`. The default features are fine for
+# our use; the crate gracefully falls back to non-interactive mode when
+# stdin isn't a TTY (we explicit-check `is_terminal()` at the call sites
+# anyway so we can switch to defaults without prompting).
+dialoguer = { version = "0.11", default-features = false }
+# Cross-platform terminal control for `neon status --watch`. We use only
+# the cursor + clear primitives; no async event polling needed.
+crossterm = { version = "0.27", default-features = false }
+# Shell completion script generation for `neon completion <shell>`.
+clap_complete = "4.5"
+# Man-page generation for `neon manpage`.
+clap_mangen = "0.2"
+# Self-update for `neon update self`. We use the rustls TLS backend to
+# stay consistent with the rest of the project; signature verification
+# (zipsign) is deferred to V1.1.
+self_update = { version = "0.41", default-features = false, features = ["rustls"] }
+# URL-encoding for the `neon doctor --share` issue-template URL builder.
+urlencoding = "2"
+# Tracing subscriber's rolling-file appender — used by `crate::log` to
+# rotate the daemon's `~/.cache/neon/logs/neon.log`.
+tracing-appender = "0.2"
 
 # macOS-specific deps: ObjC FFI for NSWorkspace wake notifications.
 # `block2` is required because NSNotificationCenter takes a block-typed
