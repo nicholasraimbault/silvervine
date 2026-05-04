@@ -189,6 +189,37 @@ pub fn run_as_root(command: &[&str]) -> Result<Output> {
     imp::run_as_root(command)
 }
 
+/// Run a shell script under a single elevated invocation.
+///
+/// Use this when you have multiple privileged operations to perform —
+/// it batches them all into one `pkexec` / `sudo` / `osascript` prompt
+/// instead of prompting per operation. Critical for UX: a flow that
+/// needs to remove three systemd units and reload should not fire four
+/// password dialogs.
+///
+/// `script` is passed to `sh -c` (Linux) or to `osascript`'s shell-out
+/// (macOS), so it must be POSIX-shell-safe. Caller is responsible for
+/// quoting paths that may contain whitespace or shell metacharacters.
+///
+/// Honors `NEON_TEST_ESCALATE_NOOP=1` like [`run_as_root`].
+///
+/// # Errors
+///
+/// * [`crate::ErrorCategory::Other`] if `script` is empty after trimming.
+/// * [`crate::ErrorCategory::UnsupportedPlatform`] on platforms with no
+///   known elevation path.
+/// * [`crate::ErrorCategory::Other`] if the elevation tool itself fails
+///   to spawn (e.g. neither `pkexec` nor `sudo` are installed on Linux).
+pub fn run_as_root_script(script: &str) -> Result<Output> {
+    if script.trim().is_empty() {
+        return Err(Error::other("run_as_root_script called with empty script"));
+    }
+    if std::env::var_os("NEON_TEST_ESCALATE_NOOP").is_some() {
+        return Ok(noop_output());
+    }
+    imp::run_as_root(&["sh", "-c", script])
+}
+
 /// Atomic rename helper used by [`crate::patch`] (via core-engine's
 /// `patch::backup`).
 ///
