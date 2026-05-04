@@ -36,6 +36,13 @@ url = "2"
 dirs = "5"
 # `flock`-based exclusive lockfile.
 fs2 = "0.4"
+# SHA-512 verification for the Widevine CRX3 download (Phase 2).
+sha2 = "0.10"
+# CRX3 ZIP body extraction. Default features pull lots of compression
+# methods we don't need; only deflate is required for Mozilla's CRX3.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# Process scanning for browser-running detection (Phase 2).
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # Direct FFI for `renameat2(RENAME_EXCHANGE)` (Linux) and
 # `renameatx_np(RENAME_SWAP)` (macOS): used by `crate::platform` for the
 # atomic-rename helper. nix's renameat2 wrapper is gated on

@@ -39,6 +39,7 @@ pub mod config;
 pub mod error;
 pub mod lockfile;
 pub mod migration;
+pub mod patch;
 pub mod platform;
 pub mod widevine;
 
