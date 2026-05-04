@@ -2,15 +2,17 @@
 
 **Lead:** Claude (main session)
 **Team:** `neon-v2`
-**Active phase:** Phase 2 — Widevine + atomic patching
+**Active phase:** Phase 2 — Widevine + atomic patching (closing out)
 
 ## Current focus
 
-Phase 2 in progress: core-engine + platform teams in parallel.
-- core-engine: Widevine download/extract/cache, atomic patch protocol, backup/rollback, browser-running detection
-- platform: Linux + macOS patch impls, migration logic for old bash-installed Neon
+Phase 2 nearly complete:
+- **platform team: done** (5 commits, 88.72% coverage on owned modules, handoff doc updated)
+- **core-engine team: commits landed, awaiting handoff doc update + completion message** — sent them a status-check ping
 
-Phase 1 complete (78 unit + integration tests passing, 95.38% coverage). MSRV bumped 1.75→1.85 (clap_lex 1.1+ requires edition2024).
+210 tests passing locally; fmt + clippy clean across the workspace.
+
+Phase 1 complete (78+ unit/integration tests, 95.38% coverage on Phase 1 modules). MSRV bumped 1.75→1.85.
 
 ## Decisions made (recorded for handoff)
 
