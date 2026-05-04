@@ -9,6 +9,8 @@
 //! * [`widevine`] — Mozilla manifest fetch + (in Phase 2) CRX3 download/extract.
 //! * [`config`] — global `~/.config/neon/config.toml` schema.
 //! * [`lockfile`] — `flock`-based exclusive lock helper.
+//! * [`platform`] — XDG/Apple paths, privilege escalation, atomic-rename.
+//! * [`migration`] — detect + remove legacy (V1) Neon installs.
 //!
 //! Phase 1 scope is the public API surface that Phase 2 (download + atomic
 //! patching) will consume. Phase 1 deliberately ships **no platform syscalls**
@@ -36,6 +38,7 @@ pub mod browsers;
 pub mod config;
 pub mod error;
 pub mod lockfile;
+pub mod migration;
 pub mod platform;
 pub mod widevine;
 
