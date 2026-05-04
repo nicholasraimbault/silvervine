@@ -30,7 +30,7 @@ use crate::error::Result;
 pub mod discovery;
 pub mod known;
 
-pub use discovery::{discover_filesystem, discover_processes, FilesystemRoots};
+pub use discovery::{discover_filesystem, discover_processes, is_running, FilesystemRoots};
 pub use known::{KnownBrowser, KNOWN_LINUX, KNOWN_MACOS};
 
 /// Platform-of-interest for browser detection.

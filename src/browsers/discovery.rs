@@ -206,13 +206,51 @@ fn has_versioned_subdir(versions_dir: &Path) -> bool {
 
 /// Process-based discovery scaffold.
 ///
-/// **Phase 1 stub.** Always returns an empty `Vec`. Phase 2 wires
-/// `sysinfo` to scan running processes and resolve their binary paths
-/// to install directories. The signature is stable so consumers (the
-/// daemon, in particular) can call it today.
+/// Phase 2 keeps this returning an empty `Vec` — the spec leaves
+/// "scan processes for install dirs" semantics ambiguous (the same path
+/// would already surface via the filesystem walk). Use [`is_running`]
+/// for the patch flow's "should we refuse?" check.
 #[must_use]
 pub fn discover_processes() -> Vec<Browser> {
     Vec::new()
+}
+
+/// Returns `true` if at least one running process's executable path
+/// lives under `browser.install_path()`.
+///
+/// We use [`sysinfo`] to enumerate processes; for each we compare the
+/// process's executable path against the browser's install path. The
+/// comparison uses [`std::path::Path::starts_with`] so a process at
+/// `/opt/helium-browser-bin/helium` matches a browser whose
+/// `install_path` is `/opt/helium-browser-bin`.
+///
+/// Best-effort: process paths can be unreadable (permission denied for
+/// processes owned by other users). Those are skipped silently.
+///
+/// # Performance
+///
+/// Refreshing the process table is non-trivial (a few ms). The patch
+/// flow calls this once per patch — that's fine. Daemon code that
+/// needs frequent polling should cache and refresh on file-watch events
+/// instead.
+#[must_use]
+pub fn is_running(browser: &Browser) -> bool {
+    is_running_under(browser.install_path())
+}
+
+/// Test- and injection-friendly variant of [`is_running`]: caller passes
+/// the directory under which to consider any executable as "the browser."
+#[must_use]
+pub(crate) fn is_running_under(install: &Path) -> bool {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    for proc in system.processes().values() {
+        let Some(exe) = proc.exe() else { continue };
+        if exe.starts_with(install) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
