@@ -2,11 +2,15 @@
 
 **Lead:** Claude (main session)
 **Team:** `neon-v2`
-**Active phase:** Phase 1 — Core skeleton
+**Active phase:** Phase 2 — Widevine + atomic patching
 
 ## Current focus
 
-Phase 1 in progress: core-engine team writing manifest parsing, browser detection, custom-paths config, error type, lockfile, and test fixtures. CLI's Phase 1 scope (clap subcommand stubs) was completed by infra during Phase 0; CLI team activates again in Phase 4.
+Phase 2 in progress: core-engine + platform teams in parallel.
+- core-engine: Widevine download/extract/cache, atomic patch protocol, backup/rollback, browser-running detection
+- platform: Linux + macOS patch impls, migration logic for old bash-installed Neon
+
+Phase 1 complete (78 unit + integration tests passing, 95.38% coverage). MSRV bumped 1.75→1.85 (clap_lex 1.1+ requires edition2024).
 
 ## Decisions made (recorded for handoff)
 
@@ -19,9 +23,9 @@ Phase 1 in progress: core-engine team writing manifest parsing, browser detectio
 
 | Phase | Status | Notes |
 |---|---|---|
-| 0 — Foundation | **Done** | 6 commits on `v2-rust-rewrite`; infra agent reports complete; verified locally (build + fmt + clippy green) |
-| 1 — Core skeleton | In progress | core-engine team (cli scope preempted by infra during Phase 0 stubs) |
-| 2 — Widevine + patching | Pending | core-engine + platform (parallel) |
+| 0 — Foundation | **Done** | 6 commits; infra agent reports complete; verified locally (build + fmt + clippy green) |
+| 1 — Core skeleton | **Done** | 8 commits; manifest, browsers, config, error, lockfile shipped; 95.38% coverage on owned modules |
+| 2 — Widevine + patching | In progress | core-engine + platform (parallel) |
 | 3 — Daemon | Pending | daemon + platform (parallel) |
 | 4 — CLI completion | Pending | cli sequential |
 | 5 — Distribution + docs | Pending | infra + platform |
