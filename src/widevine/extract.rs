@@ -390,4 +390,47 @@ mod tests {
         let err = extract_crx3_bytes(&crx, &out).expect_err("traversal must be rejected");
         assert_eq!(err.category, crate::ErrorCategory::UnknownBundleStructure);
     }
+
+    /// `extract_crx3_bytes` errors when the ZIP body is garbage (not a
+    /// valid PKZIP archive).
+    #[test]
+    fn extract_crx3_rejects_malformed_zip_body() {
+        let mut crx = Vec::new();
+        crx.extend_from_slice(CRX3_MAGIC);
+        crx.extend_from_slice(&3u32.to_le_bytes());
+        crx.extend_from_slice(&0u32.to_le_bytes());
+        // Garbage instead of a valid ZIP body.
+        crx.extend_from_slice(b"this is not a zip file");
+        let tmp = TempDir::new().expect("tempdir");
+        let out = tmp.path().join("out");
+        let err = extract_crx3_bytes(&crx, &out).expect_err("malformed zip");
+        assert_eq!(err.category, crate::ErrorCategory::UnknownBundleStructure);
+    }
+
+    /// CRX3 with explicit directory entries gets the directory created.
+    #[test]
+    fn extract_crx3_creates_explicit_directory_entries() {
+        let mut zip_bytes = Vec::new();
+        {
+            let cursor = Cursor::new(&mut zip_bytes);
+            let mut zip = ZipWriter::new(cursor);
+            let opts: SimpleFileOptions =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zip.add_directory("just-a-dir/", opts).expect("dir");
+            zip.start_file("just-a-dir/inside.txt", opts)
+                .expect("start");
+            zip.write_all(b"hi").expect("write");
+            zip.finish().expect("finish");
+        }
+        let mut crx = Vec::new();
+        crx.extend_from_slice(CRX3_MAGIC);
+        crx.extend_from_slice(&3u32.to_le_bytes());
+        crx.extend_from_slice(&0u32.to_le_bytes());
+        crx.extend_from_slice(&zip_bytes);
+        let tmp = TempDir::new().expect("tempdir");
+        let out = tmp.path().join("out");
+        extract_crx3_bytes(&crx, &out).expect("ok");
+        assert!(out.join("just-a-dir").is_dir());
+        assert!(out.join("just-a-dir").join("inside.txt").exists());
+    }
 }

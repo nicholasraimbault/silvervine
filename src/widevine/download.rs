@@ -464,6 +464,37 @@ mod tests {
         }
     }
 
+    /// `download_to` errors with `HashMismatch` when the manifest's hash
+    /// is too short for our 16-char-prefix filename trick.
+    #[test]
+    fn download_to_errors_for_short_hash() {
+        let entry = PlatformEntry::Concrete {
+            file_url: "http://127.0.0.1:1/x".into(),
+            mirror_urls: vec![],
+            filesize: None,
+            hash_value: "abc".into(),
+        };
+        let tmp = TempDir::new().expect("tempdir");
+        let err = download_to(&entry, tmp.path()).expect_err("short hash");
+        assert_eq!(err.category, crate::ErrorCategory::HashMismatch);
+    }
+
+    /// `download_to_cache` (the public default-path variant) doesn't panic;
+    /// it surfaces a categorized error if `dirs::cache_dir()` is None.
+    #[test]
+    fn download_to_cache_does_not_panic() {
+        let entry = PlatformEntry::Concrete {
+            file_url: "http://127.0.0.1:1/nope".into(),
+            mirror_urls: vec![],
+            filesize: None,
+            hash_value: "0".repeat(128),
+        };
+        // Either a network error (URL fails) or a state-corrupted (no cache
+        // dir): both are valid outcomes; no panic.
+        let outcome = download_to_cache(&entry);
+        assert!(outcome.is_err());
+    }
+
     /// The integration-test happy path against the live Mozilla manifest
     /// (gated `--ignored`). Reads the committed fixture's first concrete
     /// Linux entry, downloads the CRX3, verifies the SHA-512.

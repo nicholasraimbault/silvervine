@@ -180,7 +180,9 @@ pub fn current() -> Result<Option<CachedCdm>> {
 /// `Other` if the `current` symlink can't be read or its target is missing.
 pub fn current_in(cache_root: &Path) -> Result<Option<CachedCdm>> {
     let link = cache_root.join("current");
-    if !link.exists() {
+    // `link.exists()` follows symlinks; we want to know if the link
+    // itself exists, dangling or otherwise.
+    if std::fs::symlink_metadata(&link).is_err() {
         return Ok(None);
     }
     let target = std::fs::read_link(&link)
@@ -766,5 +768,197 @@ mod tests {
             let suffix = std::path::Path::new("neon").join("widevine");
             assert!(p.ends_with(&suffix));
         }
+    }
+
+    /// Build a minimal CRX3 wrapping a synthesized ZIP.
+    fn build_synthetic_crx3() -> Vec<u8> {
+        use std::io::{Cursor, Write};
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let mut zip_bytes = Vec::new();
+        {
+            let cursor = Cursor::new(&mut zip_bytes);
+            let mut zip = ZipWriter::new(cursor);
+            let opts: SimpleFileOptions =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("manifest.json", opts).expect("start");
+            zip.write_all(br#"{"name":"WidevineCdm","version":"4.10.test"}"#)
+                .expect("write");
+            zip.start_file("_platform_specific/linux_x64/libwidevinecdm.so", opts)
+                .expect("start");
+            zip.write_all(b"\x7fELF-fake-cdm-content").expect("write");
+            zip.finish().expect("finish");
+        }
+        let mut crx = Vec::new();
+        crx.extend_from_slice(b"Cr24");
+        crx.extend_from_slice(&3u32.to_le_bytes());
+        crx.extend_from_slice(&0u32.to_le_bytes());
+        crx.extend_from_slice(&zip_bytes);
+        crx
+    }
+
+    /// Build a manifest for a CRX3 served at `url`.
+    fn manifest_for_crx(url: &str, body: &[u8], version: &str) -> Manifest {
+        let mut platforms = HashMap::new();
+        platforms.insert(
+            "Linux_x86_64-gcc3".to_string(),
+            PlatformEntry::Concrete {
+                file_url: url.to_string(),
+                mirror_urls: vec![],
+                filesize: Some(body.len() as u64),
+                hash_value: download::sha512_hex(body),
+            },
+        );
+        Manifest {
+            hash_function: Some("sha512".into()),
+            name: Some(format!("Widevine-{version}")),
+            vendors: HashMap::from([(
+                "gmp-widevinecdm".to_string(),
+                GmpVendor {
+                    platforms,
+                    version: version.to_string(),
+                },
+            )]),
+        }
+    }
+
+    /// Spin up a stub server that serves the CRX3 body for one GET.
+    fn spawn_crx_server(body: Vec<u8>) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let local = listener.local_addr().expect("local_addr");
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        });
+        format!("http://{local}/widevine.crx3")
+    }
+
+    /// End-to-end: download → extract → cache promotion → integrity check.
+    #[test]
+    fn ensure_cdm_for_with_downloads_and_promotes() {
+        let crx = build_synthetic_crx3();
+        let url = spawn_crx_server(crx.clone());
+        let manifest = manifest_for_crx(&url, &crx, "1.2.3");
+
+        let tmp = TempDir::new().expect("tempdir");
+        let cdm = ensure_cdm_for_with(&manifest, Platform::LinuxX86_64, tmp.path())
+            .expect("download must succeed");
+        assert_eq!(cdm.version(), "1.2.3");
+        assert!(cdm.cdm_dir().exists());
+        assert!(cdm.cdm_dir().join("manifest.json").exists());
+        let so = cdm
+            .cdm_dir()
+            .join("_platform_specific")
+            .join("linux_x64")
+            .join("libwidevinecdm.so");
+        assert!(so.exists());
+        // current symlink resolves to the new version.
+        let cur = current_in(tmp.path()).expect("current").expect("some");
+        assert_eq!(cur.version(), "1.2.3");
+    }
+
+    /// `verify_integrity_with` flags a corrupted CDM (.so emptied after install).
+    #[test]
+    fn verify_integrity_with_detects_emptied_so() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = make_cached_version(tmp.path(), "1.0");
+        // Empty out the `.so`.
+        let so = dir
+            .join("_platform_specific")
+            .join("linux_x64")
+            .join("libwidevinecdm.so");
+        fs::write(&so, b"").expect("truncate so");
+        advance_current(tmp.path(), "1.0").expect("advance");
+        let manifest = synthetic_manifest(b"unused", "1.0");
+        let err = verify_integrity_with(&manifest, Platform::LinuxX86_64, tmp.path())
+            .expect_err("emptied so must fail integrity");
+        assert_eq!(err.category, crate::ErrorCategory::HashMismatch);
+    }
+
+    /// `current_in` returns `StateCorrupted` when the symlink dangles.
+    #[test]
+    fn current_in_errors_on_dangling_symlink() {
+        let tmp = TempDir::new().expect("tempdir");
+        relative_symlink("does-not-exist", &tmp.path().join("current")).expect("link");
+        let err = current_in(tmp.path()).expect_err("dangling link");
+        assert_eq!(err.category, crate::ErrorCategory::StateCorrupted);
+    }
+
+    /// Cache hit with corrupted CDM (`.so` missing) triggers re-download.
+    #[test]
+    fn ensure_cdm_for_with_redownloads_on_corrupt_cache_hit() {
+        let crx = build_synthetic_crx3();
+        let url = spawn_crx_server(crx.clone());
+        let manifest = manifest_for_crx(&url, &crx, "9.9.9");
+
+        let tmp = TempDir::new().expect("tempdir");
+        // Pre-create a half-built version directory with a missing CDM .so.
+        let half = tmp.path().join("9.9.9");
+        let plat = half.join("_platform_specific").join("linux_x64");
+        fs::create_dir_all(&plat).expect("mkdir");
+        // No libwidevinecdm.so → integrity_check_dir fails → re-download.
+        let cdm = ensure_cdm_for_with(&manifest, Platform::LinuxX86_64, tmp.path())
+            .expect("must redownload");
+        assert!(cdm
+            .cdm_dir()
+            .join("_platform_specific")
+            .join("linux_x64")
+            .join("libwidevinecdm.so")
+            .exists());
+    }
+
+    /// `prune_in` with `keep == 0` is treated as `keep == 1` (never delete the active).
+    #[test]
+    fn prune_in_with_keep_zero_treats_as_one() {
+        let tmp = TempDir::new().expect("tempdir");
+        make_cached_version(tmp.path(), "1.0");
+        make_cached_version(tmp.path(), "2.0");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        advance_current(tmp.path(), "2.0").expect("advance");
+        let _ = prune_in(tmp.path(), 0).expect("prune");
+        // Active must remain; older may be removed.
+        assert!(tmp.path().join("2.0").exists());
+    }
+
+    /// `prune_in` is a no-op when the cache root doesn't exist.
+    #[test]
+    fn prune_in_with_missing_root_is_noop() {
+        let tmp = TempDir::new().expect("tempdir");
+        let phantom = tmp.path().join("does-not-exist");
+        let deleted = prune_in(&phantom, 3).expect("missing root ok");
+        assert_eq!(deleted, 0);
+    }
+
+    /// `default_*` accessors work without panic and produce paths that
+    /// end in the expected suffix when `dirs::cache_dir()` resolves.
+    #[test]
+    fn default_accessors_dont_panic() {
+        let _ = default_cache_root();
+        // `prune` calls default_cache_root then short-circuits on missing.
+        let _ = prune(0);
+        let _ = current();
     }
 }

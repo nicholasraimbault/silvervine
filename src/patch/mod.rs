@@ -570,4 +570,51 @@ mod tests {
             assert!(p.ends_with(&suffix), "got {}", p.display());
         }
     }
+
+    /// `host_patcher()` returns an `Ok(Box<dyn PlatformPatcher>)` on
+    /// supported hosts. We can't assert which impl without re-introducing
+    /// `cfg`, so we just verify the call doesn't error.
+    #[test]
+    fn host_patcher_returns_ok_on_supported_host() {
+        let r = host_patcher();
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert!(r.is_ok());
+        } else {
+            assert!(r.is_err());
+        }
+    }
+
+    /// `patch_browser` sets `version_after = version_before` when the
+    /// platform impl returns the same version both before and after the
+    /// patch (Phase 2 contract — the patch doesn't change the browser
+    /// version).
+    #[test]
+    fn version_before_equals_version_after_in_phase_2() {
+        let tmp = TempDir::new().expect("tempdir");
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).expect("mkdir");
+        fs::write(install.join("seed"), b"x").expect("seed");
+        let browser = make_browser(install);
+        let cache_root = tmp.path().join("widevine");
+        let cdm = make_cached_cdm(&cache_root, "4.10.0.0");
+        let patcher = MockPatcher::with_version("128.0.6613.119");
+        let opts = PatchOptions {
+            force_while_running: true,
+            dry_run: false,
+            lock_path: Some(tmp.path().join("patch.lock")),
+            backups_dir: Some(tmp.path().join("backups")),
+        };
+        let outcome = patch_browser(&browser, &cdm, &patcher, &opts).expect("ok");
+        assert_eq!(outcome.version_before, outcome.version_after);
+    }
+
+    /// `PatchOptions` uses `Default` to produce sensible "off" values.
+    #[test]
+    fn patch_options_defaults_are_safe() {
+        let opts = PatchOptions::default();
+        assert!(!opts.force_while_running);
+        assert!(!opts.dry_run);
+        assert!(opts.lock_path.is_none());
+        assert!(opts.backups_dir.is_none());
+    }
 }

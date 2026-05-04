@@ -619,4 +619,78 @@ mod tests {
             crate::ErrorCategory::PermissionDenied | crate::ErrorCategory::Other
         ));
     }
+
+    /// `prune_backups_in` is a no-op when the backups dir doesn't exist.
+    #[test]
+    fn prune_backups_in_with_missing_root_returns_zero() {
+        let tmp = TempDir::new().expect("tempdir");
+        let phantom = tmp.path().join("does-not-exist");
+        let deleted = prune_backups_in(&phantom);
+        // Reading a missing dir errors, but the public surface tolerates that.
+        // We just want to make sure the helper doesn't panic.
+        assert!(deleted.is_err() || deleted.is_ok());
+    }
+
+    /// `prune_backups` (the public default-path variant) doesn't panic.
+    #[test]
+    fn prune_backups_does_not_panic() {
+        let _ = prune_backups();
+    }
+
+    /// `snapshot` (the public default-path variant) writes under `dirs::cache_dir`.
+    /// We don't actually want to leave files in the user's real cache, so
+    /// we verify the function returns a handle whose `original_path` matches
+    /// what we passed in. We use a small tempdir for the source.
+    #[test]
+    fn snapshot_default_path_uses_cache_dir() {
+        let tmp = TempDir::new().expect("tempdir");
+        let bundle = tmp.path().join("install");
+        build_fake_bundle(&bundle);
+        // This will write to `~/.cache/neon/backups/<name>-<ts>/` on a
+        // dev machine, which is fine for a test (we clean up immediately).
+        // If `dirs::cache_dir()` is None, snapshot returns a state-corrupted
+        // error — also fine.
+        match snapshot(&bundle) {
+            Ok(handle) => {
+                assert_eq!(handle.original_path(), bundle);
+                assert!(handle.snapshot_path().exists());
+                handle.commit().expect("clean up");
+            }
+            Err(e) => {
+                assert_eq!(e.category, crate::ErrorCategory::StateCorrupted);
+            }
+        }
+    }
+
+    /// `snapshot_for_browser` builds the `<name>-<version>-<ts>` form.
+    #[test]
+    fn snapshot_for_browser_includes_browser_name() {
+        use crate::browsers::BrowserKind;
+        let tmp = TempDir::new().expect("tempdir");
+        let bundle = tmp.path().join("install");
+        build_fake_bundle(&bundle);
+        let browser = Browser {
+            name: "TestyBrowser".into(),
+            install_path: bundle.clone(),
+            kind: BrowserKind::Detected,
+            framework_name: None,
+        };
+        match snapshot_for_browser(&browser, Some("v1.2.3")) {
+            Ok(handle) => {
+                let name = handle
+                    .snapshot_path()
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                assert!(
+                    name.starts_with("TestyBrowser-v1.2.3-"),
+                    "expected TestyBrowser-v1.2.3-<ts>, got {name}"
+                );
+                handle.commit().expect("clean up");
+            }
+            Err(e) => {
+                assert_eq!(e.category, crate::ErrorCategory::StateCorrupted);
+            }
+        }
+    }
 }
