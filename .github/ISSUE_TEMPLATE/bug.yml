@@ -1,0 +1,57 @@
+name: Bug report
+description: Report a problem with Neon
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please run `neon doctor --share` and paste the output below — that link pre-fills this form with your diagnostic info.
+
+  - type: input
+    id: neon_version
+    attributes:
+      label: Neon version
+      description: Output of `neon --version`
+      placeholder: "neon 0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system + version
+      placeholder: "Arch Linux (kernel 6.11), or macOS 14.5 (M2)"
+    validations:
+      required: true
+
+  - type: input
+    id: browser
+    attributes:
+      label: Browser + version
+      placeholder: "Helium 144.0.7339.16"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor_output
+    attributes:
+      label: "`neon doctor --json` output"
+      description: Paste the full JSON. Sensitive paths can be redacted.
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened
+      description: What did you do, what did you expect, what did you observe?
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log excerpt (optional)
+      description: From `~/.cache/neon/logs/neon.log`. Trim to the relevant section.
+      render: text
