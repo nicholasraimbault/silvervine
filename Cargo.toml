@@ -36,6 +36,12 @@ url = "2"
 dirs = "5"
 # `flock`-based exclusive lockfile.
 fs2 = "0.4"
+# Direct FFI for `renameat2(RENAME_EXCHANGE)` (Linux) and
+# `renameatx_np(RENAME_SWAP)` (macOS): used by `crate::platform` for the
+# atomic-rename helper. nix's renameat2 wrapper is gated on
+# `target_env = "gnu"` (excludes musl), and nix has no macOS swap wrapper,
+# so the platform module calls libc directly.
+libc = "0.2"
 
 [dev-dependencies]
 # Sandboxed temporary directories for filesystem-shaped tests.

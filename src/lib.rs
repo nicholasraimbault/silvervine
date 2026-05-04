@@ -36,6 +36,7 @@ pub mod browsers;
 pub mod config;
 pub mod error;
 pub mod lockfile;
+pub mod platform;
 pub mod widevine;
 
 pub use error::{Error, ErrorCategory, Result};
