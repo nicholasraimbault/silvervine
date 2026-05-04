@@ -2,15 +2,18 @@
 
 **Lead:** Claude (main session)
 **Team:** `neon-v2`
-**Active phase:** Phase 5 done — Phase 6 (beta + release) next
+**Active phase:** V3-Phase B — Hardware capability detection (platform team)
 
 ## Current focus
 
-Phase 5 complete. README rewrite, MIGRATION/ROADMAP/CONTRIBUTING/SECURITY/CHANGELOG/CODE_OF_CONDUCT all written. .github/ISSUE_TEMPLATE/ in place (bug.yml + feature.yml + config.yml). Build still green, 456 tests passing.
+V2 V1.0 ready (`v2-rust-rewrite` HEAD `4521f3d`, 456 tests passing, all docs in place). Phase 6 V2 beta deferred until V3 lands or Nick decides to ship V2 standalone first.
 
-Phase 5 had a hiccup: the infra agent's output was blocked by an Anthropic content filter mid-flight. Working tree retained their partial work (5 doc files); orchestrator committed those, then wrote the remaining 3 docs (CHANGELOG, CODE_OF_CONDUCT, issue templates) directly. No code changes; verification gates remained green throughout.
+V3 work proceeding on `feature/v3-scaffolding` branch:
 
-Phase 6 = beta + release: tag a `v0.1.0-rc.1` pre-release, recruit testers via pinned issue, fix discovered bugs, eventually tag `v1.0.0`. Phase 6 isn't a code-spawning phase — it's mostly orchestrator + Nick coordination with all teams on standby for fixes.
+- **V3-Phase A** (scaffolding): **Done.** 6 commits (`fcb2f57..6656c2f`); CdmProvider trait + LocalFileCdm + patch flow refactor + bridge module gated stub + cli::stream stub + feature flag tests + ROADMAP/CONTRIBUTING updates. 466 tests on default, 469 with `--features experimental-bridge`. Both build paths green.
+- **V3-Phase B** (hardware capability detection): in progress; platform team activated.
+
+Known issue (not blocking): pre-existing flake in `daemon::lifecycle::tests` env_mutex poisoning under parallel test load (~10% of runs). Platform team to address as Phase B side deliverable.
 
 ## Decisions made (recorded for handoff)
 
@@ -32,7 +35,10 @@ Phase 6 = beta + release: tag a `v0.1.0-rc.1` pre-release, recruit testers via p
 | 3 — Daemon + tray + watcher | **Done** | platform: lifecycle + power; daemon: tray + watcher + IPC + notify + hooks + run(); 343 tests; serial spawn, no desktop disruption |
 | 4 — CLI completion | **Done** | 13 subcommands wired; EME translator (14 codes); tracing-subscriber logging; 456 tests |
 | 5 — Distribution + docs | **Done** | README/MIGRATION/ROADMAP/CONTRIBUTING/SECURITY/CHANGELOG/COC/issue templates; infra agent partial (content filter), orchestrator finished |
-| 6 — Beta + release | Pending | All teams standby; mostly Nick + orchestrator coordination |
+| 6 — Beta + release | Deferred | Nick to decide whether to ship V2 standalone or wait for V3 |
+| V3-A — Scaffolding | **Done** | 6 commits; CdmProvider trait; bridge stub; feature flag; 466/469 tests both paths |
+| V3-B — Hardware capability detection | In progress | platform team (single agent, serial); also addressing pre-existing env_mutex flake |
+| V3-C through F | Pending | Per V3 orchestration plan |
 | 3 — Daemon | Pending | daemon + platform (parallel) |
 | 4 — CLI completion | Pending | cli sequential |
 | 5 — Distribution + docs | Pending | infra + platform |
