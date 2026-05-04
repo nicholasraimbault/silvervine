@@ -1,0 +1,19 @@
+{
+  "name": "neon-errors",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Worker that receives opt-in error reports from the Neon CLI and writes them to D1.",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "schema:local": "wrangler d1 execute neon-errors --file ./schema.sql --local",
+    "schema:remote": "wrangler d1 execute neon-errors --file ./schema.sql --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250101.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.0.0"
+  }
+}
