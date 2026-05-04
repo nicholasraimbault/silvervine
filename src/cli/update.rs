@@ -29,7 +29,10 @@ use std::io::Write;
 use crate::cli::OutputOptions;
 use crate::error::{Error, Result};
 use crate::patch::{self, PatchOptions};
-use crate::widevine;
+use crate::widevine::{
+    self,
+    provider::{CdmProvider, LocalFileCdm},
+};
 
 /// Args for `neon update widevine`.
 #[derive(Debug, Clone, Default)]
@@ -103,8 +106,9 @@ fn run_widevine_install(args: &WidevineArgs, out: &mut dyn Write) -> Result<Wide
         Some(url) => fetch_from_custom(url)?,
         None => widevine::fetch_manifest()?,
     };
-    let cdm = widevine::cache::ensure_cdm_for(&manifest)?;
-    writeln!(out, "Cached CDM version: {}", cdm.version()).map_err(Error::from)?;
+    let cached = widevine::cache::ensure_cdm_for(&manifest)?;
+    writeln!(out, "Cached CDM version: {}", cached.version()).map_err(Error::from)?;
+    let cdm = LocalFileCdm::from_cached(&cached);
 
     // Re-patch every detected browser at the new version.
     let detected = crate::browsers::detect_browsers().unwrap_or_default();

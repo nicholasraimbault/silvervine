@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 use crate::browsers::{discovery, Browser};
 use crate::error::{Error, Result};
 use crate::lockfile;
-use crate::widevine::cache::CachedCdm;
+use crate::widevine::provider::CdmProvider;
 
 pub mod backup;
 
@@ -212,9 +212,16 @@ pub trait PlatformPatcher {
     fn read_browser_version(&self, target: &Path) -> Option<String>;
 }
 
-/// Patch a single browser with the given CDM.
+/// Patch a single browser with the given CDM source.
 ///
 /// This is the public API CLI and daemon both call.
+///
+/// V3-Phase A scaffolding: `cdm` is now a `&dyn CdmProvider` instead of
+/// `&CachedCdm`. V2 always passes a [`crate::widevine::provider::LocalFileCdm`]
+/// (constructed from the existing [`crate::widevine::cache`] APIs);
+/// V3's `experimental-bridge` feature will introduce a `BridgeCdm` impl
+/// that talks to a Windows guest VM. The orchestrator stays identical
+/// regardless of the source.
 ///
 /// # Flow
 ///
@@ -222,12 +229,15 @@ pub trait PlatformPatcher {
 /// 2. If browser is running and `force_while_running` is false, error out
 ///    with [`crate::ErrorCategory::BrowserRunning`].
 /// 3. Snapshot the install path to `~/.cache/neon/backups/<browser>-<ver>-<ts>/`.
-/// 4. Call [`PlatformPatcher::write_cdm`] → on error, restore snapshot.
-/// 5. Call [`PlatformPatcher::verify_post_patch`] → on error, restore snapshot.
-/// 6. Commit (delete the snapshot).
-/// 7. Return [`PatchOutcome`].
+/// 4. Materialize the CDM payload (via `cdm.populate(&staging_dir)`)
+///    into a temporary staging directory.
+/// 5. Call [`PlatformPatcher::write_cdm`] with the staging dir as
+///    source → on error, restore snapshot.
+/// 6. Call [`PlatformPatcher::verify_post_patch`] → on error, restore snapshot.
+/// 7. Commit (delete the snapshot).
+/// 8. Return [`PatchOutcome`].
 ///
-/// On `dry_run = true`, steps 3-6 are skipped; the function returns an
+/// On `dry_run = true`, steps 3-7 are skipped; the function returns an
 /// outcome with `dry_run = true` and the versions that *would have* been
 /// written.
 ///
@@ -235,13 +245,14 @@ pub trait PlatformPatcher {
 ///
 /// * [`crate::ErrorCategory::BrowserRunning`] — browser is running and
 ///   `force_while_running` is false.
-/// * Anything from [`PlatformPatcher::write_cdm`] or
+/// * Anything from [`crate::widevine::provider::CdmProvider::populate`],
+///   [`PlatformPatcher::write_cdm`], or
 ///   [`PlatformPatcher::verify_post_patch`] — the snapshot is restored
 ///   before the error is returned.
 /// * [`crate::ErrorCategory::Other`] — lockfile or backup machinery failed.
 pub fn patch_browser(
     browser: &Browser,
-    cdm: &CachedCdm,
+    cdm: &dyn CdmProvider,
     patcher: &dyn PlatformPatcher,
     options: &PatchOptions,
 ) -> Result<PatchOutcome> {
@@ -258,7 +269,7 @@ pub fn patch_browser(
 /// Inner patch flow, run while the lockfile is held.
 fn run_patch(
     browser: &Browser,
-    cdm: &CachedCdm,
+    cdm: &dyn CdmProvider,
     patcher: &dyn PlatformPatcher,
     options: &PatchOptions,
 ) -> Result<PatchOutcome> {
@@ -327,8 +338,23 @@ fn run_patch(
 }
 
 /// Run the platform impl + verification, between snapshot and commit.
-fn perform_patch(browser: &Browser, cdm: &CachedCdm, patcher: &dyn PlatformPatcher) -> Result<()> {
-    patcher.write_cdm(browser.install_path(), cdm.cdm_dir())?;
+///
+/// Materializes the CDM payload into a `tempfile::TempDir` so the
+/// platform impl receives a stable directory path. The temp dir lives
+/// only for the duration of `write_cdm` + `verify_post_patch`; on
+/// success it's dropped (and the directory is removed) before the
+/// orchestrator commits the snapshot.
+fn perform_patch(
+    browser: &Browser,
+    cdm: &dyn CdmProvider,
+    patcher: &dyn PlatformPatcher,
+) -> Result<()> {
+    let staging = tempfile::Builder::new()
+        .prefix("neon-cdm-staging-")
+        .tempdir()
+        .map_err(Error::from)?;
+    cdm.populate(staging.path())?;
+    patcher.write_cdm(browser.install_path(), staging.path())?;
     patcher.verify_post_patch(browser.install_path())?;
     Ok(())
 }
@@ -343,16 +369,16 @@ mod tests {
 
     use super::*;
     use crate::browsers::BrowserKind;
-    use crate::widevine::cache::CachedCdm;
+    use crate::widevine::provider::LocalFileCdm;
 
-    /// Build a minimum [`CachedCdm`] on disk for tests.
-    fn make_cached_cdm(root: &Path, version: &str) -> CachedCdm {
+    /// Build a minimum [`LocalFileCdm`] on disk for tests.
+    fn make_cached_cdm(root: &Path, version: &str) -> LocalFileCdm {
         let dir = root.join(version);
         let cdm = dir.join("_platform_specific").join("linux_x64");
         fs::create_dir_all(&cdm).expect("mkdir cdm");
         fs::write(cdm.join("libwidevinecdm.so"), b"fake-so").expect("write so");
         fs::write(dir.join("manifest.json"), br#"{"version":"4.10.0.0"}"#).expect("write manifest");
-        CachedCdm::new(version.to_string(), dir)
+        LocalFileCdm::new(version.to_string(), dir)
     }
 
     /// Recording mock implementation of [`PlatformPatcher`].

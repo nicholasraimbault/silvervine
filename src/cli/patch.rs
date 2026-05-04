@@ -21,7 +21,7 @@ use crate::browsers::{self, Browser};
 use crate::cli::OutputOptions;
 use crate::error::{Error, Result};
 use crate::patch::{self, PatchOptions, PatchOutcome, PlatformPatcher};
-use crate::widevine;
+use crate::widevine::{self, provider::LocalFileCdm};
 
 /// Args for `neon patch`.
 #[derive(Debug, Clone, Default)]
@@ -88,8 +88,12 @@ impl PatchReport {
 /// constrains it: when `Some(name)`, only the matching browser is
 /// patched; otherwise every entry is patched.
 ///
-/// `cdm_provider` is a closure that returns a [`crate::widevine::cache::CachedCdm`]
-/// — tests inject a synthetic CDM so they don't trigger downloads.
+/// `cdm_provider` is a closure that returns a
+/// [`crate::widevine::provider::LocalFileCdm`] — tests inject a
+/// synthetic CDM so they don't trigger downloads. V3-Phase A scaffolding:
+/// the closure produces a [`LocalFileCdm`] explicitly because V2 has
+/// only that one impl. V3 work will widen this to `Box<dyn CdmProvider>`
+/// when `BridgeCdm` lands.
 ///
 /// `patcher` is the [`PlatformPatcher`] (a mock in tests, the host
 /// impl in production via [`patch::host_patcher`]).
@@ -106,7 +110,7 @@ pub fn run_patch_flow<F>(
     options: &PatchOptions,
 ) -> Vec<PatchReport>
 where
-    F: FnOnce() -> Result<crate::widevine::cache::CachedCdm>,
+    F: FnOnce() -> Result<LocalFileCdm>,
 {
     let candidates: Vec<&Browser> = browsers
         .iter()
@@ -138,15 +142,17 @@ where
 }
 
 /// Production CDM provider: fetches the manifest + ensures the cache
-/// is current. Used by the `neon patch` runtime path.
+/// is current, returning a [`LocalFileCdm`] adapter. Used by the
+/// `neon patch` runtime path.
 ///
 /// # Errors
 ///
 /// * `ManifestFetchFailed` if the URL chain is exhausted.
 /// * `NetworkError` / `HashMismatch` from download.
-fn production_cdm() -> Result<crate::widevine::cache::CachedCdm> {
+fn production_cdm() -> Result<LocalFileCdm> {
     let manifest = widevine::fetch_manifest()?;
-    widevine::cache::ensure_cdm_for(&manifest)
+    let cached = widevine::cache::ensure_cdm_for(&manifest)?;
+    Ok(LocalFileCdm::from_cached(&cached))
 }
 
 /// Render a list of reports as a friendly per-line summary.
@@ -294,7 +300,7 @@ mod tests {
         }
     }
 
-    fn make_cdm(root: &Path, version: &str) -> crate::widevine::cache::CachedCdm {
+    fn make_cdm(root: &Path, version: &str) -> LocalFileCdm {
         let dir = root.join(version);
         fs::create_dir_all(dir.join("_platform_specific/linux_x64")).unwrap();
         fs::write(
@@ -303,7 +309,7 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.join("manifest.json"), br#"{"version":"x"}"#).unwrap();
-        crate::widevine::cache::CachedCdm::new(version.to_string(), dir)
+        LocalFileCdm::new(version.to_string(), dir)
     }
 
     #[test]

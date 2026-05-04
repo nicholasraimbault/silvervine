@@ -668,9 +668,12 @@ pub fn drive_patch_flow(
             .map(|b| (b.name().to_string(), false))
             .collect();
     };
-    let cdm_provider = || -> Result<crate::widevine::cache::CachedCdm> {
+    let cdm_provider = || -> Result<crate::widevine::provider::LocalFileCdm> {
         let manifest = crate::widevine::fetch_manifest()?;
-        crate::widevine::cache::ensure_cdm_for(&manifest)
+        let cached = crate::widevine::cache::ensure_cdm_for(&manifest)?;
+        Ok(crate::widevine::provider::LocalFileCdm::from_cached(
+            &cached,
+        ))
     };
     let opts = crate::patch::PatchOptions {
         force_while_running: force,

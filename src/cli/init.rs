@@ -31,7 +31,7 @@ use crate::config::{Config, ReportingConfig};
 use crate::error::{Error, Result};
 use crate::migration;
 use crate::patch::{self, PatchOptions, PlatformPatcher};
-use crate::widevine;
+use crate::widevine::{self, provider::LocalFileCdm};
 
 /// Args for `neon init`.
 #[derive(Debug, Clone, Default)]
@@ -221,10 +221,12 @@ pub fn build_plan_from_input(
 
 /// Execute a [`Plan`]'s side effects, writing a summary to `out`.
 ///
-/// `cdm_provider` returns the [`crate::widevine::cache::CachedCdm`] to
-///     patch with — production uses a closure that calls `fetch_manifest`
-///     + `ensure_cdm_for`; tests inject a synthetic CDM pre-built on a
-///     tempdir.
+/// `cdm_provider` returns the [`LocalFileCdm`] to patch with —
+/// production uses a closure that calls `fetch_manifest` +
+/// `ensure_cdm_for`; tests inject a synthetic CDM pre-built on a
+/// tempdir. V3-Phase A scaffolding: V2 only has `LocalFileCdm`; the
+/// `experimental-bridge` feature will widen this surface to
+/// `Box<dyn CdmProvider>` once `BridgeCdm` lands.
 ///
 /// `patcher` is the [`PlatformPatcher`] (mock in tests).
 ///
@@ -242,7 +244,7 @@ pub fn execute_plan<F>(
     patch_options: PatchOptions,
 ) -> Result<()>
 where
-    F: FnOnce() -> Result<crate::widevine::cache::CachedCdm>,
+    F: FnOnce() -> Result<LocalFileCdm>,
 {
     writeln!(out, "Neon: starting first-run setup.").map_err(Error::from)?;
 
@@ -394,10 +396,12 @@ pub fn run(args: &Args) -> Result<()> {
     )
 }
 
-/// Production CDM resolver: fetches the manifest and ensures the cache.
-fn production_cdm_provider() -> Result<crate::widevine::cache::CachedCdm> {
+/// Production CDM resolver: fetches the manifest, ensures the cache,
+/// and wraps the result in a [`LocalFileCdm`] adapter.
+fn production_cdm_provider() -> Result<LocalFileCdm> {
     let manifest = widevine::fetch_manifest()?;
-    widevine::cache::ensure_cdm_for(&manifest)
+    let cached = widevine::cache::ensure_cdm_for(&manifest)?;
+    Ok(LocalFileCdm::from_cached(&cached))
 }
 
 #[cfg(test)]
@@ -494,7 +498,7 @@ mod tests {
         }
     }
 
-    fn make_cdm(root: &Path, version: &str) -> crate::widevine::cache::CachedCdm {
+    fn make_cdm(root: &Path, version: &str) -> LocalFileCdm {
         let dir = root.join(version);
         fs::create_dir_all(dir.join("_platform_specific/linux_x64")).unwrap();
         fs::write(
@@ -502,7 +506,7 @@ mod tests {
             b"fake",
         )
         .unwrap();
-        crate::widevine::cache::CachedCdm::new(version.to_string(), dir)
+        LocalFileCdm::new(version.to_string(), dir)
     }
 
     #[test]
@@ -559,9 +563,7 @@ mod tests {
         };
         let mut buf = Vec::new();
         // The CDM provider should not even be called.
-        let cdm_provider = || -> Result<crate::widevine::cache::CachedCdm> {
-            Err(Error::other("should not be called"))
-        };
+        let cdm_provider = || -> Result<LocalFileCdm> { Err(Error::other("should not be called")) };
         let patcher = MockPatcher::default();
         execute_plan(
             &plan,

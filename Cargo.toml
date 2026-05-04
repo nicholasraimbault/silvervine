@@ -101,6 +101,12 @@ urlencoding = "2"
 # Tracing subscriber's rolling-file appender — used by `crate::log` to
 # rotate the daemon's `~/.cache/neon/logs/neon.log`.
 tracing-appender = "0.2"
+# Sandboxed temporary directories. Used by `patch::patch_browser` to
+# materialize CDM payloads from a `CdmProvider` into a staging directory
+# before handing to the platform write step. Same crate previously was
+# only a dev-dependency; promoting to a runtime dep for the V3 trait
+# scaffolding.
+tempfile = "3"
 
 # macOS-specific deps: ObjC FFI for NSWorkspace wake notifications.
 # `block2` is required because NSNotificationCenter takes a block-typed
