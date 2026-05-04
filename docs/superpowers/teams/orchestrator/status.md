@@ -2,18 +2,18 @@
 
 **Lead:** Claude (main session)
 **Team:** `neon-v2`
-**Active phase:** Phase 3 — Daemon + tray + watcher
+**Active phase:** Paused after Phase 2 + sudo-batching fix
 
 ## Current focus
 
-Phase 3 starting: daemon team (first activation) + platform team (returning) in parallel.
-- daemon: tray icon, file watcher, IPC, native notifications, heartbeat, CDM integrity check, hooks runner
-- platform: LaunchAgent / systemd-user lifecycle, sleep/wake hooks (NSWorkspace + logind D-Bus)
+**Project paused.** Phase 0-2 fully shipped. Sudo batching bug fixed (migration was prompting 5+ times; now batches into 1 elevation).
 
-Phase 2 complete:
-- core-engine: 87.02% coverage on Phase 2 deliverables, 89.93% overall on owned modules
-- platform: 88.72% coverage on owned modules
-- 210 unit tests + 2 integration tests passing; fmt + clippy clean
+Phase 3 was started (daemon + platform in parallel) but agents paused after a noctalia-shell crash on Nick's desktop correlated with heavy parallel agent load. Working tree was reset to clean Phase 2 state; Phase 3 WIP discarded.
+
+Next session resume strategy:
+- Apply guardrails from `docs/superpowers/teams/orchestrator/agent-guardrails.md` to every agent brief
+- Spawn Phase 3 agents **serially** (one at a time), not in parallel, to avoid the resource pressure that tipped quickshell over
+- Phase 3 scope unchanged from orchestration plan
 
 ## Decisions made (recorded for handoff)
 
@@ -29,7 +29,8 @@ Phase 2 complete:
 | 0 — Foundation | **Done** | 6 commits; infra agent reports complete; verified locally (build + fmt + clippy green) |
 | 1 — Core skeleton | **Done** | 8 commits; manifest, browsers, config, error, lockfile shipped; 95.38% coverage on owned modules |
 | 2 — Widevine + patching | **Done** | core-engine 87% / platform 88.7% coverage; 210 tests passing |
-| 3 — Daemon + tray + watcher | In progress | daemon (first activation) + platform (returning) |
+| 2.x — Sudo batching fix | **Done** | migration's 5+ prompts → 1 prompt via `run_as_root_script` |
+| 3 — Daemon + tray + watcher | Paused after WIP discarded | resume serially with guardrails next session |
 | 3 — Daemon | Pending | daemon + platform (parallel) |
 | 4 — CLI completion | Pending | cli sequential |
 | 5 — Distribution + docs | Pending | infra + platform |
