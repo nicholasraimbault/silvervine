@@ -1,192 +1,129 @@
 # Neon
 
-Fix DRM playback in Chromium-based browsers on macOS and Linux.
+**Single-binary cross-platform DRM (Widevine) helper for Chromium-family browsers on macOS and Linux.**
 
-Neon patches [WidevineCdm](https://www.widevine.com/) into browsers that ship without it, enabling Netflix, Spotify, Disney+, and other DRM-protected content. It auto-patches when your browser updates so you never have to think about it again.
-
-## Features
-
-- **Multi-browser**: Supports Helium, Thorium, ungoogled-chromium, and Chromium out of the box.
-- **Auto-discovery**: Scans for additional Chromium-based browsers beyond the hardcoded list.
-- **Auto-patching**: Re-patches automatically when a browser updates (LaunchDaemon on macOS, systemd on Linux).
-- **Tray/menu bar app**: Per-browser status, one-click patching, launch at login.
-- **Update check**: See if a newer WidevineCdm is available from Google.
-- **ARM64 Linux**: Extracts WidevineCdm from ChromeOS LaCrOS images for aarch64 systems (Asahi Linux, Raspberry Pi).
-
-## Supported browsers
-
-### macOS
-
-| Browser | Path |
-|---------|------|
-| [Helium](https://helium.build) | `/Applications/Helium.app` |
-| [Thorium](https://thorium.rocks) | `/Applications/Thorium.app` |
-| [ungoogled-chromium](https://ungoogled-software.github.io/ungoogled-chromium-binaries/) | `/Applications/Chromium.app` |
-
-Plus any Chromium-based `.app` in `/Applications` (auto-discovered).
-
-### Linux
-
-| Browser | Path(s) |
-|---------|---------|
-| [Helium](https://helium.build) | `/opt/helium-browser-bin` |
-| [Thorium](https://thorium.rocks) | `/opt/chromium.org/thorium`, `/opt/thorium-browser` |
-| [ungoogled-chromium](https://ungoogled-software.github.io/ungoogled-chromium-binaries/) | `/usr/lib/chromium`, `/usr/lib64/chromium` |
-| [Chromium](https://www.chromium.org/) | `/usr/lib/chromium-browser` |
-
-Plus any Chromium-based browser in `/opt`, `/usr/lib`, `/usr/lib64` (auto-discovered).
-
-## Requirements
-
-- Python 3, curl, unzip
-- macOS or Linux (x86_64 or ARM64)
-- squashfs-tools (ARM64 Linux only)
-- Go 1.21+ and `libayatana-appindicator3-dev` (only if building the Linux tray app)
-- systemd (optional, for auto-patching on Linux)
+Neon patches Google's Widevine CDM into Chromium-family browsers that don't ship with it (Helium, Thorium, ungoogled-chromium, plain Chromium), enabling Netflix, Spotify, Disney+, HBO Max, and other DRM-protected content. It re-patches automatically when your browser updates, so you set it up once and forget about it.
 
 ## Install
 
-### macOS — Homebrew
-
-```
-brew install nicholasraimbault/neon/neon
-neon-install
+```sh
+curl -fsSL https://github.com/nicholasraimbault/neon/releases/latest/download/neon-installer.sh | sh
+neon setup
 ```
 
-macOS will prompt for your password to patch apps in `/Applications` and install the auto-patch daemon.
+That's it. The installer drops a single statically-linked binary into `$CARGO_HOME/bin` (typically `~/.cargo/bin`); `neon setup` then detects your browsers, downloads the Widevine CDM from Mozilla's GMP manifest, patches each browser, and registers a user-session daemon (LaunchAgent on macOS, systemd-user unit on Linux) that re-patches automatically on browser self-updates.
 
-### macOS — Menu bar app
+If you previously installed Neon via the V1 bash script, Homebrew tap, AUR package, or .deb — `neon setup` detects and migrates the old install. See [MIGRATION.md](MIGRATION.md).
 
-Download **Neon.dmg** from [Releases](https://github.com/nicholasraimbault/neon/releases) and drag to Applications.
+## Supported browsers
 
-Neon lives in your menu bar:
+Neon patches any Chromium-family browser. The following are auto-discovered out of the box:
 
-- Per-browser patch status
-- **Patch Now** — patch all detected browsers
-- **Update Widevine** — re-download the latest WidevineCdm
-- **Launch at Login** — start Neon on boot
-- Auto-patches when a browser updates (no daemon needed)
+| Browser | macOS path | Linux path(s) |
+|---|---|---|
+| [Helium](https://helium.computer) | `/Applications/Helium.app` | `/opt/helium-browser-bin` |
+| [Thorium](https://thorium.rocks) | `/Applications/Thorium.app` | `/opt/chromium.org/thorium`, `/opt/thorium-browser` |
+| [ungoogled-chromium](https://ungoogled-software.github.io/ungoogled-chromium-binaries/) | `/Applications/Chromium.app` | `/usr/lib/chromium`, `/usr/lib64/chromium` |
+| [Chromium](https://www.chromium.org/) | `/Applications/Chromium.app` | `/usr/lib/chromium-browser` |
 
-### Linux — Arch (PKGBUILD)
+Additional Chromium-family browsers are auto-discovered by scanning `/Applications/*.app` (macOS) and `/opt`, `/usr/lib`, `/usr/lib64`, `/usr/local/lib` (Linux) for the Chromium framework signature.
 
-```
-git clone https://github.com/nicholasraimbault/neon.git
-cd neon/packaging/aur
-makepkg -si
-neon-install
-```
+You can add custom browsers via `~/.config/neon/config.toml`:
 
-### Linux — .deb (Debian/Ubuntu)
-
-```
-git clone https://github.com/nicholasraimbault/neon.git
-cd neon
-bash packaging/deb/build-deb.sh
-sudo dpkg -i packaging/deb/neon-drm_*.deb
-neon-install
+```toml
+[[browsers]]
+name = "MyCustomBrowser"
+# macOS:
+bundle_path = "/Users/me/Applications/MyCustomBrowser.app"
+framework_name = "MyCustomBrowser Framework"
+# Or Linux:
+# install_path = "/home/me/builds/my-chromium"
 ```
 
-Requires Go to build the tray app binary.
+## The L3 ceiling — please read
 
-### Manual (macOS or Linux)
+Patched Widevine is **software-only L3**. Streaming services cap L3 playback at roughly **720p**. That means:
 
-```
-git clone https://github.com/nicholasraimbault/neon.git
-cd neon
-bash install.sh
-```
+- **Netflix, Disney+, HBO Max, Hulu, etc. will not deliver 4K HDR** through a patched browser, regardless of your monitor, GPU, or subscription tier.
+- This is a DRM platform constraint enforced by the studios, **not a Neon limitation**. No software patch can change it.
+- Spotify, YouTube Music, and audio-only services work at full quality (DRM tier doesn't bound audio bitrate).
+- 1080p SDR works on most services. Some services downgrade further (Netflix sometimes caps L3 at 540p depending on title).
 
-This downloads WidevineCdm, patches all detected browsers, and sets up auto-patching. The scripts can be run directly afterward:
+Hardware-DRM L1 requires a Widevine binary signed by your device's TPM/Secure Enclave + browser binary signed by the browser vendor + CDN-side allow-listing. None of that exists for de-Googled Chromium forks. If you need 4K HDR, you need a device blessed by the studios — Apple TV, smart TV, official Edge/Safari/Chrome.
 
-```
-bash fix-drm.sh              # Patch browsers
-bash fix-drm.sh --force      # Re-patch even if already patched
-bash download-widevine.sh     # Download latest WidevineCdm
-bash check-widevine-update.sh # Check for newer version
-bash uninstall.sh             # Remove daemon and cache
-```
+[ROADMAP.md](ROADMAP.md) has a sketch of a V3 stretch goal — `neon localhost-bridge` — that proxies premium DRM through a local Win11 IoT VM with GPU passthrough. Experimental, behind a Cargo feature flag, not in V1.
 
-### CLI wrapper commands
+## Features
 
-Homebrew, PKGBUILD, and .deb installs add these to your PATH:
+- **One binary, two modes.** The same `neon` executable is both the CLI and the long-running tray daemon. No daemon-spawn race conditions, no second-source-of-truth bugs.
+- **Atomic patching with rollback.** Every patch snapshots the original framework, writes the new one to a staging copy, and atomic-renames into place (`renameat2(RENAME_EXCHANGE)` on Linux, `renameatx_np(RENAME_SWAP)` on macOS). A crash mid-patch never destroys the browser bundle.
+- **Browser-running detection.** Refuses to patch a running browser by default; the daemon defers and retries automatically when the browser quits (mtime stable for 30s).
+- **Tray icon + native notifications.** Per-browser status, one-click re-patch, native success/failure notifications via libnotify (Linux) or NSUserNotificationCenter (macOS).
+- **`neon doctor`** produces structured diagnostics with EME error-code translation (Netflix N-codes, Disney+ codes, Spotify codes, etc.) — paste a Netflix N-codes page right into `neon doctor 6020` for actionable advice.
+- **`neon repair`** brings any broken state back to working in one command.
+- **Opt-in error reporting.** Default off. If enabled in `neon init`, categorized failure reports flow to a Cloudflare Worker so trends become visible without depending on user-filed issues. No PII; no telemetry; only failures.
+- **Mozilla manifest fallback chain.** Primary: `hg.mozilla.org`. Fallback: GitHub mirror. Final fallback: 24h-cached manifest. Survives `hg.mozilla.org` flakes (which is why Mozilla mirrors the manifest themselves).
+- **Migration from V1.** Detects and cleans up legacy bash installs, V1 Homebrew formula installs, AUR packages, and .deb installs.
+
+## CLI reference
 
 | Command | Description |
-|---------|-------------|
-| `neon-install` | Download WidevineCdm, patch browsers, install auto-patch daemon |
-| `neon-patch` | Patch all detected browsers |
-| `neon-patch --force` | Re-patch even if already patched |
-| `neon-update-widevine` | Download latest WidevineCdm |
-| `neon-update-widevine --force` | Re-download even if cached |
-| `neon-uninstall` | Remove daemon and cached files |
-| `neon-check-update` | Check if a newer WidevineCdm version is available |
+|---|---|
+| `neon` | Run the tray daemon (default when invoked without args) |
+| `neon init` | Interactive first-run wizard |
+| `neon setup` | Non-interactive install (scriptable; runs migration first) |
+| `neon patch [--force] [--dry-run] [<browser>]` | Patch one or more browsers |
+| `neon status [--json] [--watch]` | Show per-browser patch status |
+| `neon list-browsers [--all] [--json]` | Enumerate known + auto-discovered browsers |
+| `neon doctor [--json] [--share] [<error-code>]` | Diagnostics + EME error code translation |
+| `neon test` | EME health-check against Shaka Player demo |
+| `neon update widevine [--rollback] [--cdm-source <url>]` | Update the Widevine CDM |
+| `neon update self [--rollback]` | Self-update Neon |
+| `neon repair` | uninstall + setup composition |
+| `neon launch <browser>` | Verify-then-launch wrapper (re-patches if needed) |
+| `neon uninstall` | Remove daemon + cache (preserves browser bundles) |
+| `neon completion <shell>` | Generate shell completions (bash/zsh/fish/powershell) |
+| `neon manpage` | Generate man page (roff) |
+
+Global flags: `-v`/`-vv` for verbose logging, `-q` to silence non-error output, `--no-color` to disable colored output (`NO_COLOR` env honored), `--json` for structured output where applicable.
 
 ## How it works
 
-1. Neon downloads the latest WidevineCdm from Google (via Mozilla's version manifest) and verifies its SHA-512 hash.
+1. **Manifest fetch.** `neon update widevine` pulls Mozilla's `widevinecdm.json` (or the GitHub mirror, or the 24h cache), parses the platform-specific entry (`Linux_x86_64-gcc3` / `Darwin_x86_64-gcc3-u-i386-x86_64` / `Darwin_arm64-gcc3`), and resolves the CRX3 download URL + SHA-512.
+2. **Download.** CRX3 (Chrome Extension v3) is downloaded to `~/.cache/neon/widevine/downloads/<hash>.crx3`, SHA-512 verified, ZIP body extracted to `~/.cache/neon/widevine/<version>/`.
+3. **Patch.** For each detected browser, Neon snapshots the framework directory, writes the CDM in, runs platform-specific finalization (`xattr -cr` + `codesign --force --deep -s -` on macOS; just `chmod 0755` on Linux), and atomic-renames the staging copy into place.
+4. **Daemon.** The daemon (LaunchAgent / systemd-user unit) watches each browser's framework path via `notify` (FSEvents on macOS, inotify on Linux). When a browser self-updates, the watcher fires, the daemon checks the browser is closed, re-patches, and emits a desktop notification.
+5. **Sleep/wake hooks.** On wake-from-sleep, the daemon re-verifies every browser's patch status (browsers can update via package manager while the laptop is asleep).
 
-2. It copies WidevineCdm into each browser's install directory:
-   - **macOS**: patches the `.app` bundle, clears extended attributes, and ad-hoc codesigns
-   - **Linux**: copies into the browser directory alongside the binary
+The full module layout, atomic-rename protocol, and IPC schema are documented in `docs/superpowers/specs/2026-05-04-neon-rust-rewrite-design.md`.
 
-3. A background watcher monitors your browsers for updates and re-patches automatically:
-   - **macOS Homebrew/manual**: LaunchDaemon with WatchPaths
-   - **macOS menu bar app**: built-in file watcher (no root daemon needed)
-   - **Linux**: systemd `.path` unit with PathChanged
-   - **Linux tray app**: built-in inotify watcher
+## Why Neon
 
-## Build from source
+Helium, Thorium, ungoogled-chromium, and similar Chromium forks intentionally remove Google's proprietary blobs (including the Widevine CDM) for privacy / de-Googling reasons. Streaming sites won't play DRM-protected video without a CDM, so a fresh install of any of these browsers can't watch Netflix.
 
-### macOS app
+Neon fills that gap. It downloads the CDM from the same Mozilla manifest that Firefox uses, drops it into the browser bundle, and keeps it in sync as the browser updates. This is the same workflow as `vikas5914/helium-drm-fixer` (which Neon is a successor to) but with cross-platform support, atomic patching, no-root user-session daemon, and integrated diagnostics.
 
-```
-bash app/build.sh
-```
+If you're using Helium, Thorium, ungoogled-chromium, or a custom-built Chromium and you want Netflix to work — Neon is for you.
 
-Produces `build/Neon.app` and `build/Neon.dmg`. Requires Xcode Command Line Tools.
+If you're using regular Chrome, regular Edge, regular Brave, or Firefox — you don't need Neon. Those browsers ship a working Widevine binary already.
 
-### Linux tray app
+## Requirements
 
-```
-cd linux-app
-go mod tidy
-go build -o neon-tray .
-```
+- macOS (x86_64 or aarch64) or Linux (x86_64).
+- On Linux: GTK + `libayatana-appindicator3` for the tray icon. If absent at runtime, the daemon falls back to `--no-tray` mode (notifications-only) with a clear log message.
+- A Chromium-family browser to patch.
 
-Requires Go 1.21+ and `libayatana-appindicator3-dev`.
+ARM64 Linux (Asahi, Pi) is **not** supported in V1 — see [ROADMAP.md](ROADMAP.md) for V2 plans (proper ELF binary patching).
+Windows is **not** supported in V1 — see [ROADMAP.md](ROADMAP.md) for V2 plans.
 
-### Linux packages
+## Documentation
 
-```
-# .deb
-bash packaging/deb/build-deb.sh
-
-# Arch (test locally)
-cd packaging/aur && makepkg -si
-```
-
-## Uninstall
-
-```
-# macOS — Homebrew
-neon-uninstall && brew uninstall neon
-
-# macOS — Manual
-bash uninstall.sh
-
-# Linux — Arch
-neon-uninstall && sudo pacman -R neon-drm
-
-# Linux — .deb
-neon-uninstall && sudo dpkg -r neon-drm
-
-# Linux — Manual
-bash uninstall.sh
-```
-
-## Known limitations
-
-- **Linux support is untested.** The CLI, systemd daemon, and tray app have been built and pass CI, but have not been verified on a real Linux system yet. Bug reports welcome.
-- **Flatpak browsers**: Flatpak sandboxing prevents writing to the browser's install directory.
+- [MIGRATION.md](MIGRATION.md) — upgrading from V1 (bash, Homebrew, DMG, AUR, .deb)
+- [ROADMAP.md](ROADMAP.md) — V1.1 / V2 / V3 plans
+- [CONTRIBUTING.md](CONTRIBUTING.md) — dev setup, conventional commits, PR conventions
+- [SECURITY.md](SECURITY.md) — disclosure policy, supported versions
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — Contributor Covenant 2.1
+- [CHANGELOG.md](CHANGELOG.md) — release history
 
 ## License
 
