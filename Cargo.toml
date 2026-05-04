@@ -37,22 +37,21 @@ lto = "thin"
 # Config for 'dist'
 [workspace.metadata.dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
-cargo-dist-version = "0.22.1"
+cargo-dist-version = "0.31.0"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)
-targets = [
-    "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
-    "x86_64-unknown-linux-musl",
-]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-musl"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
-# Publish jobs to run in CI
+# Which actions to run on pull requests
 pr-run-mode = "plan"
-# Sign artifacts using zipsign for self_update verification
-ssldotcom-windows-sign = "prod"
+# NOTE: zipsign signing is not natively supported by cargo-dist 0.31. The
+# `self_update` crate's `signatures` feature can verify zipsign-signed
+# artifacts at update time; producing those signatures requires a separate
+# post-build signing step. This is deferred to Phase 5 alongside the
+# self-update implementation. See infra handoff doc.
