@@ -183,13 +183,7 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::path::Path;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    /// Process-wide guard for env-mutating tests. Without it, parallel
-    /// `cargo test` workers could race on `$HOME` / `$XDG_CONFIG_HOME` /
-    /// `NEON_TEST_LIFECYCLE_NOOP` and produce flaky failures.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     /// RAII env-var setter that restores on drop. Mirrors the helper in
     /// the per-platform impl modules but exposed at the public-API test
@@ -224,7 +218,7 @@ mod tests {
     /// and forces `is_registered()` to `false`.
     #[test]
     fn noop_short_circuits_all_entry_points() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let _noop = ScopedEnv::set(NOOP_ENV, Path::new("1"));
         assert!(register().is_ok(), "register short-circuits under NOOP");
         assert!(unregister().is_ok(), "unregister short-circuits under NOOP");
@@ -237,7 +231,7 @@ mod tests {
     /// `noop_enabled()` returns true when the var is set, false otherwise.
     #[test]
     fn noop_enabled_reflects_env_var() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let _noop = ScopedEnv::unset(NOOP_ENV);
         assert!(!noop_enabled());
         let _set = ScopedEnv::set(NOOP_ENV, Path::new("anything"));
@@ -248,7 +242,7 @@ mod tests {
     /// environment (via `$HOME` on macOS, `$XDG_CONFIG_HOME` on Linux).
     #[test]
     fn registration_path_resolves_under_redirected_env() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _noop = ScopedEnv::unset(NOOP_ENV);
 
@@ -273,7 +267,7 @@ mod tests {
     /// the underlying `registration_path()` -> `is_file()` plumbing runs.
     #[test]
     fn is_registered_reflects_file_presence() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _noop = ScopedEnv::unset(NOOP_ENV);
 
@@ -297,7 +291,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn is_registered_returns_false_when_paths_unresolvable() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let _noop = ScopedEnv::unset(NOOP_ENV);
         let _xdg = ScopedEnv::unset("XDG_CONFIG_HOME");
         let _home = ScopedEnv::unset("HOME");
@@ -308,7 +302,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn is_registered_returns_false_when_home_unset() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let _noop = ScopedEnv::unset(NOOP_ENV);
         let _home = ScopedEnv::unset("HOME");
         assert!(!is_registered());

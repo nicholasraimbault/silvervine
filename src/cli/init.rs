@@ -463,11 +463,6 @@ mod tests {
         }
     }
 
-    /// Process-wide guard for env-mutating tests. Without it, parallel
-    /// `cargo test` workers could race on the lifecycle NOOP env var.
-    /// Mirrors the pattern used in other env-touching test modules.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// RAII env-var setter that restores on drop.
     struct ScopedEnv {
         key: &'static str,
@@ -553,7 +548,7 @@ mod tests {
 
     #[test]
     fn execute_plan_with_no_browsers_skips_cdm_resolution() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _life = ScopedEnv::set(crate::daemon::lifecycle::NOOP_ENV, Path::new("1"));
         let tmp = TempDir::new().unwrap();
         let plan = Plan {
@@ -580,7 +575,7 @@ mod tests {
 
     #[test]
     fn execute_plan_patches_browsers_and_writes_config() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _life = ScopedEnv::set(crate::daemon::lifecycle::NOOP_ENV, Path::new("1"));
         let tmp = TempDir::new().unwrap();
         let h = tmp.path().join("h");
@@ -642,7 +637,7 @@ mod tests {
 
     #[test]
     fn execute_plan_with_failed_patches_reports_count() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _life = ScopedEnv::set(crate::daemon::lifecycle::NOOP_ENV, Path::new("1"));
         let tmp = TempDir::new().unwrap();
         let h = tmp.path().join("h");

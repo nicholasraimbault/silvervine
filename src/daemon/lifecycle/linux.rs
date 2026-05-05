@@ -214,14 +214,7 @@ impl WithSourceMessage for Error {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    /// Process-wide mutex so env-mutating tests in this file don't race.
-    /// `cargo test` runs each `#[test]` on a worker thread; without this
-    /// guard, tests that swap `$XDG_CONFIG_HOME` could interfere with
-    /// each other and produce flaky results.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     /// RAII env var setter — restores prior value on drop.
     struct ScopedEnv {
@@ -251,7 +244,7 @@ mod tests {
 
     #[test]
     fn registration_path_uses_xdg_when_set() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _xdg = ScopedEnv::set("XDG_CONFIG_HOME", tmp.path());
         let path = registration_path().expect("path resolves");
@@ -261,7 +254,7 @@ mod tests {
 
     #[test]
     fn registration_path_falls_back_to_home_dot_config() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _xdg = ScopedEnv::unset("XDG_CONFIG_HOME");
         let _home = ScopedEnv::set("HOME", tmp.path());
@@ -278,7 +271,7 @@ mod tests {
 
     #[test]
     fn registration_path_errors_when_no_home_or_xdg() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let _xdg = ScopedEnv::unset("XDG_CONFIG_HOME");
         let _home = ScopedEnv::unset("HOME");
         let r = registration_path();
@@ -287,7 +280,7 @@ mod tests {
 
     #[test]
     fn empty_xdg_falls_back_to_home() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         // Empty string $XDG_CONFIG_HOME should fall back to $HOME/.config.
         let _xdg = ScopedEnv::set("XDG_CONFIG_HOME", Path::new(""));
@@ -332,7 +325,7 @@ mod tests {
 
     #[test]
     fn unregister_idempotent_when_unit_missing() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _xdg = ScopedEnv::set("XDG_CONFIG_HOME", tmp.path());
         // Don't bypass NOOP — unregister still does the systemctl shell-out
@@ -389,7 +382,7 @@ mod tests {
         // Simulate by changing PATH to an empty dir and calling the
         // helper. The real systemctl binary is on PATH on every Linux
         // dev box, so we have to deny it via a scoped env override.
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _path = ScopedEnv::set("PATH", tmp.path());
         let r = systemctl_user(&["--version"]);
@@ -431,7 +424,7 @@ mod tests {
     /// own coverage.
     #[test]
     fn register_under_noop_short_circuits() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let _noop = ScopedEnv::set(super::super::NOOP_ENV, Path::new("1"));
         // Public API hits the NOOP gate before any filesystem / shell
         // operation runs.

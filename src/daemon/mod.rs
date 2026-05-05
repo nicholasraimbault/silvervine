@@ -715,10 +715,6 @@ mod tests {
 
     use crate::browsers::BrowserKind;
 
-    /// Process-wide guard so env-mutating tests don't race on $HOME and
-    /// the various NOOP env vars.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
-
     struct ScopedEnv {
         key: &'static str,
         prev: Option<OsString>,
@@ -767,7 +763,7 @@ mod tests {
     /// `run_with` returns `Ok(())` in test mode with `single_iteration=true`.
     #[test]
     fn run_with_test_mode_returns_ok() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _life = ScopedEnv::set(lifecycle::NOOP_ENV, Path::new("1"));
         let _power = ScopedEnv::set(power::NOOP_ENV, Path::new("1"));
@@ -780,7 +776,7 @@ mod tests {
     /// IPC socket gets created during `run_with`.
     #[test]
     fn run_with_creates_ipc_socket() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _life = ScopedEnv::set(lifecycle::NOOP_ENV, Path::new("1"));
         let _power = ScopedEnv::set(power::NOOP_ENV, Path::new("1"));
@@ -799,7 +795,7 @@ mod tests {
     /// Shutdown timestamp is written.
     #[test]
     fn run_with_writes_shutdown_timestamp() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _life = ScopedEnv::set(lifecycle::NOOP_ENV, Path::new("1"));
         let _power = ScopedEnv::set(power::NOOP_ENV, Path::new("1"));
@@ -820,7 +816,7 @@ mod tests {
     /// IPC handler responds to Status with the configured browser count.
     #[test]
     fn ipc_status_reflects_browser_count() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _life = ScopedEnv::set(lifecycle::NOOP_ENV, Path::new("1"));
         let _power = ScopedEnv::set(power::NOOP_ENV, Path::new("1"));
@@ -848,7 +844,7 @@ mod tests {
     /// known browser.
     #[test]
     fn ipc_patch_with_all_browsers_returns_per_browser_results() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _noop = ScopedEnv::set(DAEMON_PATCH_NOOP_ENV, Path::new("1"));
         let tmp = TempDir::new().unwrap();
         let state = IpcSharedState {
@@ -880,7 +876,7 @@ mod tests {
     /// IPC `Patch` filtered by browser returns only that one.
     #[test]
     fn ipc_patch_filter_by_browser_name() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _noop = ScopedEnv::set(DAEMON_PATCH_NOOP_ENV, Path::new("1"));
         let tmp = TempDir::new().unwrap();
         let state = IpcSharedState {
@@ -1095,7 +1091,7 @@ mod tests {
     /// `read_heartbeat_now` returns None when no file exists.
     #[test]
     fn read_heartbeat_now_none_when_missing() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _xdg = ScopedEnv::set("XDG_CACHE_HOME", tmp.path());
         let _home = ScopedEnv::set("HOME", tmp.path());
@@ -1106,7 +1102,7 @@ mod tests {
     /// `read_heartbeat_now` reads the file when it exists.
     #[test]
     fn read_heartbeat_now_some_when_present() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _xdg = ScopedEnv::set("XDG_CACHE_HOME", tmp.path());
         let _home = ScopedEnv::set("HOME", tmp.path());
@@ -1120,7 +1116,7 @@ mod tests {
     /// shell-out happens.
     #[test]
     fn tray_toggle_launch_at_login_under_noop() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _life = ScopedEnv::set(lifecycle::NOOP_ENV, Path::new("1"));
         let _notify = ScopedEnv::set(notify_user::NOOP_ENV, Path::new("1"));
 
@@ -1137,7 +1133,7 @@ mod tests {
     /// Tray `PatchAll` command is logged but doesn't crash the loop.
     #[test]
     fn tray_patch_all_acknowledged() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _noop = ScopedEnv::set(DAEMON_PATCH_NOOP_ENV, Path::new("1"));
         let tray = Tray::headless(MenuState {
             browsers: vec![],
@@ -1151,7 +1147,7 @@ mod tests {
     /// Tray `PatchOne` command carries through to the loop.
     #[test]
     fn tray_patch_one_acknowledged() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _noop = ScopedEnv::set(DAEMON_PATCH_NOOP_ENV, Path::new("1"));
         let tray = Tray::headless(MenuState {
             browsers: vec![],
@@ -1165,7 +1161,7 @@ mod tests {
     /// Tray `UpdateWidevine` command runs.
     #[test]
     fn tray_update_widevine_acknowledged() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _noop = ScopedEnv::set(DAEMON_PATCH_NOOP_ENV, Path::new("1"));
         let tray = Tray::headless(MenuState {
             browsers: vec![],
@@ -1180,7 +1176,7 @@ mod tests {
     /// to per-browser `false` results without invoking the host patcher.
     #[test]
     fn drive_patch_flow_under_noop_returns_false_results() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _noop = ScopedEnv::set(DAEMON_PATCH_NOOP_ENV, Path::new("1"));
         let tmp = TempDir::new().unwrap();
         let browsers = vec![
@@ -1195,7 +1191,7 @@ mod tests {
     /// `drive_patch_flow` filter constrains the result list.
     #[test]
     fn drive_patch_flow_filter_by_name_returns_one_entry() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _noop = ScopedEnv::set(DAEMON_PATCH_NOOP_ENV, Path::new("1"));
         let tmp = TempDir::new().unwrap();
         let browsers = vec![

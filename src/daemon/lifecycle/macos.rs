@@ -262,10 +262,7 @@ impl WithSourceMessage for Error {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     struct ScopedEnv {
         key: &'static str,
@@ -294,7 +291,7 @@ mod tests {
 
     #[test]
     fn registration_path_uses_home() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _home = ScopedEnv::set("HOME", tmp.path());
         let path = registration_path().expect("ok");
@@ -309,7 +306,7 @@ mod tests {
 
     #[test]
     fn registration_path_errors_without_home() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let _home = ScopedEnv::unset("HOME");
         let r = registration_path();
         assert!(r.is_err());
@@ -317,7 +314,7 @@ mod tests {
 
     #[test]
     fn log_path_resolves_under_home_library_logs() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _home = ScopedEnv::set("HOME", tmp.path());
         let p = log_path().expect("ok");
@@ -398,7 +395,7 @@ mod tests {
 
     #[test]
     fn unregister_idempotent_under_noop() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let _noop = ScopedEnv::set(super::super::NOOP_ENV, Path::new("1"));
         // Public API short-circuits, so no shell-out happens.
         assert!(super::super::unregister().is_ok());
@@ -421,7 +418,7 @@ mod tests {
     #[test]
     fn launchctl_required_returns_err_on_missing_binary() {
         // Force PATH to an empty dir so the spawn fails.
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _path = ScopedEnv::set("PATH", tmp.path());
         let r = launchctl_required(&["help"]);
@@ -430,7 +427,7 @@ mod tests {
 
     #[test]
     fn launchctl_returns_err_on_missing_binary() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _path = ScopedEnv::set("PATH", tmp.path());
         let r = launchctl(&["help"]);
@@ -472,7 +469,7 @@ mod tests {
     /// `register()` under NOOP short-circuits (public API gate).
     #[test]
     fn register_under_noop_short_circuits() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let _noop = ScopedEnv::set(super::super::NOOP_ENV, Path::new("1"));
         assert!(super::super::register().is_ok());
     }

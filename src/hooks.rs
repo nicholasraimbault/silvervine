@@ -237,13 +237,7 @@ fn is_executable_file(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    /// Process-wide guard for env-mutating tests. Without it, parallel
-    /// `cargo test` workers could race on `$HOME` / `$XDG_CONFIG_HOME`
-    /// and produce flaky failures. Other modules use the same pattern.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     /// RAII env-var setter that restores on drop.
     struct ScopedEnv {
@@ -425,7 +419,7 @@ exit 0
     /// config dir.
     #[test]
     fn resolve_hook_path_default_falls_back_to_neon_hooks_dir() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         // Override $XDG_CONFIG_HOME (Linux) / $HOME (anything dirs uses).
         let _xdg = ScopedEnv::set("XDG_CONFIG_HOME", tmp.path());
@@ -452,7 +446,7 @@ exit 0
     /// at the resolved path.
     #[test]
     fn run_hook_with_no_script_returns_not_configured() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _xdg = ScopedEnv::set("XDG_CONFIG_HOME", tmp.path());
         let _home = ScopedEnv::set("HOME", tmp.path());
@@ -465,7 +459,7 @@ exit 0
     #[test]
     #[cfg(unix)]
     fn run_hook_runs_default_path_script() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _xdg = ScopedEnv::set("XDG_CONFIG_HOME", tmp.path());
         let _home = ScopedEnv::set("HOME", tmp.path());
@@ -503,7 +497,7 @@ exit 0
     /// Unknown hook name → no `[hooks]` match, fallback to default path.
     #[test]
     fn resolve_hook_path_unknown_name_falls_back() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let _xdg = ScopedEnv::set("XDG_CONFIG_HOME", tmp.path());
         let _home = ScopedEnv::set("HOME", tmp.path());

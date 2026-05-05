@@ -49,6 +49,11 @@ pub mod patch;
 pub mod platform;
 pub mod widevine;
 
+/// Test-only helpers — only exposed in test/dev builds. See module docs
+/// for the env-mutation locking story.
+#[cfg(any(test, debug_assertions))]
+pub mod test_support;
+
 /// V3 localhost-bridge — experimental, gated on `experimental-bridge`.
 ///
 /// Default builds compile no V3 code. Activate with:

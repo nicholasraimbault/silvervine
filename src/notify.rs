@@ -176,9 +176,6 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::path::Path;
-    use std::sync::Mutex;
-
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     struct ScopedEnv {
         key: &'static str,
@@ -250,7 +247,7 @@ mod tests {
     /// returns without hitting D-Bus / mac-notification-sys.
     #[test]
     fn notify_noop_short_circuits_dispatch() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _e = ScopedEnv::set(NOOP_ENV, Path::new("1"));
         // Should not panic / block / open notification.
         notify_success("Helium", "4.10.0.0");
@@ -264,7 +261,7 @@ mod tests {
     /// internal logging.
     #[test]
     fn notify_without_noop_does_not_panic_when_dispatch_fails() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _e = ScopedEnv::unset(NOOP_ENV);
         // We DO NOT actually want this to succeed in CI — the daemon's
         // best-effort behavior is to log+drop on failure. Calling it

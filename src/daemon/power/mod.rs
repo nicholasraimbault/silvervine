@@ -178,9 +178,7 @@ mod tests {
     use std::ffi::OsString;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
-
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    use std::sync::Arc;
 
     struct ScopedEnv {
         key: &'static str,
@@ -211,7 +209,7 @@ mod tests {
     /// cleanly and never fires the callback.
     #[test]
     fn noop_subscription_returns_handle_without_firing() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let _noop = ScopedEnv::set(NOOP_ENV, Path::new("1"));
 
         let counter = Arc::new(AtomicUsize::new(0));
@@ -229,7 +227,7 @@ mod tests {
     /// `noop_enabled()` reflects the env var.
     #[test]
     fn noop_enabled_reflects_env_var() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let _u = ScopedEnv::unset(NOOP_ENV);
         assert!(!noop_enabled());
         let _s = ScopedEnv::set(NOOP_ENV, Path::new("yes"));
@@ -239,7 +237,7 @@ mod tests {
     /// Multiple NOOP subscriptions can co-exist and drop in any order.
     #[test]
     fn multiple_noop_subscriptions_independent() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::env_lock();
         let _noop = ScopedEnv::set(NOOP_ENV, Path::new("1"));
         let s1 = subscribe_wake_events(Box::new(|| {})).expect("ok");
         let s2 = subscribe_wake_events(Box::new(|| {})).expect("ok");

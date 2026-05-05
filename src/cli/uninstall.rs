@@ -138,10 +138,7 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::fs;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     struct ScopedEnv {
         key: &'static str,
@@ -165,7 +162,7 @@ mod tests {
 
     #[test]
     fn run_with_removes_existing_cache() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _life = ScopedEnv::set(crate::daemon::lifecycle::NOOP_ENV, Path::new("1"));
         let tmp = TempDir::new().unwrap();
         let cache = tmp.path().join("cache");
@@ -192,7 +189,7 @@ mod tests {
 
     #[test]
     fn run_with_purge_removes_config() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _life = ScopedEnv::set(crate::daemon::lifecycle::NOOP_ENV, Path::new("1"));
         let tmp = TempDir::new().unwrap();
         let cache = tmp.path().join("cache");
@@ -211,7 +208,7 @@ mod tests {
 
     #[test]
     fn run_with_purge_says_already_absent_when_missing() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _life = ScopedEnv::set(crate::daemon::lifecycle::NOOP_ENV, Path::new("1"));
         let tmp = TempDir::new().unwrap();
         let cache = tmp.path().join("cache");
@@ -231,7 +228,7 @@ mod tests {
 
     #[test]
     fn run_with_no_cache_says_already_clean() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _life = ScopedEnv::set(crate::daemon::lifecycle::NOOP_ENV, Path::new("1"));
         let tmp = TempDir::new().unwrap();
         let cache = tmp.path().join("does-not-exist");
@@ -246,7 +243,7 @@ mod tests {
 
     #[test]
     fn run_with_default_preserves_config() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _life = ScopedEnv::set(crate::daemon::lifecycle::NOOP_ENV, Path::new("1"));
         let tmp = TempDir::new().unwrap();
         let cache = tmp.path().join("cache");

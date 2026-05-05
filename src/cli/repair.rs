@@ -62,10 +62,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::Path;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     struct ScopedEnv {
         key: &'static str,
@@ -97,7 +94,7 @@ mod tests {
     /// config when invoked with `purge: false`.
     #[test]
     fn uninstall_step_preserves_config() {
-        let _g = ENV_MUTEX.lock().unwrap();
+        let _g = crate::test_support::env_lock();
         let _life = ScopedEnv::set(crate::daemon::lifecycle::NOOP_ENV, Path::new("1"));
         let tmp = TempDir::new().unwrap();
         let cache = tmp.path().join("cache");
