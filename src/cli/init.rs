@@ -31,7 +31,10 @@ use crate::config::{Config, ReportingConfig};
 use crate::error::{Error, Result};
 use crate::migration;
 use crate::patch::{self, PatchOptions, PlatformPatcher};
-use crate::widevine::{self, provider::LocalFileCdm};
+use crate::widevine::{
+    self,
+    provider::{CdmProvider, LocalFileCdm},
+};
 
 /// Args for `neon init`.
 #[derive(Debug, Clone, Default)]
@@ -285,6 +288,23 @@ where
     let mut patch_failures = 0_usize;
     for browser in &plan.browsers_to_manage {
         if let Some(cdm) = &cdm {
+            // Idempotency: if the browser is already patched at the
+            // cached CDM version, skip cleanly. This matters for
+            // re-runs of `neon setup` after a self-update — the user
+            // may have the browser open, and a forced re-patch would
+            // fail with `BrowserRunning` even though the system is
+            // already in the desired state.
+            if let Some(installed) = browser.installed_cdm_version() {
+                if installed == cdm.version() {
+                    writeln!(
+                        out,
+                        "{}: already patched (Widevine {installed}); skipping",
+                        browser.name()
+                    )
+                    .map_err(Error::from)?;
+                    continue;
+                }
+            }
             match patch::patch_browser(browser, cdm, patcher, &patch_options) {
                 Ok(outcome) => {
                     writeln!(
@@ -618,6 +638,102 @@ mod tests {
         let parsed = Config::from_toml_str(&toml).unwrap();
         assert!(parsed.reporting.opt_in_error_reporting);
         assert!(parsed.reporting.endpoint.is_some());
+    }
+
+    #[test]
+    fn execute_plan_skips_already_patched_browser_at_matching_version() {
+        let _g = crate::test_support::env_lock();
+        let _life = ScopedEnv::set(crate::daemon::lifecycle::NOOP_ENV, Path::new("1"));
+        let tmp = TempDir::new().unwrap();
+        // Browser install dir + a pre-existing patched manifest at
+        // "4.10.2934.0" — i.e. the CDM is already in place at the
+        // version we'll claim is cached.
+        let h = tmp.path().join("h");
+        fs::create_dir_all(h.join("WidevineCdm")).unwrap();
+        fs::write(
+            h.join("WidevineCdm").join("manifest.json"),
+            br#"{"version":"4.10.2934.0"}"#,
+        )
+        .unwrap();
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+
+        let plan = Plan {
+            browsers_to_manage: vec![make_browser(h.clone(), "Helium")],
+            ..Plan::empty()
+        };
+        let mut buf = Vec::new();
+        let opts = PatchOptions {
+            force_while_running: true,
+            lock_path: Some(tmp.path().join("patch.lock")),
+            backups_dir: Some(tmp.path().join("backups")),
+            ..Default::default()
+        };
+        let patcher = MockPatcher::default();
+        execute_plan(
+            &plan,
+            || Ok(make_cdm(&cache, "4.10.2934.0")),
+            &patcher,
+            Some(&tmp.path().join("config.toml")),
+            &mut buf,
+            opts,
+        )
+        .expect("ok");
+
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.contains("already patched"),
+            "expected idempotency message; got: {s}"
+        );
+        assert!(
+            s.contains("Widevine 4.10.2934.0"),
+            "expected version in skip message; got: {s}"
+        );
+        // Critical: the patcher must NOT have been called — the whole
+        // point of idempotency is to avoid touching a running browser.
+        assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn execute_plan_repatches_when_installed_cdm_version_mismatches() {
+        let _g = crate::test_support::env_lock();
+        let _life = ScopedEnv::set(crate::daemon::lifecycle::NOOP_ENV, Path::new("1"));
+        let tmp = TempDir::new().unwrap();
+        // Browser is patched at an OLDER version; cached CDM is newer
+        // — we should re-patch (write_calls == 1).
+        let h = tmp.path().join("h");
+        fs::create_dir_all(h.join("WidevineCdm")).unwrap();
+        fs::write(
+            h.join("WidevineCdm").join("manifest.json"),
+            br#"{"version":"4.10.0.0"}"#,
+        )
+        .unwrap();
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+
+        let plan = Plan {
+            browsers_to_manage: vec![make_browser(h.clone(), "Helium")],
+            ..Plan::empty()
+        };
+        let mut buf = Vec::new();
+        let opts = PatchOptions {
+            force_while_running: true,
+            lock_path: Some(tmp.path().join("patch.lock")),
+            backups_dir: Some(tmp.path().join("backups")),
+            ..Default::default()
+        };
+        let patcher = MockPatcher::default();
+        execute_plan(
+            &plan,
+            || Ok(make_cdm(&cache, "4.10.2934.0")),
+            &patcher,
+            Some(&tmp.path().join("config.toml")),
+            &mut buf,
+            opts,
+        )
+        .expect("ok");
+
+        assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 1);
     }
 
     /// A patcher whose `write_cdm` fails — used by

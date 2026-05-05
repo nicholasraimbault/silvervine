@@ -123,8 +123,31 @@ impl Browser {
     /// browser's framework structure has changed.
     #[must_use]
     pub fn is_patched(&self) -> bool {
-        // macOS: walk the framework Versions directory to find any version
-        // directory with the CDM at the expected sub-path.
+        self.cdm_manifest_path().is_some()
+    }
+
+    /// Read the version of the currently-installed Widevine CDM, if
+    /// any. Returns `None` if the browser isn't patched, the manifest
+    /// is unreadable, or the manifest doesn't carry a `version` field.
+    ///
+    /// Used by `setup` for idempotency: re-running setup against an
+    /// already-patched browser at the cached CDM version is a no-op
+    /// instead of a re-patch (which would error with `BrowserRunning`
+    /// if the user happens to have the browser open).
+    #[must_use]
+    pub fn installed_cdm_version(&self) -> Option<String> {
+        let manifest_path = self.cdm_manifest_path()?;
+        let body = std::fs::read_to_string(&manifest_path).ok()?;
+        let manifest: serde_json::Value = serde_json::from_str(&body).ok()?;
+        manifest.get("version")?.as_str().map(String::from)
+    }
+
+    /// Resolve the path to the installed CDM's `manifest.json`, if
+    /// any. Mirrors [`Browser::is_patched`]'s search but returns the
+    /// path so [`Browser::installed_cdm_version`] can read it. macOS
+    /// picks the first version directory containing a manifest
+    /// (matches `is_patched`'s short-circuit order).
+    fn cdm_manifest_path(&self) -> Option<std::path::PathBuf> {
         if let Some(framework_name) = &self.framework_name {
             let versions_dir = self
                 .install_path
@@ -140,17 +163,14 @@ impl Browser {
                         .join("WidevineCdm")
                         .join("manifest.json");
                     if manifest.exists() {
-                        return true;
+                        return Some(manifest);
                     }
                 }
             }
-            return false;
+            return None;
         }
-        // Linux: simple per-install check.
-        self.install_path
-            .join("WidevineCdm")
-            .join("manifest.json")
-            .exists()
+        let manifest = self.install_path.join("WidevineCdm").join("manifest.json");
+        manifest.exists().then_some(manifest)
     }
 }
 
@@ -458,6 +478,49 @@ mod tests {
             framework_name: None,
         };
         assert!(b.is_patched());
+    }
+
+    #[test]
+    fn installed_cdm_version_reads_manifest_field() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cdm = tmp.path().join("WidevineCdm");
+        fs::create_dir_all(&cdm).expect("mkdir cdm");
+        fs::write(cdm.join("manifest.json"), br#"{"version":"4.10.2934.0","name":"Widevine CDM"}"#)
+            .expect("write manifest");
+        let b = Browser {
+            name: "x".into(),
+            install_path: tmp.path().to_path_buf(),
+            kind: BrowserKind::Detected,
+            framework_name: None,
+        };
+        assert_eq!(b.installed_cdm_version().as_deref(), Some("4.10.2934.0"));
+    }
+
+    #[test]
+    fn installed_cdm_version_returns_none_when_unpatched() {
+        let tmp = TempDir::new().expect("tempdir");
+        let b = Browser {
+            name: "x".into(),
+            install_path: tmp.path().to_path_buf(),
+            kind: BrowserKind::Detected,
+            framework_name: None,
+        };
+        assert_eq!(b.installed_cdm_version(), None);
+    }
+
+    #[test]
+    fn installed_cdm_version_returns_none_when_manifest_lacks_version() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cdm = tmp.path().join("WidevineCdm");
+        fs::create_dir_all(&cdm).expect("mkdir cdm");
+        fs::write(cdm.join("manifest.json"), b"{}").expect("write manifest");
+        let b = Browser {
+            name: "x".into(),
+            install_path: tmp.path().to_path_buf(),
+            kind: BrowserKind::Detected,
+            framework_name: None,
+        };
+        assert_eq!(b.installed_cdm_version(), None);
     }
 
     #[test]
