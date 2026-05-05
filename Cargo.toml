@@ -114,18 +114,19 @@ notify-rust = "4"
 # trait API; debouncing is done at our layer so we have full control of
 # the per-browser dispatch.
 notify = "8"
-# Tray icon UI. Tauri's tray-icon crate uses GTK + libayatana-appindicator
-# at runtime on Linux and Cocoa NSStatusItem on macOS. We document the
-# Linux runtime dep in the README and fall back to --no-tray if the
-# library isn't available at startup.
-#
-# `libxdo` (default feature) wraps libxdo-dev for keyboard-shortcut
-# simulation in menu accelerators. We don't use accelerators, so we
-# disable the default features and re-add `gtk` (transitively required
-# for the GTK/libayatana-appindicator backend on Linux). This keeps the
-# musl static-build story clean and removes a system C library
-# dependency that's not installed on minimal distros.
-tray-icon = { version = "0.23", default-features = false }
+# Tray icon UI is platform-split:
+#   - Linux: `ksni` — direct StatusNotifierItem implementation over
+#     D-Bus. Zero GTK dep; works natively with any compositor that
+#     speaks SNI (KDE Plasma, noctalia/Quickshell, sway+waybar,
+#     Hyprland+waybar, Cinnamon, etc.). Helium/Thorium/uChromium users
+#     skew toward minimal Arch/Fedora/NixOS where libappindicator isn't
+#     installed by default; ksni lets us render a tray with no extra
+#     packages on those systems.
+#   - macOS: `tray-icon` (Tauri's crate) for its NSStatusItem backend.
+#     We disable default features (libxdo for keyboard accelerators) we
+#     don't use.
+# Linux-only ksni declaration is in `[target.'cfg(target_os = "linux")'`.
+# macOS-only tray-icon declaration is in `[target.'cfg(target_os = "macos")'`.
 # Interactive prompts for `neon init`. The default features are fine for
 # our use; the crate gracefully falls back to non-interactive mode when
 # stdin isn't a TTY (we explicit-check `is_terminal()` at the call sites
@@ -171,11 +172,16 @@ objc2-foundation = "0.2"
 objc2-app-kit = "0.2"
 block2 = "0.5"
 
-# Linux-specific deps: zbus for systemd-logind PrepareForSleep signal.
-# Default features include async runtime integration we don't need; we use
-# only the blocking API on a dedicated background thread.
+# Linux-specific deps:
+#  - `zbus` for the systemd-logind PrepareForSleep signal. Default
+#    features include async runtime integration we don't need; we use
+#    only the blocking API on a dedicated background thread.
+#  - `ksni` for the system tray (StatusNotifierItem over D-Bus). Default
+#    features pull `tokio`; we use the runtime-agnostic `blocking`
+#    feature instead so we don't need to introduce an async runtime.
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = { version = "4" }
+zbus = { version = "5" }
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 # libvirt-rs (`virt`) for V3-Phase C bridge VM orchestration. Optional
 # so default builds don't pull it in; activated transitively when the
 # user opts into `experimental-bridge` AND is on Linux. This dep is

@@ -53,8 +53,67 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
+
 use crate::browsers::Browser;
 use crate::error::{Error, Result};
+
+/// Whether the platform's tray icon backend is usable at runtime.
+///
+/// On Linux this hinges on a reachable session D-Bus (the
+/// StatusNotifierItem protocol that `ksni` implements is pure D-Bus —
+/// no GTK / libappindicator runtime required). On macOS the Cocoa
+/// backend is always present.
+///
+/// Used by `neon doctor` to surface the silent-fallback condition that
+/// the daemon hits when the user's compositor doesn't expose a tray —
+/// without this, a casual user has to grep journalctl to discover that
+/// their tray is disabled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "reason", rename_all = "snake_case")]
+pub enum TrayAvailability {
+    /// The platform tray backend is usable; the daemon will mount a
+    /// real tray icon.
+    Available,
+    /// The backend is unusable in this environment; the daemon falls
+    /// back to notifications-only. The string explains why.
+    Unavailable(String),
+}
+
+/// Probe whether the platform tray backend is usable.
+///
+/// Intended for diagnostics surfaces (`neon doctor`). Cheap enough to
+/// call on every doctor invocation — opens a session D-Bus connection
+/// and immediately drops it.
+///
+/// **Note**: a positive result means the protocol prerequisites are in
+/// place; the daemon may still fail to render a tray if no compositor
+/// / tray bar is listening for `StatusNotifierItem` registrations.
+/// (`ksni` retries automatically when a watcher comes online, so this
+/// is usually a transient condition.)
+#[must_use]
+pub fn detect_tray_availability() -> TrayAvailability {
+    #[cfg(target_os = "linux")]
+    {
+        match zbus::blocking::Connection::session() {
+            Ok(_conn) => TrayAvailability::Available,
+            Err(e) => TrayAvailability::Unavailable(format!(
+                "session D-Bus unavailable ({e}); tray won't render. \
+                 Notifications-only fallback is active. Check that \
+                 $DBUS_SESSION_BUS_ADDRESS is set and a session bus is \
+                 running in your user session."
+            )),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        TrayAvailability::Available
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        TrayAvailability::Unavailable("tray icon not supported on this platform".into())
+    }
+}
 
 /// Event emitted by the tray on a user interaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -490,9 +549,16 @@ pub struct Tray {
     inner: Option<TrayInner>,
 }
 
-/// Wrapper around the platform-specific `tray-icon` handle. Behind a
-/// struct so we can extend it (icon set, tooltip update) without
-/// changing [`Tray`].
+/// Wrapper around the platform-specific tray handle. Platform-split:
+/// Linux uses `ksni` (StatusNotifierItem over D-Bus, no GTK runtime),
+/// macOS uses Tauri's `tray-icon` (Cocoa NSStatusItem).
+#[cfg(target_os = "linux")]
+struct TrayInner {
+    /// Spawn handle from `ksni`. Dropping the handle (when [`Tray`]
+    /// drops) shuts the StatusNotifierItem service down cleanly.
+    handle: ksni::blocking::Handle<NeonKsniTray>,
+}
+#[cfg(target_os = "macos")]
 struct TrayInner {
     _tray: tray_icon::TrayIcon,
     /// Map of `MenuId` strings → command, for click-event routing.
@@ -502,6 +568,143 @@ struct TrayInner {
     /// time) doesn't see a moving target — even though no one reads
     /// this field directly after construction.
     _routes: std::collections::HashMap<String, TrayCommand>,
+}
+
+/// `ksni::Tray` implementation. Holds a snapshot of `MenuState` and a
+/// `Sender<TrayCommand>` so menu callbacks can route clicks back to
+/// the daemon's main loop.
+///
+/// Lives on Linux only; macOS uses Cocoa via `tray-icon` instead.
+///
+/// State updates flow via [`ksni::blocking::Handle::update`] — the
+/// daemon calls [`Tray::set_state`], which both mutates the
+/// daemon-side `MenuState` and pushes the new state into this struct
+/// so `menu()` re-renders with the latest layout.
+#[cfg(target_os = "linux")]
+struct NeonKsniTray {
+    /// Latest menu-state snapshot. Read by [`ksni::Tray::menu`] every
+    /// time the SNI client requests the current menu.
+    state: MenuState,
+    /// Channel back to the daemon's main loop. Each menu item's
+    /// `activate` callback clones this and sends the appropriate
+    /// `TrayCommand` on click.
+    tx: Sender<TrayCommand>,
+}
+
+#[cfg(target_os = "linux")]
+impl ksni::Tray for NeonKsniTray {
+    fn id(&self) -> String {
+        "neon".into()
+    }
+
+    fn icon_name(&self) -> String {
+        // Freedesktop icon-naming spec — "video-display" is in every
+        // mainstream icon theme (hicolor, Adwaita, Breeze, Papirus,
+        // etc.) and is a sensible "media playback helper" glyph for
+        // a Widevine helper. A follow-up commit replaces this with an
+        // embedded ARGB32 pixmap of the Neon icon.
+        "video-display".into()
+    }
+
+    fn title(&self) -> String {
+        "Neon".into()
+    }
+
+    fn tool_tip(&self) -> ksni::ToolTip {
+        ksni::ToolTip {
+            title: "Neon — Widevine helper".into(),
+            description: String::new(),
+            icon_name: "video-display".into(),
+            icon_pixmap: vec![],
+        }
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        ksni_menu_from_specs(&menu_layout(&self.state), &self.tx)
+    }
+}
+
+/// Convert our pure-data [`MenuItemSpec`] vec into the `ksni::MenuItem`
+/// representation. Each actionable item gets a closure that sends the
+/// item's [`TrayCommand`] back to the daemon over the supplied
+/// `Sender`.
+///
+/// Recurses on submenus — `ksni` supports real nested menus, so V3's
+/// `Bridge ▶` submenu renders properly without the flatten-and-indent
+/// hack the macOS `tray-icon` path uses.
+#[cfg(target_os = "linux")]
+fn ksni_menu_from_specs(
+    specs: &[MenuItemSpec],
+    tx: &Sender<TrayCommand>,
+) -> Vec<ksni::MenuItem<NeonKsniTray>> {
+    use ksni::menu::{CheckmarkItem, StandardItem, SubMenu};
+    use ksni::MenuItem as M;
+
+    specs
+        .iter()
+        .map(|spec| match spec {
+            MenuItemSpec::BrowserStatus { browser_name, .. } => {
+                // Click on a per-browser row → request a targeted
+                // re-patch for that browser. Matches the routing the
+                // macOS `build_routes` path produces. The label
+                // (which includes the patched/not-patched glyph) is
+                // produced by `spec.label()` so we don't need to
+                // destructure `patched` here.
+                let cmd = TrayCommand::PatchOne(browser_name.clone());
+                let tx = tx.clone();
+                StandardItem {
+                    label: spec.label(),
+                    activate: Box::new(move |_: &mut NeonKsniTray| {
+                        let _ = tx.send(cmd.clone());
+                    }),
+                    ..Default::default()
+                }
+                .into()
+            }
+            MenuItemSpec::Action { label, command } => {
+                let cmd = command.clone();
+                let tx = tx.clone();
+                StandardItem {
+                    label: label.clone(),
+                    activate: Box::new(move |_| {
+                        let _ = tx.send(cmd.clone());
+                    }),
+                    ..Default::default()
+                }
+                .into()
+            }
+            MenuItemSpec::Toggle {
+                label,
+                checked,
+                command_when_toggled,
+            } => {
+                let cmd = command_when_toggled.clone();
+                let tx = tx.clone();
+                CheckmarkItem {
+                    label: label.clone(),
+                    checked: *checked,
+                    activate: Box::new(move |_| {
+                        let _ = tx.send(cmd.clone());
+                    }),
+                    ..Default::default()
+                }
+                .into()
+            }
+            MenuItemSpec::Submenu { label, items } => SubMenu {
+                label: label.clone(),
+                submenu: ksni_menu_from_specs(items, tx),
+                ..Default::default()
+            }
+            .into(),
+            MenuItemSpec::Label { text } => StandardItem {
+                label: text.clone(),
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+            MenuItemSpec::Separator => M::Separator,
+        })
+        .collect()
 }
 
 impl Tray {
@@ -523,10 +726,35 @@ impl Tray {
     ///   failure.
     pub fn new(initial_state: MenuState) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<TrayCommand>();
-        let routes = build_routes(&initial_state);
-        let inner = build_tray_icon(&initial_state, &routes, tx.clone()).map_err(|e| {
-            Error::unsupported_platform(format!("tray-icon initialization failed: {e}"))
-        })?;
+
+        #[cfg(target_os = "linux")]
+        let inner = {
+            use ksni::blocking::TrayMethods;
+            let tray_impl = NeonKsniTray {
+                state: initial_state.clone(),
+                tx: tx.clone(),
+            };
+            // `assume_sni_available(true)` lets the daemon survive a
+            // compositor restart and tolerate startups before the
+            // tray bar is up: ksni retries instead of failing fatally
+            // when no SNI watcher is registered yet.
+            let handle = tray_impl
+                .assume_sni_available(true)
+                .spawn()
+                .map_err(|e| {
+                    Error::unsupported_platform(format!("ksni tray failed to spawn: {e}"))
+                })?;
+            TrayInner { handle }
+        };
+
+        #[cfg(target_os = "macos")]
+        let inner = {
+            let routes = build_routes(&initial_state);
+            build_tray_icon(&initial_state, &routes, tx.clone()).map_err(|e| {
+                Error::unsupported_platform(format!("tray-icon initialization failed: {e}"))
+            })?
+        };
+
         Ok(Self {
             rx: Mutex::new(rx),
             tx,
@@ -555,14 +783,25 @@ impl Tray {
         self.state.lock().unwrap().clone()
     }
 
-    /// Update the menu state. The next call to [`Tray::menu_layout`]
-    /// reflects the new layout. (Re-rendering the live tray icon is
-    /// not a Phase 3 deliverable — daemon's main loop simply drops the
-    /// existing tray and constructs a fresh one when state changes
-    /// non-trivially. A follow-up can wire `set_menu` into the tray
-    /// crate for incremental updates.)
+    /// Update the menu state. On Linux the live `ksni` service is
+    /// pushed the new state immediately, so the rendered menu reflects
+    /// the change without a tray-icon rebuild. On macOS the daemon's
+    /// main loop drops + reconstructs `Tray` when state changes
+    /// non-trivially (a follow-up can wire `tray-icon`'s `set_menu`).
     pub fn set_state(&self, state: MenuState) {
-        *self.state.lock().unwrap() = state;
+        *self.state.lock().unwrap() = state.clone();
+        #[cfg(target_os = "linux")]
+        if let Some(inner) = &self.inner {
+            // `update` returns None if the ksni service has shut down;
+            // that's a transient condition we don't need to log here
+            // because the daemon's main loop already handles channel
+            // disconnection on the receiver side.
+            let _ = inner.handle.update(|tray: &mut NeonKsniTray| {
+                tray.state = state;
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = state;
     }
 
     /// Render the current menu layout (pure-data view).
@@ -600,14 +839,21 @@ impl Tray {
     }
 }
 
-/// Build a map of `MenuId` strings to [`TrayCommand`] used by the tray
-/// crate's event handler to route click events back to us.
+/// Build a map of `MenuId` strings to [`TrayCommand`] used by the
+/// macOS `tray-icon` event handler to route click events back to us.
 ///
 /// Each entry in the menu layout gets a unique stable id derived from
 /// its position + content; we re-build the map every time we re-render.
 ///
 /// Submenu children are also routed: for index `idx` the submenu, the
 /// submenu's children get ids prefixed with `<submenu-id>-child-<n>`.
+///
+/// On Linux the tray uses `ksni`, where each menu item carries its own
+/// `activate` callback — no central routing table is needed. The
+/// function (and tests below) remain compiled on all platforms because
+/// the routing logic itself is platform-agnostic and the tests verify
+/// it stays correct.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn build_routes(state: &MenuState) -> std::collections::HashMap<String, TrayCommand> {
     let mut routes = std::collections::HashMap::new();
     let layout = menu_layout(state);
@@ -623,6 +869,7 @@ fn build_routes(state: &MenuState) -> std::collections::HashMap<String, TrayComm
 /// `parent_id` is `Some(parent)` when we're inside a submenu — child
 /// ids are derived from the submenu's id + the child's index so they
 /// stay unique across re-renders.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn route_item_into(
     routes: &mut std::collections::HashMap<String, TrayCommand>,
     idx: usize,
@@ -660,6 +907,7 @@ fn route_item_into(
 /// Build a stable id for a menu item at a given position. Position +
 /// label is enough to identify any of our menu items uniquely (we never
 /// have two browsers with the same name).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn menu_item_id(index: usize, item: &MenuItemSpec) -> String {
     match item {
         MenuItemSpec::BrowserStatus { browser_name, .. } => {
@@ -673,12 +921,15 @@ fn menu_item_id(index: usize, item: &MenuItemSpec) -> String {
     }
 }
 
-/// Construct the live tray icon. This is the only function in this
-/// module that touches the GUI — guarded by a `Result` so callers can
-/// fall back to headless mode if it fails (e.g. no
-/// `libayatana-appindicator3` on a Linux box).
+/// Construct the live tray icon (macOS only — Linux uses `ksni`
+/// directly via [`NeonKsniTray`]).
+///
+/// This is the only function in this module that touches the macOS
+/// `tray-icon` GUI handle — guarded by a `Result` so callers can
+/// fall back to headless mode if it fails.
 ///
 /// Tests do **not** call this; they use [`Tray::headless`].
+#[cfg(target_os = "macos")]
 #[allow(clippy::needless_pass_by_value)] // `tx` is moved into the click handler closure
 fn build_tray_icon(
     state: &MenuState,
