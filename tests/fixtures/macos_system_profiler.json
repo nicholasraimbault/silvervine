@@ -1,0 +1,18 @@
+{
+  "SPHardwareDataType": [
+    {
+      "_name": "hardware_overview",
+      "boot_rom_version": "10151.140.19.0.0",
+      "chip_type": "Apple M2 Pro",
+      "machine_model": "Mac14,7",
+      "machine_name": "Mac mini",
+      "model_number": "MNH73LL/A",
+      "number_processors": "proc 12:8:4",
+      "os_loader_version": "10151.140.19.0.0",
+      "physical_memory": "32 GB",
+      "platform_UUID": "00000000-0000-0000-0000-000000000000",
+      "provisioning_UDID": "00000000-0000-0000-0000-000000000000",
+      "serial_number": "REDACTED"
+    }
+  ]
+}

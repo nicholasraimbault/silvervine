@@ -271,6 +271,11 @@ pub use linux::LinuxPaths;
 #[cfg(target_os = "macos")]
 pub use macos::MacosPaths;
 
+/// Hardware capability detection (V3-Phase B). See [`capabilities`] for
+/// the full module documentation. Default V2 builds compile this module
+/// but only the V3 wizard / `neon doctor --bridge` path consume it.
+pub mod capabilities;
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod unsupported {
     //! Stub implementation for platforms outside V1's scope (e.g. Windows,
