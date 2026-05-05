@@ -214,14 +214,16 @@ enum StreamSubcommand {
         json: bool,
     },
 
-    /// Resume the bridge VM and open the URL in Edge inside the guest
-    /// (queued for V3-Phase D).
+    /// Resume the bridge VM and (optionally) open a URL in Edge inside
+    /// the guest. Cold-start target: <10s on a warm snapshot pool.
     Start {
-        /// URL to open in the bridged browser.
-        url: String,
+        /// Optional URL to open in the bridged browser. URL navigation
+        /// is queued for V3-Phase F; for now Edge boots at default.
+        url: Option<String>,
     },
 
-    /// Snapshot + halt the bridge VM (queued for V3-Phase D).
+    /// Snapshot + halt the bridge VM. Pauses the VM (suspend-to-RAM);
+    /// next `neon stream start` resumes from the `last-good` snapshot.
     Stop,
 
     /// Detect + fix broken bridge state (queued for V3-Phase F).
@@ -343,8 +345,10 @@ fn dispatch_stream(sub: StreamSubcommand, output: cli::OutputOptions) -> neon::R
         StreamSubcommand::Status { json } => {
             stream::Subcommand::Status(stream::StatusArgs { json, output })
         }
-        StreamSubcommand::Start { url } => stream::Subcommand::Start { url, output },
-        StreamSubcommand::Stop => stream::Subcommand::Stop { output },
+        StreamSubcommand::Start { url } => {
+            stream::Subcommand::Start(stream::StartArgs { url, output })
+        }
+        StreamSubcommand::Stop => stream::Subcommand::Stop(stream::StopArgs { output }),
         StreamSubcommand::Repair => stream::Subcommand::Repair { output },
         StreamSubcommand::Uninstall { purge } => stream::Subcommand::Uninstall { purge, output },
         StreamSubcommand::License => stream::Subcommand::License { output },

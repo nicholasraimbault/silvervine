@@ -95,25 +95,30 @@ fn stream_subcommand_help_succeeds_with_feature_on() {
     }
 }
 
-/// V3-Phase C: `neon stream start <url>` (V3-Phase D stub) exits
-/// non-zero with a "queued for V3-Phase D" error.
+/// V3-Phase D: `neon stream start <url>` against a fresh host
+/// (without `bridge.toml`) surfaces the "run `neon stream init`
+/// first" remediation. We point `XDG_CONFIG_HOME` at an empty tempdir
+/// to guarantee no `bridge.toml` is found regardless of the runner's
+/// real `~/.config`.
 #[cfg(feature = "experimental-bridge")]
 #[test]
-fn stream_start_returns_phase_d_stub() {
+fn stream_start_without_bridge_toml_suggests_init() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
     let bin = env!("CARGO_BIN_EXE_neon");
     let output = Command::new(bin)
         .args(["stream", "start", "https://example.com"])
+        .env("XDG_CONFIG_HOME", tmp.path())
         .output()
         .expect("spawn neon binary");
     assert!(
         !output.status.success(),
-        "stream start stub must exit non-zero (status was {:?})",
+        "stream start without bridge.toml must exit non-zero (status was {:?})",
         output.status
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("V3-Phase D"),
-        "stub error must mention V3-Phase D; got: {stderr}"
+        stderr.contains("bridge.toml") || stderr.contains("neon stream init"),
+        "expected bridge.toml not-found remediation; got: {stderr}"
     );
 }
 

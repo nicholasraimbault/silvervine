@@ -1,25 +1,26 @@
 //! `neon stream <subcommand>` — V3 experimental localhost-bridge.
 //!
 //! Only compiled when the `experimental-bridge` Cargo feature is on.
-//! V3-Phase C ships:
-//!
-//! * [`init`] — provisions the bridge VM (the heavy phase).
-//! * [`status`] — surfaces VM state, snapshot age, license expiry.
-//!
-//! Future V3 phases extend this surface with `start`, `stop`, `repair`,
-//! `uninstall`, `license`. Until those land, those subcommands return
-//! a "queued for V3-Phase D/F" stub error pointing at ROADMAP.md.
+//! V3-Phase C shipped `init` + `status`. V3-Phase D adds `start` +
+//! `stop`. V3-Phase F adds `repair`, `uninstall`, `license` (stubbed
+//! until then).
 
 use crate::cli::OutputOptions;
 use crate::error::{Error, Result};
 
 pub mod init;
+pub mod start;
 pub mod status;
+pub mod stop;
 
 /// `neon stream init` Args (top-level CLI subcommand).
 pub use init::Args as InitArgs;
+/// `neon stream start` Args (V3-Phase D).
+pub use start::Args as StartArgs;
 /// `neon stream status` Args.
 pub use status::Args as StatusArgs;
+/// `neon stream stop` Args (V3-Phase D).
+pub use stop::Args as StopArgs;
 
 /// Subcommand variants under `neon stream`. Mapped 1:1 from
 /// the `StreamSubcommand` enum in `src/main.rs`.
@@ -29,18 +30,10 @@ pub enum Subcommand {
     Init(InitArgs),
     /// `neon stream status [--json]`.
     Status(StatusArgs),
-    /// `neon stream start <url>` — V3-Phase D (stubbed).
-    Start {
-        /// URL to open in the bridged browser.
-        url: String,
-        /// Output flags.
-        output: OutputOptions,
-    },
-    /// `neon stream stop` — V3-Phase D (stubbed).
-    Stop {
-        /// Output flags.
-        output: OutputOptions,
-    },
+    /// `neon stream start [URL]` — V3-Phase D.
+    Start(StartArgs),
+    /// `neon stream stop` — V3-Phase D.
+    Stop(StopArgs),
     /// `neon stream repair` — V3-Phase F (stubbed).
     Repair {
         /// Output flags.
@@ -65,20 +58,14 @@ pub enum Subcommand {
 /// # Errors
 ///
 /// * Propagates errors from each subcommand.
-/// * V3-Phase C-stubbed subcommands return `Error::other("queued for
-///   V3-Phase D/F")` pointing at ROADMAP.md.
+/// * V3-Phase F-stubbed subcommands return `Error::other("queued for
+///   V3-Phase F")` pointing at ROADMAP.md.
 pub fn run(sub: Subcommand) -> Result<()> {
     match sub {
         Subcommand::Init(args) => init::run(&args),
         Subcommand::Status(args) => status::run(&args),
-        Subcommand::Start { .. } => Err(Error::other(
-            "neon stream start is queued for V3-Phase D. \
-             Track ROADMAP.md and the V3 orchestration plan.",
-        )),
-        Subcommand::Stop { .. } => Err(Error::other(
-            "neon stream stop is queued for V3-Phase D. \
-             Track ROADMAP.md and the V3 orchestration plan.",
-        )),
+        Subcommand::Start(args) => start::run(&args),
+        Subcommand::Stop(args) => stop::run(&args),
         Subcommand::Repair { .. } => Err(Error::other(
             "neon stream repair is queued for V3-Phase F. \
              Track ROADMAP.md and the V3 orchestration plan.",
@@ -97,26 +84,6 @@ pub fn run(sub: Subcommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn start_returns_phase_d_stub() {
-        let err = run(Subcommand::Start {
-            url: "https://example.com".into(),
-            output: OutputOptions::default(),
-        })
-        .expect_err("stub");
-        assert_eq!(err.category, crate::ErrorCategory::Other);
-        assert!(err.to_string().contains("V3-Phase D"));
-    }
-
-    #[test]
-    fn stop_returns_phase_d_stub() {
-        let err = run(Subcommand::Stop {
-            output: OutputOptions::default(),
-        })
-        .expect_err("stub");
-        assert!(err.to_string().contains("V3-Phase D"));
-    }
 
     #[test]
     fn repair_returns_phase_f_stub() {
