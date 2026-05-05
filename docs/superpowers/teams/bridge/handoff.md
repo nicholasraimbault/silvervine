@@ -31,7 +31,18 @@ V3-Phase A scaffolding files. Future V3 phases (B → F) extend the same files p
 | `neon stream status` reporter | `src/cli/stream/status.rs` | ~380 | 7 |
 | `cli::stream` subcommand group + dispatcher | `src/cli/stream/mod.rs` | ~140 | 5 |
 
-V3-Phase D (Looking Glass + tray extensions) is queued. Not started.
+**V3-Phase D (Looking Glass + tray extensions) complete (2026-05-04).** All 8 deliverables landed; both build paths green; 503 default tests passing (unchanged: V3 modules are feature-gated); 686 with `--features experimental-bridge` on (675 lib + 11 integration). New surface area:
+
+| Area | Module | LOC | Tests |
+|---|---|---|---|
+| kvmfr module detection (`/proc/modules` + `/sys` + `/dev` + `/lib/modules`) | `src/bridge/kvmfr.rs` | ~370 | 14 |
+| Looking Glass client wrapper (spawn + SIGTERM-on-drop) | `src/bridge/looking_glass.rs` | ~480 | 13 |
+| Single-GPU IDD fallback / dummy plug detection | `src/bridge/idd_fallback.rs` | ~390 | 13 |
+| `neon stream start` (resume + LG launch) | `src/cli/stream/start.rs` | ~395 | 11 |
+| `neon stream stop` (snapshot + halt) | `src/cli/stream/stop.rs` | ~190 | 5 |
+| Tray V3 extensions (streaming + Bridge submenu, feature-gated) | `src/daemon/tray.rs` | +~360 | 14 (new V3 test module) |
+| Daemon dispatch handlers for new TrayCommand variants | `src/daemon/mod.rs` | +~115 | (covered through orchestration tests) |
+| `cli::stream::Subcommand::Start/Stop` wiring through main.rs + dispatcher | `src/cli/stream/mod.rs`, `src/main.rs`, `tests/feature_flag.rs` | net +20 | 1 (revised integration test) |
 
 ## V3-Phase A deliverables — status
 
@@ -136,11 +147,11 @@ The `experimental-bridge` Cargo feature, plus `experimental` umbrella, are part 
 
 ### Future V3 phases
 
-V3-Phase D (`bridge` team): Looking Glass integration. Adds `src/bridge/{kvmfr,looking_glass,idd_fallback}.rs` + `cli::stream::{start,stop}`. Will also add tray menu extensions for streaming controls.
+V3-Phase D (`bridge` + `daemon` teams): Looking Glass integration + tray growth. **Done (2026-05-04).** See above.
 
 V3-Phase E (`bridge` + `core-engine`): CDM forwarding. Recommended deferred to V3.1 per the orchestration plan.
 
-V3-Phase F (`cli` + `bridge`): `cli::stream::{repair,uninstall,license}` wizard polish + tray notifications.
+V3-Phase F (`cli` + `bridge` + `daemon`): `cli::stream::{repair,uninstall,license}` wizard polish + tray notifications + URL navigation into the guest's Edge (deferred from V3-Phase D).
 
 ## V3-Phase C public contracts
 
@@ -154,6 +165,111 @@ See module-level rustdoc in each `src/bridge/*.rs` and `src/cli/stream/*.rs` for
 - `bridge::install::provision(&ProvisionOpts) -> Result<ProvisionOutcome>`
 - `cli::stream::init::run(&Args)` and `cli::stream::status::run(&Args)`
 
+## V3-Phase D public contracts
+
+```rust
+// src/bridge/kvmfr.rs (Linux only)
+pub enum KvmfrStatus {
+    Loaded { device_path: PathBuf },
+    Available { module_path: PathBuf },
+    Missing,
+}
+pub struct KvmfrRoots {
+    pub proc_modules: PathBuf,
+    pub sys_class_misc: PathBuf,
+    pub dev: PathBuf,
+    pub lib_modules: PathBuf,
+}
+impl KvmfrRoots { pub fn host() -> Self; }
+pub fn detect_kvmfr() -> KvmfrStatus;            // honors NEON_TEST_KVMFR_NOOP=1
+pub fn detect_kvmfr_with(roots: &KvmfrRoots) -> KvmfrStatus;
+pub fn load_module_command() -> &'static str;    // documented sudo modprobe (does NOT execute)
+pub fn udev_rule_text() -> &'static str;         // /etc/udev/rules.d/99-kvmfr.rules body
+pub const NOOP_ENV: &str = "NEON_TEST_KVMFR_NOOP";
+
+// src/bridge/looking_glass.rs (Linux only)
+pub struct LookingGlassSpec {
+    pub device_path: PathBuf,
+    pub fullscreen: bool,
+    pub cursor_grab: bool,
+    pub audio: bool,
+    pub hdr_passthrough: bool,
+}
+impl LookingGlassSpec { pub fn defaults() -> Self; }
+pub struct LookingGlassHandle { /* pid + log_path + mock flag; SIGTERM on Drop */ }
+impl LookingGlassHandle {
+    pub fn pid(&self) -> Option<u32>;
+    pub fn log_path(&self) -> Option<&Path>;
+    pub fn is_mock(&self) -> bool;
+    pub fn mock() -> Self;
+}
+pub fn launch(spec: &LookingGlassSpec) -> Result<LookingGlassHandle>;
+pub fn detect_client_binary() -> Option<PathBuf>;        // walks $PATH manually
+pub fn render_command_args(spec: &LookingGlassSpec) -> Vec<String>;
+pub const NOOP_ENV: &str = "NEON_TEST_LG_NOOP";
+pub const CLIENT_BINARY_NAME: &str = "looking-glass-client";
+
+// src/bridge/idd_fallback.rs
+pub enum IddFallbackStatus {
+    NotRequired,
+    DummyPlugRequired { reason: String, shopping_link: &'static str },
+    IddHostAvailable,                                    // forward-compat
+}
+impl IddFallbackStatus {
+    pub fn is_satisfied(&self) -> bool;                  // NotRequired | IddHostAvailable
+    pub fn shopping_link(&self) -> Option<&'static str>;
+}
+pub fn detect(caps: &BridgeCapabilities) -> IddFallbackStatus;
+pub fn detect_with(caps: &BridgeCapabilities, drm_root: &Path) -> IddFallbackStatus;
+pub const DUMMY_PLUG_SHOPPING_LINK: &str = "https://www.amazon.com/dp/B07YFF3JGL";
+
+// src/cli/stream/start.rs
+pub struct Args { pub url: Option<String>, pub output: OutputOptions }
+pub fn run(args: &Args) -> Result<()>;
+pub fn run_with<F: FnOnce() -> BridgeCapabilities>(args: &Args, out: &mut dyn Write, detect: F) -> Result<()>;
+pub const COLD_START_BUDGET: Duration = Duration::from_secs(10);
+
+// src/cli/stream/stop.rs
+pub struct Args { pub output: OutputOptions }
+pub fn run(args: &Args) -> Result<()>;
+pub fn run_with(args: &Args, out: &mut dyn Write) -> Result<()>;
+pub const LAST_GOOD_SNAPSHOT: &str = "last-good";
+
+// src/daemon/tray.rs (additions, all feature-gated)
+pub enum TrayCommand {
+    /* existing variants ... */
+    #[cfg(feature = "experimental-bridge")] StreamUrl(String),
+    #[cfg(feature = "experimental-bridge")] BridgePause,
+    #[cfg(feature = "experimental-bridge")] BridgeResume,
+    #[cfg(feature = "experimental-bridge")] BridgeRepair,
+}
+pub enum MenuItemSpec {
+    /* existing variants ... */
+    Label { text: String },                              // additive
+    Submenu { label: String, items: Vec<MenuItemSpec> }, // additive
+}
+pub struct MenuState {
+    pub browsers: Vec<BrowserMenuEntry>,
+    pub launch_at_login: bool,
+    #[cfg(feature = "experimental-bridge")]
+    pub bridge: BridgeMenuState,                         // feature-gated field
+}
+#[cfg(feature = "experimental-bridge")]
+pub struct BridgeMenuState {
+    pub ready: bool,
+    pub paused: bool,
+    pub snapshot_age_hours: Option<u64>,
+    pub eval_days_remaining: Option<i64>,
+}
+```
+
+Test-mode env vars added in V3-Phase D:
+
+| Var | Effect |
+|---|---|
+| `NEON_TEST_KVMFR_NOOP=1` | `kvmfr::detect_kvmfr` returns a fixture `Loaded` status without filesystem I/O |
+| `NEON_TEST_LG_NOOP=1` | `looking_glass::launch` returns a mock handle without spawning `looking-glass-client` |
+
 Test-mode env vars added in V3-Phase C:
 
 | Var | Effect |
@@ -166,6 +282,32 @@ Test-mode env vars added in V3-Phase C:
 | `NEON_TEST_VIRTXMLVALIDATE_NOOP=1` | `libvirt_xml::validate_with_virt_xml_validate` short-circuits |
 | `NEON_TEST_PROVISION_NOOP=1` | Top-level `install::provision` short-circuits, returns a stub outcome |
 | `NEON_TEST_STATUS_NO_NETWORK=1` | `stream::status::probe_sunshine` is skipped (no TCP connect) |
+
+## Decisions log (V3-Phase D)
+
+- **2026-05-04 (V3-Phase D)** — `kvmfr.rs` and `looking_glass.rs` are gated `#[cfg(target_os = "linux")]` (in addition to the feature flag). Reason: kvmfr is a Linux kernel module and `looking-glass-client` is Linux-first (the macOS port is in flux). `idd_fallback.rs` is *not* OS-gated because the underlying detection (DRM tree walk) compiles on any target — macOS gets a deterministic `DummyPlugRequired` because it doesn't have `/sys/class/drm`, which is the right answer for the macOS path's "use Parallels/UTM" guidance.
+
+- **2026-05-04 (V3-Phase D)** — No `which` crate. `looking_glass::detect_client_binary` walks `$PATH` manually with the same `is_executable` helper used in `bridge::install`'s `genisoimage` lookup. Saves ~50 KB binary size and one transitive dep.
+
+- **2026-05-04 (V3-Phase D)** — `LookingGlassHandle::Drop` sends `SIGTERM` via `libc::kill(pid, SIGTERM)` after `std::mem::forget(child)`. Reason: the LG client outlives the `neon stream start` invocation; we want it tied to the wizard's lifecycle (drop the handle → close LG) but we can't keep `Child` because that'd hold a `Wait` semaphore the kernel never releases (LG runs until killed).
+
+- **2026-05-04 (V3-Phase D)** — `cli::stream::stop` uses a `/proc/<pid>/comm`-based scanner to find `looking-glass-client` rather than a pidfile. Reason: pidfile state is racy (LG can crash; tray dispatch and CLI dispatch can both think they own it) and would require new on-disk schema. The proc-scan works on every Linux kernel, takes ~3 ms, and the `/proc/<pid>/comm` truncation behavior (15 chars) is well-known so we match both `looking-glass-client` and `looking-glass-c`.
+
+- **2026-05-04 (V3-Phase D)** — Tray menu uses a new `MenuItemSpec::Submenu` variant rather than threading the V3 items into the existing flat layout. Reason: the brief explicitly calls out "Bridge ▶ submenu"; flattening the items would have been cleaner code but would have lost the visual nesting cue. The Submenu variant is rendered as a flattened header + indented children for V3-Phase D (matching tray-icon's current capabilities); V3-Phase F can wire real nested menus via `tray-icon::menu::Submenu`.
+
+- **2026-05-04 (V3-Phase D)** — `MenuState` gains a feature-gated `bridge: BridgeMenuState` field rather than a separate `BridgeMenuState` snapshot stored alongside. Reason: keeps the layout-rendering function signature unchanged (`menu_layout(&MenuState)`) and means existing callers pass one struct instead of two. The `#[cfg(feature = "experimental-bridge")]` field syntax is well-supported in Rust and tests for both feature states verify the build.
+
+- **2026-05-04 (V3-Phase D)** — `MenuState: Default` derive added. Reason: the new `bridge` field would have broken every existing field-shorthand `MenuState { browsers, launch_at_login }` initializer under feature-on. Default lets callers write `..MenuState::default()` if they want; for the existing initializers we updated each one with `#[cfg(feature = "experimental-bridge")] bridge: BridgeMenuState::default()`.
+
+- **2026-05-04 (V3-Phase D)** — Default-feature tests `empty_browsers_skips_per_browser_block_but_keeps_actions`, `two_browsers_produces_canonical_layout`, `set_state_updates_layout`, and `build_routes_covers_actions_and_browsers_and_toggles` are gated `#[cfg(not(feature = "experimental-bridge"))]`. Reason: they assert exact layout sizes (6, 9, 8, 5 actionables) which change under feature-on. The new `tests_v3` module asserts the V3-augmented sizes (13 layout + 7 V3 actionables on the same scenario).
+
+- **2026-05-04 (V3-Phase D)** — `cli::stream::start` checks `bridge.toml` *before* hardware (kvmfr + IDD fallback). Reason: a fresh user without `neon stream init` should see the wizard suggestion first, not "kvmfr not loaded". The hardware checks only matter once provisioning is done.
+
+- **2026-05-04 (V3-Phase D)** — URL navigation inside the guest's Edge is **deferred to V3-Phase F**, not V3-Phase D. Reason: the simplest implementation (a Sunshine-side input replay) is fragile; the cleaner path (a small HTTP helper baked into the unattended-install image) is significant additional scope. V3-Phase D captures the URL parameter and prints a "for now, paste it in Edge" message; V3-Phase F's wizard polish wires the helper.
+
+- **2026-05-04 (V3-Phase D)** — `wait_for_sunshine_handshake` is best-effort; on timeout (5 s by default) it returns `false` but the wizard does not error. Reason: Sunshine takes a few seconds after VM resume to bind its TCP socket; the LG client itself surfaces a clean "guest not ready" overlay if it can't connect. Erroring here would surface the failure twice.
+
+- **2026-05-04 (V3-Phase D)** — `BridgeRepair` tray click is a TODO placeholder for V3-Phase D — it logs an info message + emits a notification pointing the user at `neon stream init --accept-eval`. Reason: `cli::stream::repair::run` is a V3-Phase F deliverable; surfacing a `unimplemented!()` panic from a tray click would crash the daemon.
 
 ## Decisions log (V3-Phase C)
 
@@ -197,6 +339,56 @@ Test-mode env vars added in V3-Phase C:
 
 - **2026-05-04 (V3-Phase C)** — Sunshine URL + SHA-256 in `bridge::unattended::DEFAULT_SUNSHINE_*` are similarly pinned at compile time. The unattended XML's first-logon script verifies the SHA before running the installer; if the SHA doesn't match the user sees a guest-side PowerShell error in the serial console.
 
+## Nick action required (V3-Phase D hardware acceptance)
+
+Hardware acceptance is **not** part of the bridge agent's gate. After V3-Phase C is hardware-accepted (Windows VM provisioned + snapshot taken), Nick exercises Phase D:
+
+1. Confirm `looking-glass-client` is installed:
+   - Arch: `sudo pacman -S looking-glass`
+   - Debian/Ubuntu: `sudo apt install looking-glass-client`
+   - From source (any distro): https://looking-glass.io/wiki/Installation_on_Linux
+
+2. Load the kvmfr kernel module (one-time per boot until you add it to `/etc/modules-load.d/`):
+   ```sh
+   sudo modprobe kvmfr static_size_mb=64
+   ```
+   The module needs to come from the looking-glass DKMS package (Arch: `sudo pacman -S looking-glass-module-dkms`; Debian: `sudo apt install looking-glass-kvmfr-dkms`).
+
+3. Install the udev rule so non-root users can read `/dev/kvmfr0`:
+   ```sh
+   sudo tee /etc/udev/rules.d/99-kvmfr.rules <<'EOF'
+   SUBSYSTEM=="kvmfr", OWNER="root", GROUP="kvm", MODE="0660"
+   EOF
+   sudo udevadm control --reload-rules && sudo udevadm trigger
+   ```
+
+4. Add yourself to the `kvm` group: `sudo usermod -aG kvm $USER` then log out/in.
+
+5. Plug in a $5 4K HDMI dummy plug if `neon doctor --bridge` reported `NeedsDummyPlug` (single-GPU host). Recommended listing: <https://www.amazon.com/dp/B07YFF3JGL>.
+
+6. Run end-to-end (assuming V3-Phase C provisioning is complete):
+   ```sh
+   cargo run --features experimental-bridge,experimental-bridge-libvirt -- stream start netflix.com
+   ```
+   Expected:
+   - Cold start <10 s on a warm pool.
+   - Looking Glass window opens fullscreen, cursor grabs.
+   - Edge appears (default home page; URL navigation lands in V3-Phase F).
+
+7. Verify `neon stream stop` halts the VM cleanly:
+   ```sh
+   cargo run --features experimental-bridge,experimental-bridge-libvirt -- stream stop
+   ```
+   Expected: snapshot `last-good` taken; LG window closes; `virsh list` shows `neon-bridge` as paused / shut off.
+
+8. Verify the tray menu (run `neon` with no args; click the icon):
+   - "Stream Netflix" / "Stream Disney+" / "Stream HBO Max" entries appear.
+   - "Bridge ▶" submenu shows Status / Pause VM / Resume VM / Repair.
+   - Clicking "Stream Netflix" launches the start flow in a non-blocking thread.
+   - On a default `cargo install neon` (no feature), the menu is unchanged — V2 users see no V3 items.
+
+If `looking-glass-client` segfaults on first run, check `~/.cache/neon/logs/looking-glass.log` — most issues are kvmfr permission or static_size_mb mismatches against the libvirt domain XML's IVSHMEM size (V3-Phase C defaults to 64 MB which matches the `modprobe` arg above).
+
 ## Nick action required (V3-Phase C hardware acceptance)
 
 Per the brief, hardware acceptance is **not** part of the bridge agent's gate. Nick will run end-to-end on his actual machine:
@@ -223,21 +415,21 @@ If anything is unclear, ping the orchestrator (`team-lead`).
 
 ## Verification (local, on Linux)
 
-V3-Phase A gate per the brief — all six green:
+V3-Phase D gate — all six green:
 
 ```bash
 # Default build path (V2 stable surface)
 cargo build --jobs 2                                      # clean
 cargo fmt --check                                         # clean
 cargo clippy --all-targets --jobs 2 -- -D warnings        # clean
-cargo test --lib --jobs 2                                 # 466 passed (was 456 baseline)
-cargo test --jobs 2                                       # 466 lib + 2 browsers_int + 3 feature_flag + 2 manifest_int + 2 doc = 475 total
+cargo test --lib --jobs 2                                 # 494 passed (unchanged: V3 modules feature-gated)
+cargo test --jobs 2                                       # 494 + 3 + 2 + 2 + 2 = 503 total
 
 # Experimental feature path
 cargo build --features experimental-bridge --jobs 2                                # clean
 cargo clippy --all-targets --features experimental-bridge --jobs 2 -- -D warnings  # clean
-cargo test --features experimental-bridge --lib --jobs 2                           # 469 passed (+3 from default: bridge stub error, bridge HardwareCapabilities::detect, cli::stream::run stub error)
-cargo test --features experimental-bridge --jobs 2                                 # 469 lib + 2 browsers_int + 4 feature_flag + 2 manifest_int + 2 doc = 479 total
+cargo test --features experimental-bridge --lib --jobs 2                           # 675 passed (+62 V3-Phase D: kvmfr 14 + LG 13 + IDD 13 + start 11 + stop 5 + tray V3 14 -8 default-only tests gated off)
+cargo test --features experimental-bridge --jobs 2                                 # 675 + 5 + 2 + 2 + 2 = 686 total
 ```
 
 `--jobs 2` cap honored per noctalia-shell crash guardrail; no `cargo tarpaulin` run (would peg all CPUs).
@@ -246,13 +438,13 @@ cargo test --features experimental-bridge --jobs 2                              
 
 ```
                   Default features    --features experimental-bridge
-Lib                       494                       613
+Lib                       494                       675
 browsers_integration        2                         2
-feature_flag                3                         5   (V3-Phase C: 2 always + 3 feature-on)
+feature_flag                3                         5   (2 always + 3 feature-on)
 manifest_integration        2                         2
 Doc tests                   2                         2
                   ----                      ----
-Total                     503                       624
+Total                     503                       686
 ```
 
 V3-Phase C added **121** tests under the feature flag (well over the brief's "~50 new" target):
@@ -293,6 +485,33 @@ The `feature_flag` test count differs by 2 across feature states because `stream
 - `tests/feature_flag.rs` (V3-Phase A — new — integration tests for both feature states)
 - `ROADMAP.md` (V3-Phase A — V3 section cross-links to scaffolding + orchestration plans)
 - `CONTRIBUTING.md` (V3-Phase A — "Experimental features" section)
+
+## Files most recently changed (V3-Phase D)
+
+- `src/bridge/kvmfr.rs` (V3-Phase D — new — Linux-gated kvmfr detection)
+- `src/bridge/looking_glass.rs` (V3-Phase D — new — Linux-gated LG client wrapper)
+- `src/bridge/idd_fallback.rs` (V3-Phase D — new — single-GPU dummy plug detection)
+- `src/bridge/mod.rs` (V3-Phase D — new module declarations)
+- `src/cli/stream/start.rs` (V3-Phase D — new — `neon stream start [URL]`)
+- `src/cli/stream/stop.rs` (V3-Phase D — new — `neon stream stop`)
+- `src/cli/stream/mod.rs` (V3-Phase D — Subcommand::Start/Stop now wire to real impls)
+- `src/main.rs` (V3-Phase D — `Stream Start { url: Option<String> }`; was `String`)
+- `src/daemon/tray.rs` (V3-Phase D — TrayCommand StreamUrl/Bridge*; MenuItemSpec Label+Submenu; menu_layout V3 inject)
+- `src/daemon/mod.rs` (V3-Phase D — drive_tray_loop dispatches new variants; build_initial_bridge_state)
+- `tests/feature_flag.rs` (V3-Phase D — `stream_start_returns_phase_d_stub` rewritten as `stream_start_without_bridge_toml_suggests_init`)
+
+## Commits on `feature/v3-scaffolding` from V3-Phase D
+
+```
+feat(bridge): kvmfr detection (V3-Phase D)
+feat(bridge): looking-glass client wrapper (V3-Phase D)
+feat(bridge): single-GPU dummy-plug detection (V3-Phase D)
+feat(cli): stream start + stop (V3-Phase D)
+feat(daemon): tray V3 extensions (streaming + bridge submenu)
+docs(bridge): V3-Phase D status + decisions log + Nick action items
+```
+
+(Six logical units; one commit per major surface. Phase D code-complete.)
 
 ## Coordination with core-engine in V3-Phase A
 
