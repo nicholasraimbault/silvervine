@@ -2,18 +2,24 @@
 
 **Lead:** Claude (main session)
 **Team:** `neon-v2`
-**Active phase:** V3-Phase B — Hardware capability detection (platform team)
+**Active phase:** V3.0 code-complete — awaiting Nick's hardware acceptance
 
 ## Current focus
 
-V2 V1.0 ready (`v2-rust-rewrite` HEAD `4521f3d`, 456 tests passing, all docs in place). Phase 6 V2 beta deferred until V3 lands or Nick decides to ship V2 standalone first.
+**V3.0 is shipped to the branch.** All 5 V3 sub-phases (A/B/C/D/F; E deferred to V3.1) are committed on `feature/v3-scaffolding`. 744 tests passing with `--features experimental-bridge`, 494 on default (V3 fully feature-gated; default V2 install unchanged).
 
-V3 work proceeding on `feature/v3-scaffolding` branch:
+Only remaining gate is Nick's hardware acceptance run:
 
-- **V3-Phase A** (scaffolding): **Done.** 6 commits (`fcb2f57..6656c2f`); CdmProvider trait + LocalFileCdm + patch flow refactor + bridge module gated stub + cli::stream stub + feature flag tests + ROADMAP/CONTRIBUTING updates. 466 tests on default, 469 with `--features experimental-bridge`. Both build paths green.
-- **V3-Phase B** (hardware capability detection): in progress; platform team activated.
+1. Install host deps: `pacman -S libvirt looking-glass looking-glass-module-dkms` (or apt equivalents)
+2. Pin current 2026 Microsoft IoT LTSC URL + SHA in `~/.config/neon/bridge.toml` (Phase F bridge.toml override solves this without source edits)
+3. `sudo modprobe kvmfr static_size_mb=64` (one-time)
+4. Install `/etc/udev/rules.d/99-kvmfr.rules` per `bridge::kvmfr::udev_rule_text()`; `usermod -aG kvm $USER`
+5. `cargo run --features experimental-bridge,experimental-bridge-libvirt -- stream init --accept-eval`
+6. Wait ~30-45 min for unattended Windows install
+7. `cargo run --features experimental-bridge,experimental-bridge-libvirt -- stream start netflix.com`
+8. Verify Looking Glass window opens; Netflix plays at higher quality than V2's L3 720p ceiling
 
-Known issue (not blocking): pre-existing flake in `daemon::lifecycle::tests` env_mutex poisoning under parallel test load (~10% of runs). Platform team to address as Phase B side deliverable.
+If hardware acceptance succeeds, tag `v1.0.0` and ship. If it surfaces issues, file them; bridge team fixes them as V3.1.
 
 ## Decisions made (recorded for handoff)
 
@@ -40,7 +46,7 @@ Known issue (not blocking): pre-existing flake in `daemon::lifecycle::tests` env
 | V3-B — Hardware capability detection | **Done** | 5 commits; BridgeCapabilities API; per-vendor remediation; env_mutex flake fixed; 494/508 tests; **first hardware-acceptance gate passed on Nick's actual machine** |
 | V3-C — Windows guest provisioning | **Done** | 4 commits; ISO + license + unattended XML + libvirt XML + libvirt orchestration + install + `neon stream init` + status; 613 tests with feature; **Nick action required** — pin Microsoft ISO + Sunshine URL/SHA-256 to 2026 values (placeholders are 2024) before end-to-end run, OR wait for Phase F bridge.toml override |
 | V3-D — Looking Glass + tray growth | **Done** | 6 commits; kvmfr detection + LG client wrapper + IDD fallback + stream start/stop + tray V3 extensions (Stream Netflix/Disney+/HBO Max + Bridge submenu); 494/675 tests; default V2 menu unchanged |
-| V3-F — Polish + repair | In progress | bridge team (single agent); URL navigation, repair flow, uninstall, bridge.toml override (unblocks Phase C URL pinning issue), wizard polish |
+| V3-F — Polish + repair | **Done** | 9 commits; bridge.toml override + repair + uninstall + license + URL nav + auto-dispatch + health monitor + tray dynamic state + wizard polish + docs/v3/; 744 tests with feature; **V3.0 code-complete** |
 | V3-E — CDM forwarding | Deferred to V3.1 | Decided pre-execution |
 | 3 — Daemon | Pending | daemon + platform (parallel) |
 | 4 — CLI completion | Pending | cli sequential |
