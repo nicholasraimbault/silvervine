@@ -1666,12 +1666,14 @@ dependencies = [
  "dialoguer",
  "dirs 5.0.1",
  "fs2",
+ "indicatif",
  "libc",
  "notify",
  "notify-rust",
  "objc2 0.5.2",
  "objc2-app-kit 0.2.2",
  "objc2-foundation 0.2.2",
+ "quick-xml 0.36.2",
  "reqwest",
  "self_update",
  "serde",
@@ -1687,6 +1689,7 @@ dependencies = [
  "tray-icon",
  "url",
  "urlencoding",
+ "virt",
  "zbus 4.4.0",
  "zip",
 ]
@@ -2174,6 +2177,15 @@ name = "quick-xml"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11bafc859c6815fbaffbbbf4229ecb767ac913fecb27f9ad4343662e9ef099ea"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.36.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7649a7b4df05aed9ea7ec6f628c67c9953a43869b8bc50929569b2999d443fe"
 dependencies = [
  "memchr",
 ]
@@ -3287,6 +3299,27 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "virt"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b191deb9f351999588bbd289fd40d5ca0076fd9784d1a1a0af531ec8684093c9"
+dependencies = [
+ "libc",
+ "uuid",
+ "virt-sys",
+]
+
+[[package]]
+name = "virt-sys"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8762dc8eb11b230e7ed6c94152910f8382a128eed861af21047a203e3e2ebb00"
+dependencies = [
+ "libc",
+ "pkg-config",
+]
 
 [[package]]
 name = "walkdir"

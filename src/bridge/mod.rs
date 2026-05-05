@@ -32,7 +32,13 @@
 use crate::error::{Error, Result};
 use crate::platform::capabilities::BridgeCapabilities;
 
+pub mod install;
+pub mod iso;
+pub mod libvirt;
+pub mod libvirt_xml;
+pub mod license;
 pub mod remediation;
+pub mod unattended;
 
 /// Top-level entry from `cli::stream::run`. Provisions the bridge VM
 /// (idempotent), boots Edge in the guest pointed at `target_url`, and

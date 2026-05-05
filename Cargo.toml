@@ -38,7 +38,33 @@ default = []
 experimental = []
 # V3 stretch: localhost-bridge for premium 4K HDR streaming.
 # Activates the `bridge` module and `neon stream` subcommand.
-experimental-bridge = ["experimental"]
+#
+# Pulls in optional deps required by V3-Phase C (Windows guest
+# provisioning): `quick-xml` for unattended-XML parsing and
+# `indicatif` for progress UX. Builds and runs end-to-end under
+# the NEON_TEST_VIRT_NOOP=1 mock path without libvirt installed;
+# real-libvirt linkage requires the `experimental-bridge-libvirt`
+# feature (additive — both must be enabled together for actual VM
+# orchestration on a host with libvirt0 installed).
+#
+# Cargo install paths:
+#   cargo install neon --features experimental-bridge
+#       → builds the bridge module + tests + mock paths
+#   cargo install neon --features experimental-bridge,experimental-bridge-libvirt
+#       → adds real libvirt0 linkage; must have libvirt0 / libvirt-dev
+#         installed on the host
+experimental-bridge = [
+    "experimental",
+    "dep:quick-xml",
+    "dep:indicatif",
+]
+# Real libvirt0 linkage. Additive over `experimental-bridge`. Without
+# this flag, the bridge module's libvirt-rs path returns an explicit
+# error pointing the user at this feature.
+experimental-bridge-libvirt = [
+    "experimental-bridge",
+    "dep:virt",
+]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -128,6 +154,13 @@ tracing-appender = "0.2"
 # scaffolding.
 tempfile = "3"
 
+# V3-Phase C deps — gated on the `experimental-bridge` Cargo feature so
+# the default V2 build doesn't pull them in. `quick-xml` parses the
+# generated `autounattend.xml` for schema validation; `indicatif`
+# powers the install progress bars in `cli::stream::init`.
+quick-xml = { version = "0.36", optional = true }
+indicatif = { version = "0.17", optional = true }
+
 # macOS-specific deps: ObjC FFI for NSWorkspace wake notifications.
 # `block2` is required because NSNotificationCenter takes a block-typed
 # handler argument; objc2-app-kit doesn't enable the dep transitively
@@ -143,6 +176,15 @@ block2 = "0.5"
 # only the blocking API on a dedicated background thread.
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "4" }
+# libvirt-rs (`virt`) for V3-Phase C bridge VM orchestration. Optional
+# so default builds don't pull it in; activated transitively when the
+# user opts into `experimental-bridge` AND is on Linux. This dep is
+# absent on macOS entirely (libvirt isn't available there); the
+# `cli::stream::init` flow returns an UnsupportedPlatform error on
+# macOS. Linux hosts without `libvirt0` will fail at runtime; install
+# via your distro: `apt install libvirt0` (Debian/Ubuntu),
+# `pacman -S libvirt` (Arch).
+virt = { version = "0.4", optional = true }
 
 [dev-dependencies]
 # Sandboxed temporary directories for filesystem-shaped tests.
