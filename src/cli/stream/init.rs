@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::bridge::config;
 use crate::bridge::install::{self, ProvisionOpts, ProvisionOutcome};
 use crate::bridge::iso;
 use crate::bridge::libvirt_xml::PciAddress;
@@ -114,15 +115,40 @@ where
         .map_err(Error::from)?;
     }
 
+    // Spin up an indicatif progress bar for the install phase. Skipped
+    // under quiet mode + when stdout isn't a TTY (the install_progress
+    // crate auto-detects + degrades cleanly).
+    let progress = if args.output.quiet {
+        None
+    } else {
+        Some(start_install_spinner())
+    };
+
     let outcome = install::provision(&opts);
 
+    if let Some(p) = progress.as_ref() {
+        p.finish_and_clear();
+    }
+
     if cancel.load(Ordering::SeqCst) {
+        // Best-effort partial-state cleanup. We honor the design that
+        // install::provision is itself idempotent — re-running picks up
+        // where we stopped — so the cleanup here is just clearing the
+        // unfinished progress UI.
         return Err(Error::other(
-            "cancelled by user; partial state has been cleaned up",
+            "cancelled by user. Run `neon stream init` again to resume — \
+             provisioning is idempotent and skips already-completed steps.",
         ));
     }
 
-    let outcome: ProvisionOutcome = outcome?;
+    let outcome: ProvisionOutcome = outcome.map_err(|e| {
+        // V3-Phase F: append the repair suggestion to wizard errors so
+        // users always see the next-step hint.
+        Error::other(format!(
+            "{e}\nIf you re-run `neon stream init` and hit the same error, \
+             try `neon stream repair` to detect + fix broken state."
+        ))
+    })?;
 
     // Step 5: success message.
     let total = started.elapsed();
@@ -138,6 +164,17 @@ where
         .map_err(Error::from)?;
     }
     Ok(())
+}
+
+/// Start the install-phase progress spinner. Uses
+/// [`indicatif::ProgressBar::new_spinner`] with a tick interval that's
+/// generous enough not to flicker. The bar is finished on success
+/// or cancellation in [`run_with`].
+fn start_install_spinner() -> indicatif::ProgressBar {
+    let pb = indicatif::ProgressBar::new_spinner();
+    pb.set_message("Provisioning bridge VM (typically 25-40 minutes)");
+    pb.enable_steady_tick(Duration::from_millis(250));
+    pb
 }
 
 /// Resolve the license posture from CLI flags, falling back to
@@ -193,7 +230,8 @@ fn resolve_license_posture(args: &Args) -> Result<LicensePosture> {
     }
 }
 
-/// Build [`ProvisionOpts`] from a posture + the host capability snapshot.
+/// Build [`ProvisionOpts`] from a posture + the host capability snapshot,
+/// then merge any `~/.config/neon/bridge.toml` overrides on top.
 fn build_provision_opts(posture: LicensePosture, caps: &BridgeCapabilities) -> ProvisionOpts {
     let gpu_addr = first_gpu_pci_address(caps);
     let mut opts = ProvisionOpts::defaults_for(
@@ -202,9 +240,11 @@ fn build_provision_opts(posture: LicensePosture, caps: &BridgeCapabilities) -> P
         u32::try_from(num_cpus_or_default()).unwrap_or(8),
         gpu_addr,
     );
-    // Override the ISO spec with the default (already done) so
-    // tests / future bridge.toml override has a single seam.
-    opts.iso_spec = iso::default_spec();
+    // V3-Phase F: load bridge.toml overrides so the user can pin a
+    // fresh ISO URL or override RAM/vCPU sizing without rebuilding.
+    let cfg = config::load().unwrap_or_default();
+    opts.iso_spec = config::apply_iso_override(iso::default_spec(), &cfg.iso);
+    opts = config::apply_provision_overrides(opts, &cfg.bridge);
     opts
 }
 
@@ -234,11 +274,21 @@ fn num_cpus_or_default() -> usize {
 
 /// Render the issues + remediation block when the capability gate
 /// fails.
+///
+/// Apple-UX: lists ALL issues at once (not just the first), each with
+/// per-issue remediation. The user fixes everything, runs `neon stream
+/// init` once more, and is done.
 fn render_blocking_issues(
     issues: &[remediation::CapabilityIssue],
     out: &mut dyn Write,
 ) -> Result<()> {
     writeln!(out, "neon stream init: capability gate FAILED").map_err(Error::from)?;
+    writeln!(
+        out,
+        "Found {} issue(s). Each has a specific remediation below.",
+        issues.len()
+    )
+    .map_err(Error::from)?;
     writeln!(out).map_err(Error::from)?;
     for (i, issue) in issues.iter().enumerate() {
         let r = remediation::remediation_for(issue);
@@ -246,18 +296,56 @@ fn render_blocking_issues(
         writeln!(out, "{}", r.detail).map_err(Error::from)?;
         writeln!(out).map_err(Error::from)?;
     }
+    writeln!(
+        out,
+        "After fixing the items above, re-run `neon stream init`. \
+         If anything goes wrong during install, `neon stream repair` \
+         detects + remediates broken state."
+    )
+    .map_err(Error::from)?;
     Ok(())
+}
+
+/// Cancellation flag the libc signal handler flips. Stored as a
+/// `OnceLock<Arc<AtomicBool>>` so multiple `run_with` invocations during
+/// the program's lifetime share the same handler.
+#[cfg(not(test))]
+static SIGINT_CANCEL: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceLock::new();
+
+#[cfg(not(test))]
+extern "C" fn sigint_handler(_signum: libc::c_int) {
+    if let Some(c) = SIGINT_CANCEL.get() {
+        c.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Best-effort SIGINT install. Sets the atomic on Ctrl-C; the
 /// install loop polls it.
-fn install_sigint_handler(_cancel: Arc<AtomicBool>) {
-    // We deliberately do NOT install a real signal handler in tests —
-    // it would interfere with cargo test's own signal handling. The
-    // production path is best-effort: the wizard completes without
-    // it, just less responsively. V3-Phase F polishes this with a
-    // proper `ctrlc`-crate handler.
+///
+/// V3-Phase F: we install a libc-level signal handler that flips the
+/// atomic. The handler is async-signal-safe (only stores a u8 flag).
+/// Inside `cargo test` we leave the runner's own handler in place —
+/// otherwise the test runner can't tear down on Ctrl-C.
+#[cfg(not(test))]
+fn install_sigint_handler(cancel: Arc<AtomicBool>) {
+    if SIGINT_CANCEL.set(cancel).is_err() {
+        // Already installed — re-use the prior handler.
+        return;
+    }
+    // SAFETY: signal() is async-signal-safe; the handler only stores
+    // a relaxed atomic.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            sigint_handler as *const () as libc::sighandler_t,
+        );
+    }
 }
+
+/// Test-mode: do nothing. Real SIGINT handlers would interfere with
+/// `cargo test`.
+#[cfg(test)]
+fn install_sigint_handler(_cancel: Arc<AtomicBool>) {}
 
 /// Friendly user-visible label for a license posture.
 fn posture_label(p: &LicensePosture) -> &'static str {
@@ -494,5 +582,67 @@ mod tests {
         assert!(body.contains("Issue 2/2"));
         assert!(body.contains("TPM"));
         assert!(body.contains("virtualization") || body.contains("VT-x"));
+        // V3-Phase F polish: lists ALL issues + suggests `neon stream repair`.
+        assert!(body.contains("issue(s)"));
+        assert!(body.contains("neon stream repair"));
+    }
+
+    /// V3-Phase F: `build_provision_opts` honors `[bridge]` overrides
+    /// from `bridge.toml`.
+    #[test]
+    fn build_provision_opts_applies_bridge_toml_overrides() {
+        let _g = crate::test_support::env_lock();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let bridge_toml = tmp.path().join("neon").join("bridge.toml");
+        std::fs::create_dir_all(bridge_toml.parent().unwrap()).expect("mkdir");
+        std::fs::write(
+            &bridge_toml,
+            r#"[bridge]
+data_dir = "/mnt/ssd/n-bridge"
+ram_mb = 8192
+"#,
+        )
+        .expect("write");
+        // SAFETY: env behind env_lock.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        }
+        let caps = green_caps();
+        let opts = build_provision_opts(LicensePosture::Eval { accepted_at: 1 }, &caps);
+        assert_eq!(
+            opts.data_root,
+            std::path::PathBuf::from("/mnt/ssd/n-bridge")
+        );
+        // ram_mb override flows through host_ram_total_bytes.
+        assert_eq!(opts.host_ram_total_bytes, 8192u64 * 1024 * 1024 * 4);
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+    }
+
+    /// V3-Phase F: `build_provision_opts` honors `[iso]` URL override.
+    #[test]
+    fn build_provision_opts_applies_iso_url_override() {
+        let _g = crate::test_support::env_lock();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let bridge_toml = tmp.path().join("neon").join("bridge.toml");
+        std::fs::create_dir_all(bridge_toml.parent().unwrap()).expect("mkdir");
+        std::fs::write(
+            &bridge_toml,
+            r#"[iso]
+url = "https://example.com/win.iso"
+"#,
+        )
+        .expect("write");
+        // SAFETY: env behind env_lock.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        }
+        let caps = green_caps();
+        let opts = build_provision_opts(LicensePosture::Eval { accepted_at: 1 }, &caps);
+        assert_eq!(opts.iso_spec.url, "https://example.com/win.iso");
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
     }
 }
