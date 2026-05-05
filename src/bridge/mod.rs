@@ -32,6 +32,8 @@
 use crate::error::{Error, Result};
 use crate::platform::capabilities::BridgeCapabilities;
 
+pub mod config;
+pub mod health;
 pub mod idd_fallback;
 pub mod install;
 pub mod iso;

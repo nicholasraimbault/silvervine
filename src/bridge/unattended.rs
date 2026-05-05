@@ -294,6 +294,13 @@ pub fn render_autounattend(opts: &UnattendedOptions) -> Result<String> {
 /// Construct the inline first-logon PowerShell. Embedded in
 /// `<CommandLine>` via single-line PowerShell with semicolon-separated
 /// statements.
+///
+/// V3-Phase F adds a scheduled task that polls the host-shared sentinel
+/// (`E:\neon-navigate-url.txt` — a virtio-9p mount of
+/// `~/.local/share/neon/bridge/`) every 3 seconds and launches Edge with
+/// the URL on first non-empty read. The 9p share is not yet wired into
+/// the libvirt domain XML; that happens in V3.1. For V3.0 the user can
+/// still paste the URL manually inside the LG window.
 fn build_first_logon_script(opts: &UnattendedOptions) -> String {
     let url = &opts.sunshine_url;
     let sha = &opts.sunshine_sha256;
@@ -308,6 +315,12 @@ fn build_first_logon_script(opts: &UnattendedOptions) -> String {
         "if ($got -ne $h.ToLower()) { throw \"Sunshine SHA mismatch\" }".to_string(),
         "Start-Process -FilePath $dst -ArgumentList '/S' -Wait".to_string(),
         "Set-Service -Name sunshinesvc -StartupType Automatic".to_string(),
+        // V3-Phase F: install a scheduled task that polls a shared file
+        // for a navigation URL and opens it in Edge. Best-effort; if the
+        // 9p mount fails the task simply finds no file and exits cleanly.
+        "$navTask = 'C:\\Windows\\Temp\\neon-navigate-poll.ps1'".to_string(),
+        "Set-Content -Path $navTask -Value @'\r\n$src = 'E:\\neon-navigate-url.txt'\r\nif (Test-Path $src) { $u = (Get-Content $src -ErrorAction SilentlyContinue).Trim(); if ($u) { Start-Process \"msedge.exe\" -ArgumentList $u; Remove-Item $src -ErrorAction SilentlyContinue } }\r\n'@".to_string(),
+        "schtasks /Create /TN NeonNavigatePoll /TR \"powershell -NoProfile -ExecutionPolicy Bypass -File $navTask\" /SC ONSTART /RU SYSTEM /RL HIGHEST /F".to_string(),
         "New-Item -ItemType File -Path 'C:\\neon-bridge-ready' -Force".to_string(),
     ];
     parts.join("; ")

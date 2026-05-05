@@ -165,10 +165,14 @@ pub fn provision(opts: &ProvisionOpts) -> Result<ProvisionOutcome> {
     // Step 3: persist the license posture.
     license::save_posture(&opts.license_posture)?;
 
-    // Step 4: render autounattend.xml.
-    let unattended_xml = unattended::render_autounattend(&UnattendedOptions::defaults_for(
-        opts.license_posture.clone(),
-    ))?;
+    // Step 4: render autounattend.xml. V3-Phase F: merge `[sunshine]`
+    // overrides from bridge.toml so users can pin a fresh installer URL.
+    let unattended_opts = {
+        let baseline = UnattendedOptions::defaults_for(opts.license_posture.clone());
+        let cfg = crate::bridge::config::load().unwrap_or_default();
+        crate::bridge::config::apply_sunshine_override(baseline, &cfg.sunshine)
+    };
+    let unattended_xml = unattended::render_autounattend(&unattended_opts)?;
 
     // Step 5: build the autounattend ISO.
     let autounattend_iso = opts.data_root.join("autounattend.iso");
@@ -178,18 +182,23 @@ pub fn provision(opts: &ProvisionOpts) -> Result<ProvisionOutcome> {
     let disk_path = opts.data_root.join("disk.qcow2");
     create_qcow2_disk(&disk_path, opts.disk_gb)?;
 
-    // Step 7: render libvirt domain XML.
-    let domain_spec = DomainSpec {
-        name: opts.vm_name.clone(),
-        ..DomainSpec::sized_for_host(
-            opts.vm_name.clone(),
-            opts.host_ram_total_bytes,
-            opts.host_cpu_count,
-            disk_path.clone(),
-            iso_path.clone(),
-            autounattend_iso.clone(),
-            opts.gpu_pci_address.clone(),
-        )
+    // Step 7: render libvirt domain XML. V3-Phase F: merge `[bridge]`
+    // ivshmem / ram / vcpu overrides from bridge.toml.
+    let domain_spec = {
+        let baseline = DomainSpec {
+            name: opts.vm_name.clone(),
+            ..DomainSpec::sized_for_host(
+                opts.vm_name.clone(),
+                opts.host_ram_total_bytes,
+                opts.host_cpu_count,
+                disk_path.clone(),
+                iso_path.clone(),
+                autounattend_iso.clone(),
+                opts.gpu_pci_address.clone(),
+            )
+        };
+        let cfg = crate::bridge::config::load().unwrap_or_default();
+        crate::bridge::config::apply_domain_overrides(baseline, &cfg.bridge)
     };
     let domain_xml = libvirt_xml::render_domain_xml(&domain_spec)?;
     libvirt_xml::validate_with_virt_xml_validate(&domain_xml)?;
