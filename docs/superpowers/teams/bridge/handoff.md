@@ -44,6 +44,24 @@ V3-Phase A scaffolding files. Future V3 phases (B → F) extend the same files p
 | Daemon dispatch handlers for new TrayCommand variants | `src/daemon/mod.rs` | +~115 | (covered through orchestration tests) |
 | `cli::stream::Subcommand::Start/Stop` wiring through main.rs + dispatcher | `src/cli/stream/mod.rs`, `src/main.rs`, `tests/feature_flag.rs` | net +20 | 1 (revised integration test) |
 
+**V3-Phase F (polish + repair + uninstall + tray polish + docs) complete (2026-05-04).** All 12 deliverables landed; both build paths green; 503 default tests passing (unchanged: V3 modules are feature-gated); 755 with `--features experimental-bridge` on (744 lib + 11 integration). New surface area:
+
+| Area | Module | LOC | Tests |
+|---|---|---|---|
+| `bridge.toml` override plumbing (iso/sunshine/bridge sections) | `src/bridge/config.rs` | ~590 | 17 |
+| Periodic bridge-health monitor + heartbeat | `src/bridge/health.rs` | ~380 | 10 |
+| `neon stream repair` — broken-state detection + fix | `src/cli/stream/repair.rs` | ~570 | 11 |
+| `neon stream uninstall` — clean teardown w/ optional `--purge` | `src/cli/stream/uninstall.rs` | ~290 | 8 |
+| `neon stream license` — show/set/rearm posture management | `src/cli/stream/license.rs` | ~410 | 10 |
+| `neon stream` (no args) auto-dispatch + new subcommand wiring | `src/cli/stream/mod.rs` | +~80 | 4 |
+| URL navigation via shared sentinel + first-logon poll | `src/cli/stream/start.rs`, `src/bridge/unattended.rs` | +~70 | 2 |
+| Init wizard polish (lists ALL issues + indicatif spinner + repair hint) | `src/cli/stream/init.rs` | +~80 | 2 |
+| Tray dynamic state — alert badge, top-level rearm, BridgeRearm action | `src/daemon/tray.rs` | +~80 | 4 |
+| Daemon health-monitor spawn + BridgeRearm/BridgeRepair real wiring | `src/daemon/mod.rs` | +~50 | (covered via existing daemon tests) |
+| `main.rs` clap subcommand changes (Repair/License/Uninstall args) | `src/main.rs` | +~50 | (covered via integration test) |
+| User-facing docs — hardware compat, troubleshooting, license FAQ | `docs/v3/*.md` | ~600 | (no tests; markdown content) |
+| ROADMAP.md + CHANGELOG.md V3 entries | `ROADMAP.md`, `CHANGELOG.md` | net +60 | (no tests) |
+
 ## V3-Phase A deliverables — status
 
 | # | Deliverable | Status | Notes |
@@ -151,7 +169,7 @@ V3-Phase D (`bridge` + `daemon` teams): Looking Glass integration + tray growth.
 
 V3-Phase E (`bridge` + `core-engine`): CDM forwarding. Recommended deferred to V3.1 per the orchestration plan.
 
-V3-Phase F (`cli` + `bridge` + `daemon`): `cli::stream::{repair,uninstall,license}` wizard polish + tray notifications + URL navigation into the guest's Edge (deferred from V3-Phase D).
+V3-Phase F (`cli` + `bridge` + `daemon`): `cli::stream::{repair,uninstall,license}` wizard polish + tray notifications + URL navigation into the guest's Edge. **Done (2026-05-04).** See "V3-Phase F public contracts" + "Decisions log (V3-Phase F)" + "Nick action required (V3.0 hardware acceptance)" sections below.
 
 ## V3-Phase C public contracts
 
@@ -531,3 +549,266 @@ docs: ROADMAP + CONTRIBUTING updates for experimental-bridge feature
 ```
 
 (Six logical units; one commit per major surface. Phase A code-complete.)
+
+## V3-Phase F public contracts
+
+```rust
+// src/bridge/config.rs
+pub struct IsoOverride { pub url: Option<String>, pub sha256: Option<String>, pub expected_size: Option<u64> }
+pub struct SunshineOverride { pub url: Option<String>, pub sha256: Option<String> }
+pub struct BridgeOverride {
+    pub data_dir: Option<PathBuf>,
+    pub ram_mb: Option<u32>,
+    pub vcpus: Option<u32>,
+    pub ivshmem_size_mb: Option<u32>,
+}
+pub struct BridgeConfig {
+    pub iso: IsoOverride,
+    pub sunshine: SunshineOverride,
+    pub bridge: BridgeOverride,
+}
+pub fn load() -> Result<BridgeConfig>;
+pub fn load_from(path: &Path) -> Result<BridgeConfig>;
+pub fn apply_iso_override(baseline: IsoSpec, ov: &IsoOverride) -> IsoSpec;
+pub fn apply_sunshine_override(baseline: UnattendedOptions, ov: &SunshineOverride) -> UnattendedOptions;
+pub fn apply_provision_overrides(opts: ProvisionOpts, ov: &BridgeOverride) -> ProvisionOpts;
+pub fn apply_domain_overrides(spec: DomainSpec, ov: &BridgeOverride) -> DomainSpec;
+
+// src/bridge/health.rs
+pub struct HealthSample {
+    pub eval_days_remaining: Option<i64>,
+    pub eval_expiring_soon: bool,
+    pub snapshot_age_hours: Option<u64>,
+    pub snapshot_stale: bool,
+    pub vm_paused: bool,
+    pub vm_paused_hours: Option<u64>,
+}
+impl HealthSample {
+    pub fn collect() -> Result<Self>;
+    pub fn with_snapshot_age_hours(self, hours: Option<u64>) -> Self;
+    pub fn with_paused_hours(self, hours: Option<u64>) -> Self;
+    pub fn needs_attention(&self) -> bool;
+    pub fn compose_notification(&self) -> Option<String>;
+    pub fn priority_label(&self) -> &'static str;
+}
+pub fn spawn_health_thread(stop: Arc<AtomicBool>) -> Result<Option<JoinHandle<()>>>;
+pub fn heartbeat_path() -> Option<PathBuf>;
+pub const NOOP_ENV: &str = "NEON_TEST_BRIDGE_HEALTH_NOOP";
+pub const HEALTH_INTERVAL: Duration = Duration::from_secs(10 * 60);
+pub const EVAL_NOTIFY_THRESHOLD_DAYS: i64 = 7;
+pub const SNAPSHOT_STALE_DAYS: u64 = 30;
+pub const PAUSED_NOTIFY_THRESHOLD_HOURS: u64 = 24;
+
+// src/cli/stream/repair.rs
+pub struct Args {
+    pub auto: bool,
+    pub from_snapshot: Option<String>,
+    pub refresh_snapshot: bool,
+    pub output: OutputOptions,
+}
+pub enum RepairIssue {
+    LicenseMissing, DomainMissing, DiskMissing,
+    FreshSnapshotMissing, LastGoodSnapshotMissing,
+    #[cfg(target_os = "linux")] KvmfrNotLoaded,
+}
+impl RepairIssue { pub fn title(&self) -> &'static str; pub fn remediation(&self) -> String; pub fn is_heavy(&self) -> bool; }
+pub struct RepairOutcome {
+    pub issues: Vec<RepairIssue>,
+    pub repaired: Vec<RepairIssue>,
+    pub restored_from_snapshot: Option<String>,
+}
+pub fn run(args: &Args) -> Result<()>;
+pub fn run_with(args: &Args, out: &mut dyn Write) -> Result<RepairOutcome>;
+pub fn scan_issues() -> Vec<RepairIssue>;
+
+// src/cli/stream/uninstall.rs
+pub struct Args { pub purge: bool, pub output: OutputOptions }
+pub struct UninstallOutcome {
+    pub libvirt_domain_removed: bool,
+    pub data_dir_removed: bool,
+    pub config_purged: bool,
+}
+pub fn run(args: &Args) -> Result<()>;
+pub fn run_with(args: &Args, out: &mut dyn Write, data_dir: Option<PathBuf>, config_path: Option<PathBuf>) -> Result<UninstallOutcome>;
+pub fn default_data_dir() -> Option<PathBuf>;
+pub fn default_config_path() -> Option<PathBuf>;
+
+// src/cli/stream/license.rs
+pub struct Args { pub action: Action, pub output: OutputOptions }
+pub enum Action {
+    Show,
+    Set { eval: bool, key: Option<String>, key_file: Option<PathBuf> },
+    Rearm,
+}
+pub fn run(args: &Args) -> Result<()>;
+pub fn run_with(args: &Args, out: &mut dyn Write) -> Result<()>;
+
+// src/cli/stream/start.rs (V3-Phase F additions)
+pub const GUEST_NAVIGATE_NOOP_ENV: &str = "NEON_TEST_GUEST_NAVIGATE_NOOP";
+pub const NAVIGATE_URL_SENTINEL: &str = "neon-navigate-url.txt";
+
+// src/cli/stream/mod.rs (V3-Phase F additions)
+pub enum Subcommand {
+    Default(OutputOptions),  // NEW: `neon stream` (no args) auto-dispatch
+    Init(InitArgs),
+    Status(StatusArgs),
+    Start(StartArgs),
+    Stop(StopArgs),
+    Repair(RepairArgs),       // changed shape from V3-Phase D stub
+    Uninstall(UninstallArgs), // changed shape
+    License(LicenseArgs),     // changed shape
+}
+
+// src/daemon/tray.rs (V3-Phase F additions)
+pub enum TrayCommand {
+    /* existing variants ... */
+    #[cfg(feature = "experimental-bridge")] BridgeRearm,  // NEW
+}
+impl BridgeMenuState {
+    pub fn needs_attention(&self) -> bool;       // NEW: <7-day eval / >30-day snapshot
+    pub fn eval_expiry_visible(&self) -> bool;   // NEW: <7-day eval
+}
+```
+
+Test-mode env vars added in V3-Phase F:
+
+| Var | Effect |
+|---|---|
+| `NEON_TEST_BRIDGE_HEALTH_NOOP=1` | `health::spawn_health_thread` returns `None` without spawning |
+| `NEON_TEST_GUEST_NAVIGATE_NOOP=1` | `cli::stream::start` writes no sentinel file (test pure) |
+
+## Decisions log (V3-Phase F)
+
+- **2026-05-04 (V3-Phase F)** — `bridge::config` is a *new* module separate from `bridge::license`. They share `~/.config/neon/bridge.toml` but operate on disjoint sections (`[license]` vs `[iso] / [sunshine] / [bridge]`). The license module ignores override sections; the config module ignores `[license]`. This keeps each module's `serde(deny_unknown_fields)` opinion local to its block.
+
+- **2026-05-04 (V3-Phase F)** — `BridgeConfig`'s top-level struct does NOT use `deny_unknown_fields` (so it tolerates `[license]` living in the same file). Each *section* under it (`IsoOverride`, `SunshineOverride`, `BridgeOverride`) does use `deny_unknown_fields`, so a typo'd key inside `[iso]` (e.g. `[iso] sha = "..."` instead of `sha256`) fails loudly with a `StateCorrupted` error.
+
+- **2026-05-04 (V3-Phase F)** — `apply_provision_overrides` translates `ram_mb` from "user wants 8192 MB of guest RAM" into "set host_ram_total to 4× that, so sized_for_host yields 8192". Reason: keeping `ProvisionOpts::host_ram_total_bytes` semantically correct (it's the *host* total) means the existing `sized_for_host` logic still does the right thing for unconfigured users. The 4× arithmetic falls out of `sized_for_host`'s `host/4` formula. `apply_domain_overrides` then writes `ram_mb` directly into the rendered `DomainSpec` for users who customized.
+
+- **2026-05-04 (V3-Phase F)** — Health monitor runs every 10 min in production, NOT every minute. Reason: the heartbeat is just for "monitor is alive" UX; the actual events being detected (eval expiry, snapshot age) change on day-scale. The 10-min cadence is a balance between responsiveness and not draining laptop batteries.
+
+- **2026-05-04 (V3-Phase F)** — Health monitor does **not** call `Hypervisor::connect()` directly — `BridgeMenuState` is the canonical surface for VM-state visibility. Reason: a hung libvirt connection would block the daemon thread for up to 30s; we want the health thread to stay responsive. `vm_paused` and `vm_paused_hours` fields are reserved for future polish where the daemon's main loop pushes state into the health sample.
+
+- **2026-05-04 (V3-Phase F)** — `RepairIssue::is_heavy` gates re-provisioning behind `--auto`. Reason: re-provisioning takes 30+ minutes; surprising users with "neon stream repair just kicked off a 30-minute install" would violate the Apple-UX guarantee. The default path surfaces the issue + remediation; users opt in via `--auto` or just run `neon stream init` manually.
+
+- **2026-05-04 (V3-Phase F)** — `cli::stream::uninstall` does NOT shell out to `sudo` for kvmfr unload / udev removal. Reason: per the guardrail "no sudo / pkexec / osascript-with-admin". The uninstall flow documents the manual sudo steps in its summary output.
+
+- **2026-05-04 (V3-Phase F)** — `cli::stream::license::Action::Set` requires exactly one of `--eval` / `--key` / `--key-file`. Zero or two-or-more is a `StateCorrupted` error. Reason: clap's `conflicts_with_all` already enforces "at most one" at the parse level (in `main.rs`), but the library-level run_with also enforces it as a defense-in-depth check. The 0-flags case is a separate user-error path with its own message.
+
+- **2026-05-04 (V3-Phase F)** — URL navigation uses a host-side sentinel file polled by a guest scheduled task. Reason: the alternatives (Sunshine input replay, custom RPC over IVSHMEM) all require either guest cooperation we can't easily test or a pre-baked Windows binary we'd have to maintain. The sentinel approach is dead-simple and degrades gracefully (if the 9p mount isn't wired in V3.0, the user pastes the URL manually and the guest task waits for it indefinitely).
+
+- **2026-05-04 (V3-Phase F)** — The `9p` mount that backs `E:\neon-navigate-url.txt` is **not yet wired into the libvirt domain XML** in V3-Phase F. Reason: the autounattend bits are ready (the scheduled task polls `E:\neon-navigate-url.txt`), but adding a virtio-9p `<filesystem>` block to the domain XML and getting the guest to mount it as drive E: is V3.1 scope. For V3.0 the URL writes succeed on the host side but the guest doesn't see them; the user pastes the URL manually inside the LG window. The host-side write is still useful for `--json` status reporting.
+
+- **2026-05-04 (V3-Phase F)** — `neon stream repair --refresh-snapshot` takes a new `fresh` snapshot via `Domain::snapshot(POST_INSTALL_SNAPSHOT)`. Under real-libvirt this overwrites the existing snapshot (libvirt's create-with-existing-name semantics replace); under mock mode the recorder simply records the new snapshot label. The wizard does **not** verify the VM is in a known-good state before snapshotting — that's the user's responsibility. We surface this in the docstring of the `--refresh-snapshot` flag.
+
+- **2026-05-04 (V3-Phase F)** — Tray's `BridgeRearm` action emits a notification with the PowerShell command rather than executing anything. Reason: rearm runs *inside the guest*, not on the host; `slmgr /rearm` requires admin PowerShell in the guest's user session. The host can't trigger it directly without going through Sunshine's input channel — which V3.1's URL-navigation polish will set up alongside the 9p mount.
+
+- **2026-05-04 (V3-Phase F)** — `BridgeMenuState::needs_attention` is a Rust method, not a separate field. Reason: derived state from `eval_days_remaining` and `snapshot_age_hours`; making it a method keeps the state struct's invariants from getting out of sync. The `Default` derive still works because the underlying fields all default to "no info".
+
+- **2026-05-04 (V3-Phase F)** — Tray `MenuItemSpec::Submenu`'s label gets a `⚠ ` prefix when `BridgeMenuState::needs_attention()`. Reason: most users only check the tray when they think something is wrong; the alert glyph in the menu surface (visible without expanding) is the "Apple-UX badge" the brief calls for. Prior phases used a clean `Bridge ▶` label always; V3-Phase F adds the conditional glyph.
+
+- **2026-05-04 (V3-Phase F)** — Init wizard's SIGINT handler is gated `#[cfg(not(test))]`. Reason: under `cargo test`, libtest's own SIGINT handler must remain in place so `Ctrl-C` cancels the test runner cleanly. The signal handler is `static OnceLock<Arc<AtomicBool>>` so multiple `run_with` invocations during a process's lifetime share one handler (re-installing libc::signal each time would be a no-op anyway, but the OnceLock makes the intent explicit).
+
+- **2026-05-04 (V3-Phase F)** — `neon stream` (no subcommand) auto-dispatches to `init` (no posture) or `status` (posture present). Reason: most-natural-thing UX. We don't surface this via `clap`'s `default_value_t` because clap's optional-subcommand handling is cleaner — `Option<StreamSubcommand>` with `None` → `Subcommand::Default(output)`.
+
+- **2026-05-04 (V3-Phase F)** — `bridge.toml` overrides for the Microsoft ISO URL+SHA + Sunshine URL+SHA are the **fix** for the V3-Phase C known-stub issue. With this in place, when Microsoft rotates the eval-center URL (yearly), users update `~/.config/neon/bridge.toml` and `neon stream init` re-runs cleanly without rebuilding from source.
+
+## Nick action required (V3.0 hardware acceptance)
+
+V3 is now code-complete behind the `experimental-bridge` feature flag. Hardware acceptance is **not** part of the bridge agent's gate. Nick exercises the full V3.0 path:
+
+1. **One-time host setup** (per V3-Phase D's Nick action items):
+   - `sudo pacman -S looking-glass looking-glass-module-dkms` (Arch) or distro equivalent.
+   - `sudo modprobe kvmfr static_size_mb=64` (and add to `/etc/modules-load.d/`).
+   - `sudo tee /etc/udev/rules.d/99-kvmfr.rules <<<'SUBSYSTEM=="kvmfr", OWNER="root", GROUP="kvm", MODE="0660"'` then `sudo udevadm control --reload-rules && sudo udevadm trigger`.
+   - `sudo usermod -aG kvm $USER` then log out/in.
+   - Plug in $5 4K HDMI dummy plug if `neon doctor --bridge` reported `NeedsDummyPlug`.
+   - Verify libvirt0 + qemu installed (`pacman -S qemu-full libvirt`).
+
+2. **Pin the Microsoft ISO URL** (the V3-Phase C known-stub issue, now fixable via `bridge.toml`):
+   - Visit <https://www.microsoft.com/en-us/evalcenter/evaluate-windows-11-iot-enterprise-ltsc>, grab current URL + SHA.
+   - Visit <https://github.com/LizardByte/Sunshine/releases>, grab current installer URL + SHA.
+   - Edit `~/.config/neon/bridge.toml`:
+     ```toml
+     [iso]
+     url = "https://software-download.microsoft.com/db/<current-token>/26100.<...>.<lang>_x64fre_en-us.iso"
+     sha256 = "<64-char-hex>"
+     expected_size = 6500000000
+
+     [sunshine]
+     url = "https://github.com/LizardByte/Sunshine/releases/download/v0.<latest>/sunshine-windows-installer.exe"
+     sha256 = "<64-char-hex>"
+     ```
+   - See [docs/v3/troubleshooting.md](../../../docs/v3/troubleshooting.md) for full instructions.
+
+3. **Build + install**:
+   ```sh
+   cargo install --path . --features experimental-bridge,experimental-bridge-libvirt
+   ```
+
+4. **Run end-to-end**:
+   ```sh
+   neon doctor --bridge                       # capability check
+   neon stream init --accept-eval             # ~30-45 min unattended install
+   neon stream status                         # verify VM defined / running / snapshot present
+   neon stream start netflix.com              # cold start <10s, LG opens, URL sentinel written
+   # In LG window: paste netflix.com (V3.0) or wait for guest task to read sentinel
+   neon stream stop                           # clean halt + last-good snapshot
+   ```
+
+5. **Failure-mode tests** (per orchestration plan acceptance criteria):
+   - Delete `~/.local/share/neon/bridge/disk.qcow2` mid-stream → `neon stream repair --auto` re-provisions.
+   - Kill libvirt domain mid-install → `neon stream repair` resumes or restarts.
+   - Disable IOMMU in BIOS → `neon doctor --bridge` reports it with vendor-specific BIOS-key remediation.
+
+6. **Tray V3 verification** (run `neon` with no args, click the icon):
+   - "Stream Netflix" / "Stream Disney+" / "Stream HBO Max" entries present.
+   - "Bridge ▶" submenu shows Status / Pause / Resume / Repair.
+   - When eval is < 7 days: top-level "⚠ Eval: N days remaining" entry appears.
+   - When snapshot > 30 days: "⚠ Bridge ▶" submenu badge appears.
+   - Repair tray click: surfaces a notification with auto-repair outcome.
+
+7. **License management**:
+   - `neon stream license show` — current posture.
+   - `neon stream license set --key XXXXX-...` — switch to BYO key.
+   - `neon stream license rearm` — show the in-guest PowerShell rearm command.
+
+If anything fails or the wizard exits with a non-actionable error, that's a V3 acceptance bug — open an issue with the output of `neon doctor --bridge --json` and `neon stream status --json`.
+
+## Files most recently changed (V3-Phase F)
+
+- `src/bridge/config.rs` (V3-Phase F — new — bridge.toml override plumbing)
+- `src/bridge/health.rs` (V3-Phase F — new — periodic health monitor + heartbeat)
+- `src/cli/stream/repair.rs` (V3-Phase F — new — broken-state detection + fix)
+- `src/cli/stream/uninstall.rs` (V3-Phase F — new — clean teardown)
+- `src/cli/stream/license.rs` (V3-Phase F — new — show/set/rearm posture management)
+- `src/cli/stream/mod.rs` (V3-Phase F — Subcommand grew {Default, Repair(Args), Uninstall(Args), License(Args)})
+- `src/cli/stream/init.rs` (V3-Phase F — wizard polish: indicatif spinner, all-issues remediation, repair hint, real SIGINT handler, bridge.toml plumbing)
+- `src/cli/stream/start.rs` (V3-Phase F — URL navigation: write sentinel for guest's first-logon poll)
+- `src/bridge/install.rs` (V3-Phase F — apply_sunshine_override + apply_domain_overrides plumbing)
+- `src/bridge/unattended.rs` (V3-Phase F — schedules guest task to poll URL sentinel)
+- `src/bridge/mod.rs` (V3-Phase F — register new modules: config, health)
+- `src/daemon/tray.rs` (V3-Phase F — TrayCommand BridgeRearm; needs_attention badge; alert glyph; rearm action)
+- `src/daemon/mod.rs` (V3-Phase F — health-monitor spawn; BridgeRepair real wiring; handle_bridge_rearm)
+- `src/main.rs` (V3-Phase F — Stream sub: Option<StreamSubcommand> + Repair/Uninstall/License args)
+- `docs/v3/hardware-compat.md` (V3-Phase F — new)
+- `docs/v3/troubleshooting.md` (V3-Phase F — new)
+- `docs/v3/license-faq.md` (V3-Phase F — new)
+- `ROADMAP.md` (V3-Phase F — V3 promoted to "shipping in V1.x" + subcommand table)
+- `CHANGELOG.md` (V3-Phase F — V3 entry under [Unreleased])
+
+## Commits on `feature/v3-scaffolding` from V3-Phase F
+
+```
+feat(bridge): config.rs override plumbing
+feat(cli): stream repair
+feat(cli): stream uninstall
+feat(cli): stream license
+feat(cli): stream URL navigation
+feat(bridge): health monitor + tray dynamic state
+feat(cli): stream init wizard polish
+docs(v3): user-facing docs + ROADMAP/CHANGELOG updates
+docs(bridge): V3-Phase F status
+```
+
+(Nine logical units; V3-Phase F code-complete. **V3.0 ready for Nick's hardware acceptance.**)
