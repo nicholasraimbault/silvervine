@@ -34,6 +34,8 @@ use crate::platform::capabilities::BridgeCapabilities;
 
 pub mod install;
 pub mod iso;
+#[cfg(target_os = "linux")]
+pub mod kvmfr;
 pub mod libvirt;
 pub mod libvirt_xml;
 pub mod license;
