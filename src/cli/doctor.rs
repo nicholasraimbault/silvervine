@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::browsers;
 use crate::cli::OutputOptions;
+use crate::daemon::tray::{detect_tray_availability, TrayAvailability};
 use crate::eme;
 use crate::error::{Error, Result};
 
@@ -51,6 +52,11 @@ pub struct Diagnostics {
     pub browsers: Vec<crate::cli::status::BrowserStatus>,
     /// Whether the legacy V1 install was detected on disk.
     pub legacy_install_present: bool,
+    /// Whether the tray icon backend is usable in this environment.
+    /// Surfaces silent-fallback to notifications-only mode (e.g. when
+    /// no session D-Bus is reachable) so users don't have to grep
+    /// journalctl to figure out why their tray icon is missing.
+    pub tray: TrayAvailability,
 }
 
 /// Heartbeat staleness threshold (per spec: 5 minutes).
@@ -66,6 +72,7 @@ pub fn build_diagnostics(
     heartbeat_at: Option<u64>,
     current_cdm_version: Option<String>,
     legacy_install_present: bool,
+    tray: TrayAvailability,
     now: u64,
 ) -> Diagnostics {
     let heartbeat_stale = match heartbeat_at {
@@ -89,6 +96,7 @@ pub fn build_diagnostics(
         current_cdm_version,
         browsers: browsers_snapshot,
         legacy_install_present,
+        tray,
     }
 }
 
@@ -119,6 +127,14 @@ pub fn render_text(d: &Diagnostics, out: &mut dyn Write) -> std::io::Result<()> 
         writeln!(out, "CDM: cached version {v}")?;
     } else {
         writeln!(out, "CDM: no cached version (run `neon update widevine`)")?;
+    }
+    match &d.tray {
+        TrayAvailability::Available => {
+            writeln!(out, "Tray: available")?;
+        }
+        TrayAvailability::Unavailable(reason) => {
+            writeln!(out, "Tray: unavailable — {reason}")?;
+        }
     }
     writeln!(out)?;
     if d.browsers.is_empty() {
@@ -175,10 +191,11 @@ pub fn run(args: &Args) -> Result<()> {
     let heartbeat_at = crate::cli::status::read_heartbeat();
     let current_cdm = crate::cli::status::current_cdm_version();
     let legacy_present = !crate::migration::detect_legacy_install().is_empty();
+    let tray = detect_tray_availability();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let d = build_diagnostics(&detected, heartbeat_at, current_cdm, legacy_present, now);
+    let d = build_diagnostics(&detected, heartbeat_at, current_cdm, legacy_present, tray, now);
 
     if args.share {
         writeln!(handle, "{}", share_url(&d)).map_err(Error::from)?;
@@ -436,7 +453,7 @@ mod tests {
 
     #[test]
     fn build_diagnostics_no_browsers_no_heartbeat() {
-        let d = build_diagnostics(&[], None, None, false, 1_700_000_000);
+        let d = build_diagnostics(&[], None, None, false, TrayAvailability::Available, 1_700_000_000);
         assert!(d.browsers.is_empty());
         assert!(d.heartbeat_at.is_none());
         assert!(!d.heartbeat_stale);
@@ -445,20 +462,20 @@ mod tests {
 
     #[test]
     fn build_diagnostics_marks_stale_heartbeat() {
-        let d = build_diagnostics(&[], Some(1_700_000_000), None, false, 1_700_000_500);
+        let d = build_diagnostics(&[], Some(1_700_000_000), None, false, TrayAvailability::Available, 1_700_000_500);
         assert_eq!(d.heartbeat_at, Some(1_700_000_000));
         assert!(d.heartbeat_stale);
     }
 
     #[test]
     fn build_diagnostics_fresh_heartbeat_not_stale() {
-        let d = build_diagnostics(&[], Some(1_700_000_000), None, false, 1_700_000_100);
+        let d = build_diagnostics(&[], Some(1_700_000_000), None, false, TrayAvailability::Available, 1_700_000_100);
         assert!(!d.heartbeat_stale);
     }
 
     #[test]
     fn build_diagnostics_legacy_present_flag_propagates() {
-        let d = build_diagnostics(&[], None, None, true, 0);
+        let d = build_diagnostics(&[], None, None, true, TrayAvailability::Available, 0);
         assert!(d.legacy_install_present);
     }
 
@@ -466,7 +483,7 @@ mod tests {
     fn build_diagnostics_includes_browser_snapshot() {
         let tmp = TempDir::new().unwrap();
         let detected = vec![fake_browser("Helium", tmp.path().join("h"))];
-        let d = build_diagnostics(&detected, None, Some("4.10.0".into()), false, 0);
+        let d = build_diagnostics(&detected, None, Some("4.10.0".into()), false, TrayAvailability::Available, 0);
         assert_eq!(d.browsers.len(), 1);
         assert_eq!(d.browsers[0].name, "Helium");
         assert_eq!(d.current_cdm_version.as_deref(), Some("4.10.0"));
@@ -474,7 +491,7 @@ mod tests {
 
     #[test]
     fn render_text_indicates_no_daemon() {
-        let d = build_diagnostics(&[], None, None, false, 0);
+        let d = build_diagnostics(&[], None, None, false, TrayAvailability::Available, 0);
         let mut buf = Vec::new();
         render_text(&d, &mut buf).unwrap();
         let s = String::from_utf8(buf).unwrap();
@@ -483,7 +500,7 @@ mod tests {
 
     #[test]
     fn render_text_legacy_install_warning() {
-        let d = build_diagnostics(&[], None, None, true, 0);
+        let d = build_diagnostics(&[], None, None, true, TrayAvailability::Available, 0);
         let mut buf = Vec::new();
         render_text(&d, &mut buf).unwrap();
         let s = String::from_utf8(buf).unwrap();
@@ -494,7 +511,7 @@ mod tests {
     fn render_text_browser_status_lines() {
         let tmp = TempDir::new().unwrap();
         let detected = vec![fake_browser("Helium", tmp.path().join("h"))];
-        let d = build_diagnostics(&detected, None, None, false, 0);
+        let d = build_diagnostics(&detected, None, None, false, TrayAvailability::Available, 0);
         let mut buf = Vec::new();
         render_text(&d, &mut buf).unwrap();
         let s = String::from_utf8(buf).unwrap();
@@ -504,7 +521,7 @@ mod tests {
 
     #[test]
     fn share_url_starts_with_github_template() {
-        let d = build_diagnostics(&[], None, None, false, 0);
+        let d = build_diagnostics(&[], None, None, false, TrayAvailability::Available, 0);
         let url = share_url(&d);
         assert!(url.starts_with("https://github.com/nicholasraimbault/neon/issues/new"));
         assert!(url.contains("template=bug.yml"));
@@ -517,7 +534,7 @@ mod tests {
         // the URL-encoded body roundtrips.
         let tmp = TempDir::new().unwrap();
         let detected = vec![fake_browser("Helium", tmp.path().join("h"))];
-        let d = build_diagnostics(&detected, None, None, false, 0);
+        let d = build_diagnostics(&detected, None, None, false, TrayAvailability::Available, 0);
         let url = share_url(&d);
         // The "Helium" name appears in the diagnostics; the URL should
         // contain its encoded form (no special chars).
@@ -569,9 +586,42 @@ mod tests {
 
     #[test]
     fn diagnostics_round_trips_through_json() {
-        let d = build_diagnostics(&[], Some(1), None, true, 100);
+        let d = build_diagnostics(
+            &[],
+            Some(1),
+            None,
+            true,
+            TrayAvailability::Unavailable("synthetic".into()),
+            100,
+        );
         let s = serde_json::to_string(&d).unwrap();
         let back: Diagnostics = serde_json::from_str(&s).unwrap();
         assert_eq!(back, d);
+    }
+
+    #[test]
+    fn render_text_includes_tray_available_row() {
+        let d = build_diagnostics(&[], None, None, false, TrayAvailability::Available, 0);
+        let mut buf = Vec::new();
+        render_text(&d, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("Tray: available"));
+    }
+
+    #[test]
+    fn render_text_includes_tray_unavailable_reason() {
+        let d = build_diagnostics(
+            &[],
+            None,
+            None,
+            false,
+            TrayAvailability::Unavailable("session D-Bus unavailable".into()),
+            0,
+        );
+        let mut buf = Vec::new();
+        render_text(&d, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("Tray: unavailable"));
+        assert!(s.contains("session D-Bus unavailable"));
     }
 }
