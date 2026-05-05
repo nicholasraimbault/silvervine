@@ -76,12 +76,13 @@ This is bounded but involved — two-three weeks of focused work. Apple Silicon 
 
 Apple deprecated `codesign --deep` as of macOS 13. V1 still uses it because that's what V0 used and the deprecation doesn't break things yet. V2 migrates to inside-out codesigning: sign the framework's `.dylib` first, then sign the framework, then sign the bundle. Each layer's signature is verifiable independently. Documented at `https://developer.apple.com/documentation/security/notarizing_macos_software_before_distribution/resolving_common_notarization_issues`.
 
-## V3 stretch goal — `neon localhost-bridge` (experimental)
+## V3 — `neon localhost-bridge` (shipping in V1.x)
 
-**Status:** behind a Cargo feature flag `experimental-bridge`. Architectural scaffolding (feature flag, stub `neon stream` subcommand, `CdmProvider` trait, `bridge` module skeleton) ships in V1.0 alongside V2's stable surface. The real V3 implementation lands incrementally after V1.0 stabilizes.
+**Status:** code-complete behind the `experimental-bridge` Cargo feature flag. Hardware acceptance pending Nick's end-to-end test on real GPU+TPM passthrough hardware. After acceptance, ships as part of V1.x as an opt-in feature flag.
 
 - Architecture and scaffolding plan: [V3 scaffolding plan](docs/superpowers/specs/2026-05-04-neon-v3-localhost-bridge-scaffolding-plan.md)
 - Six-sub-phase orchestration: [V3 orchestration plan](docs/superpowers/plans/2026-05-04-neon-v3-orchestration-plan.md)
+- User-facing docs: [`docs/v3/`](docs/v3/) — hardware compat matrix, troubleshooting, license FAQ.
 
 Activated by:
 
@@ -89,7 +90,22 @@ Activated by:
 cargo install neon --features experimental-bridge
 ```
 
-Enables a `neon stream <url>` subcommand. In V1.0 binaries it returns a "queued for V3" stub error pointing back here; subsequent V3 phases (B → C → D → F) fill it in.
+Once installed, the `neon stream` subcommand tree provisions a Windows
+guest VM, attaches it to the host's GPU + TPM via VFIO passthrough, and
+streams the guest desktop back via Looking Glass. Apple-level UX is
+the design constraint — every error path has specific remediation, and
+`neon stream repair` recovers from broken state.
+
+| Subcommand | Purpose |
+|---|---|
+| `neon stream init [--accept-eval | --license-key K | --license-file P]` | Provision the bridge VM (single command, ~30-45 min unattended) |
+| `neon stream start [URL]` | Resume VM + launch Looking Glass; opens URL in guest's Edge |
+| `neon stream stop` | Snapshot + halt cleanly |
+| `neon stream status [--json]` | VM state, snapshot age, license expiry, Sunshine reachability |
+| `neon stream repair [--auto] [--from-snapshot=NAME] [--refresh-snapshot]` | Detect + auto-fix broken state |
+| `neon stream uninstall [--purge]` | Clean teardown; `--purge` removes config too |
+| `neon stream license {show \| set \| rearm}` | Manage license posture |
+| `neon stream` (no args) | Auto-dispatch: `init` if not provisioned, `status` otherwise |
 
 
 The L3 ceiling is real. There's no software path to 4K HDR on a de-Googled Chromium fork. But there's a hardware path: a Win11 IoT VM with GPU + TPM passthrough, running Edge or Chrome with a real signed Widevine binary, streamed back to the host via Looking Glass.

@@ -12,6 +12,39 @@ Once V1.0 ships, future entries will be auto-generated from
 
 ### Added
 
+- **V3 localhost-bridge (experimental, behind `experimental-bridge`
+  Cargo feature)**: `neon stream` subcommand tree that provisions a
+  Windows IoT LTSC guest VM with GPU + TPM passthrough and streams the
+  desktop back via Looking Glass for premium 4K HDR DRM playback.
+  Activated by `cargo install neon --features experimental-bridge`.
+  Default `cargo install neon` is unchanged.
+  - `neon stream init` — single-command provisioning (~30-45 min
+    unattended).
+  - `neon stream start [URL]` — resumes VM, launches Looking Glass,
+    writes the URL into a sentinel the guest's Edge picks up.
+  - `neon stream stop` — snapshots + halts cleanly.
+  - `neon stream status [--json]` — VM state, snapshot age, license
+    expiry, Sunshine reachability.
+  - `neon stream repair [--auto] [--from-snapshot] [--refresh-snapshot]`
+    — detects broken state, applies fixes in priority order.
+  - `neon stream uninstall [--purge]` — clean teardown; `--purge`
+    removes config too.
+  - `neon stream license {show | set | rearm}` — manage license
+    posture (eval / key / key-file).
+  - `neon stream` (no args) — auto-dispatch: `init` if not provisioned,
+    `status` otherwise.
+  - `~/.config/neon/bridge.toml` overrides for Microsoft ISO URL +
+    SHA, Sunshine installer URL + SHA, VM RAM / vCPU / IVSHMEM /
+    data-dir. Lets users pin a fresh ISO when Microsoft rotates the
+    eval-center URL without rebuilding from source.
+  - Tray icon V3 extensions: streaming quick-launches, Bridge submenu
+    (status / pause / resume / repair), eval-expiry badge with
+    one-click rearm, alert glyph (⚠) when state needs attention.
+  - Bridge health monitor: per-10-min check thread inside the daemon,
+    surfaces eval-expiry / stale-snapshot / paused-VM as native
+    notifications.
+  - User-facing docs at `docs/v3/`: hardware compat matrix,
+    troubleshooting guide, license FAQ.
 - Single-binary cross-platform Rust rewrite (replaces V0 bash + Swift + Go).
 - Atomic patching with snapshot/rollback (`renameat2(RENAME_EXCHANGE)` on
   Linux, `renameatx_np(RENAME_SWAP)` on macOS).
