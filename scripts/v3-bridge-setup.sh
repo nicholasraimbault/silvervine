@@ -178,11 +178,14 @@ if $NEED_KVM_GROUP || $NEED_LIBVIRT_GROUP; then
     warn "Either log out and back in, OR run the rest of this script in a"
     warn "subshell that picks up the new group:"
     echo
-    info "  exec sg libvirt -c \"sg kvm -c '$0 --skip-system'\""
+    info "  exec sg libvirt -c \"sg kvm -c '$0'\""
     echo
-    warn "If you'd rather just keep going (group will apply next login),"
-    warn "press Enter. Otherwise Ctrl-C and run the exec line above."
-    read -r
+    if [ -t 0 ] && [ -z "${NEON_BRIDGE_NONINTERACTIVE:-}" ]; then
+        warn "Press Enter to continue (group applies at next login), or Ctrl-C to exit."
+        read -r
+    else
+        warn "(non-interactive mode: continuing; group changes apply at next login)"
+    fi
 fi
 
 # ─── build neon with the experimental-bridge feature ──────────────────
