@@ -30,6 +30,9 @@
 //! E / F. None of that code exists yet.
 
 use crate::error::{Error, Result};
+use crate::platform::capabilities::BridgeCapabilities;
+
+pub mod remediation;
 
 /// Top-level entry from `cli::stream::run`. Provisions the bridge VM
 /// (idempotent), boots Edge in the guest pointed at `target_url`, and
@@ -53,21 +56,44 @@ pub fn stream(_target_url: &str) -> Result<()> {
 
 /// Hardware capability snapshot consumed by the V3 bridge wizard.
 ///
-/// **Stub.** V3-Phase B fills in TPM 2.0 presence, IOMMU enablement,
-/// CPU virtualization extensions, GPU model + IOMMU-grouping, RAM,
-/// available disk, HDR-capable display, etc. All detection is feature-
-/// gated to keep the V2 binary lean.
-#[derive(Debug, Clone)]
-pub struct HardwareCapabilities;
+/// V3-Phase B wires this to [`crate::platform::capabilities::detect`],
+/// which probes the host's TPM, IOMMU, CPU virtualization, GPU, kernel
+/// modules, free disk, RAM, and display surface. The wrapper exists so
+/// future V3 phases can attach bridge-specific helpers (e.g. "is the
+/// guest VM compatible with this snapshot?") without widening the
+/// `platform::capabilities` API surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HardwareCapabilities {
+    /// Underlying capability snapshot from
+    /// [`crate::platform::capabilities`].
+    pub inner: BridgeCapabilities,
+}
 
 impl HardwareCapabilities {
-    /// Detect host capabilities. V3-Phase A stub returns an empty
-    /// struct; V3-Phase B replaces this with real probing of `/dev/tpm0`,
-    /// `dmesg | grep -i iommu`, `/proc/cpuinfo`, `/sys/class/drm`,
-    /// `lspci -vk`, etc.
+    /// Detect host capabilities. V3-Phase B uses
+    /// [`crate::platform::capabilities::detect`] — the real probe path.
+    /// Tests can construct a [`HardwareCapabilities`] directly via
+    /// [`Self::with`] passing a synthesized [`BridgeCapabilities`].
     #[must_use]
     pub fn detect() -> Self {
-        Self
+        Self {
+            inner: crate::platform::capabilities::detect(),
+        }
+    }
+
+    /// Construct from a known [`BridgeCapabilities`]. Used by tests and
+    /// by future V3 phases that have a snapshot from elsewhere.
+    #[must_use]
+    pub fn with(inner: BridgeCapabilities) -> Self {
+        Self { inner }
+    }
+
+    /// Compute outstanding capability issues for this snapshot.
+    ///
+    /// Convenience wrapper around [`remediation::issues_for`].
+    #[must_use]
+    pub fn issues(&self) -> Vec<remediation::CapabilityIssue> {
+        remediation::issues_for(&self.inner)
     }
 }
 
@@ -84,9 +110,48 @@ mod tests {
         assert!(err.to_string().contains("ROADMAP"));
     }
 
-    /// `HardwareCapabilities::detect` constructs an empty stub.
+    /// `HardwareCapabilities::detect` builds a non-stub snapshot.
     #[test]
-    fn hardware_capabilities_detect_constructs_stub() {
-        let _caps = HardwareCapabilities::detect();
+    fn hardware_capabilities_detect_returns_real_snapshot() {
+        let caps = HardwareCapabilities::detect();
+        // We don't assert specific values — host hardware varies.
+        // Smoke-test: kernel.version is non-empty on every supported OS.
+        assert!(!caps.inner.kernel.version.is_empty());
+    }
+
+    /// `with` constructs from a synthesized snapshot and `issues()`
+    /// runs without panic.
+    #[test]
+    fn hardware_capabilities_with_synthesized_snapshot() {
+        use crate::platform::capabilities::{
+            DiskStatus, DisplayStatus, GpuStatus, IommuStatus, KernelStatus, RamStatus,
+            SessionType, TpmStatus, VirtStatus,
+        };
+        let snapshot = BridgeCapabilities {
+            tpm: TpmStatus::Absent,
+            iommu: IommuStatus::Absent,
+            virtualization: VirtStatus::Absent,
+            gpu: GpuStatus::NotDetected,
+            kernel: KernelStatus {
+                version: "6.6.0".into(),
+                kvmfr_supported: false,
+            },
+            disk: DiskStatus {
+                free_bytes: 0,
+                mountpoint: "/tmp".into(),
+            },
+            ram: RamStatus {
+                total_bytes: 0,
+                available_bytes: 0,
+            },
+            display: DisplayStatus {
+                session_type: SessionType::Headless,
+                hdr_capable: false,
+            },
+        };
+        let caps = HardwareCapabilities::with(snapshot);
+        let issues = caps.issues();
+        // Empty hardware → many issues surfaced.
+        assert!(!issues.is_empty());
     }
 }
