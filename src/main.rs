@@ -98,6 +98,12 @@ enum Command {
 
         /// EME error code to translate (e.g. Netflix N8156-6013).
         error_code: Option<String>,
+
+        /// Show V3 bridge hardware capability matrix + remediation
+        /// (requires the `experimental-bridge` Cargo feature).
+        #[cfg(feature = "experimental-bridge")]
+        #[arg(long)]
+        bridge: bool,
     },
 
     /// Run an EME health check against a known test page.
@@ -227,9 +233,16 @@ fn dispatch(cmd: Command, output: cli::OutputOptions) -> neon::Result<()> {
         Command::ListBrowsers { all } => {
             cli::list_browsers::run(&cli::list_browsers::Args { all, output })
         }
-        Command::Doctor { share, error_code } => cli::doctor::run(&cli::doctor::Args {
+        Command::Doctor {
+            share,
+            error_code,
+            #[cfg(feature = "experimental-bridge")]
+            bridge,
+        } => cli::doctor::run(&cli::doctor::Args {
             error_code,
             share,
+            #[cfg(feature = "experimental-bridge")]
+            bridge,
             output,
         }),
         Command::Test { browser, url } => cli::test::run(&cli::test::Args {

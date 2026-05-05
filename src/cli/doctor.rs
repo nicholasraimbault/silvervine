@@ -27,6 +27,10 @@ pub struct Args {
     pub error_code: Option<String>,
     /// `--share`: emit an issue-template URL prefilled with the report.
     pub share: bool,
+    /// `--bridge`: render the V3 bridge capability matrix +
+    /// remediation table (gated on `experimental-bridge`).
+    #[cfg(feature = "experimental-bridge")]
+    pub bridge: bool,
     /// Output flags.
     pub output: OutputOptions,
 }
@@ -152,6 +156,7 @@ pub fn share_url(diagnostics: &Diagnostics) -> String {
 /// # Errors
 ///
 /// * `Other` if writing to stdout fails.
+/// * `Other` if `--bridge` is requested and any rendering step fails.
 pub fn run(args: &Args) -> Result<()> {
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
@@ -159,6 +164,11 @@ pub fn run(args: &Args) -> Result<()> {
     // Code-translation mode short-circuits the diagnostic bundle.
     if let Some(code) = &args.error_code {
         return run_translate(code, args.output, &mut handle);
+    }
+
+    #[cfg(feature = "experimental-bridge")]
+    if args.bridge {
+        return run_bridge(args, &mut handle);
     }
 
     let detected = browsers::detect_browsers().unwrap_or_default();
@@ -179,6 +189,197 @@ pub fn run(args: &Args) -> Result<()> {
         writeln!(handle, "{s}").map_err(Error::from)?;
     } else {
         render_text(&d, &mut handle).map_err(Error::from)?;
+    }
+    Ok(())
+}
+
+/// `neon doctor --bridge` entry point. Renders the
+/// [`crate::platform::capabilities::BridgeCapabilities`] snapshot as a
+/// table (or JSON), followed by per-issue remediation steps.
+///
+/// Exit codes:
+///
+/// * 0 — every probe came back green.
+/// * non-zero — at least one capability issue surfaced. Caller maps via
+///   `Error::other(...)` so the exit-code translator returns 1.
+#[cfg(feature = "experimental-bridge")]
+fn run_bridge(args: &Args, out: &mut dyn Write) -> Result<()> {
+    use crate::bridge::remediation;
+    use crate::bridge::HardwareCapabilities;
+
+    let caps = HardwareCapabilities::detect();
+    let issues = caps.issues();
+
+    if args.output.json {
+        let body = serde_json::json!({
+            "tpm": format!("{:?}", caps.inner.tpm),
+            "iommu": format!("{:?}", caps.inner.iommu),
+            "virtualization": format!("{:?}", caps.inner.virtualization),
+            "gpu": format!("{:?}", caps.inner.gpu),
+            "kernel": {
+                "version": caps.inner.kernel.version,
+                "kvmfr_supported": caps.inner.kernel.kvmfr_supported,
+            },
+            "disk": {
+                "free_bytes": caps.inner.disk.free_bytes,
+                "mountpoint": caps.inner.disk.mountpoint.display().to_string(),
+            },
+            "ram": {
+                "total_bytes": caps.inner.ram.total_bytes,
+                "available_bytes": caps.inner.ram.available_bytes,
+            },
+            "display": format!("{:?}", caps.inner.display),
+            "issues": issues
+                .iter()
+                .map(|i| {
+                    let r = remediation::remediation_for(i);
+                    serde_json::json!({
+                        "kind": format!("{i:?}"),
+                        "title": r.title,
+                        "detail": r.detail,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        });
+        writeln!(out, "{}", serde_json::to_string_pretty(&body)?).map_err(Error::from)?;
+    } else {
+        render_bridge_text(&caps, &issues, out).map_err(Error::from)?;
+    }
+
+    if !issues.is_empty() {
+        return Err(Error::other(format!(
+            "{} bridge capability issue(s) need attention",
+            issues.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Render the bridge capability snapshot + remediation as a friendly
+/// text report. Hand-rolled (no `tabled` dep) — the bridge snapshot has
+/// a small fixed schema.
+#[cfg(feature = "experimental-bridge")]
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+fn render_bridge_text(
+    caps: &crate::bridge::HardwareCapabilities,
+    issues: &[crate::bridge::remediation::CapabilityIssue],
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
+    use std::fmt::Write as _;
+
+    use crate::platform::capabilities::{
+        DisplayStatus, GpuStatus, IommuStatus, RamStatus, SessionType, TpmStatus, VirtStatus,
+    };
+    let inner = &caps.inner;
+
+    writeln!(out, "Neon doctor --bridge")?;
+    writeln!(out, "====================")?;
+    writeln!(out)?;
+    writeln!(out, "Capability                   Status")?;
+    writeln!(
+        out,
+        "---------------------------- ----------------------------"
+    )?;
+    let tpm = match &inner.tpm {
+        TpmStatus::Present { version, vendor } => format!(
+            "Present ({} from {})",
+            version,
+            vendor.as_deref().unwrap_or("unknown vendor")
+        ),
+        TpmStatus::Absent => "Absent".to_string(),
+        TpmStatus::NotChecked => "Not checked".to_string(),
+    };
+    let iommu = match &inner.iommu {
+        IommuStatus::Enabled { kind } => format!("Enabled ({kind:?})"),
+        IommuStatus::Disabled => "Disabled".to_string(),
+        IommuStatus::Absent => "Absent".to_string(),
+    };
+    let virt = match &inner.virtualization {
+        VirtStatus::Enabled { kind } => format!("Enabled ({kind:?})"),
+        VirtStatus::Disabled => "Disabled".to_string(),
+        VirtStatus::Absent => "Absent".to_string(),
+    };
+    let gpu = match &inner.gpu {
+        GpuStatus::Detected { devices } => {
+            let mut s = String::new();
+            for (i, d) in devices.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                let _ = write!(s, "{} {}", d.vendor, d.model);
+                if let Some(g) = d.iommu_group {
+                    let isolation = if d.clean_isolation { "clean" } else { "shared" };
+                    let _ = write!(s, " (IOMMU {g}, isolation {isolation})");
+                }
+            }
+            s
+        }
+        GpuStatus::NotDetected => "Not detected".to_string(),
+    };
+    let RamStatus { total_bytes, .. } = inner.ram;
+    let ram_label = format!(
+        "{:.1} GB total",
+        total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
+    let disk_label = format!(
+        "{:.1} GB free at {}",
+        inner.disk.free_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        inner.disk.mountpoint.display()
+    );
+    let display_label = match &inner.display {
+        DisplayStatus {
+            session_type: SessionType::Wayland { compositor },
+            hdr_capable,
+        } => format!(
+            "Wayland ({}){}",
+            compositor.as_deref().unwrap_or("compositor unknown"),
+            if *hdr_capable { ", HDR-capable" } else { "" }
+        ),
+        DisplayStatus {
+            session_type: SessionType::X11,
+            hdr_capable,
+        } => format!("X11{}", if *hdr_capable { ", HDR-capable" } else { "" }),
+        DisplayStatus {
+            session_type: SessionType::Headless,
+            ..
+        } => "Headless".to_string(),
+    };
+    let kernel_label = format!(
+        "{}{}",
+        inner.kernel.version,
+        if inner.kernel.kvmfr_supported {
+            " (kvmfr available)"
+        } else {
+            ""
+        }
+    );
+
+    writeln!(out, "{:<28} {tpm}", "TPM 2.0")?;
+    writeln!(out, "{:<28} {iommu}", "IOMMU")?;
+    writeln!(out, "{:<28} {virt}", "CPU virtualization")?;
+    writeln!(out, "{:<28} {gpu}", "GPU")?;
+    writeln!(out, "{:<28} {kernel_label}", "Kernel")?;
+    writeln!(out, "{:<28} {ram_label}", "RAM")?;
+    writeln!(out, "{:<28} {disk_label}", "Disk")?;
+    writeln!(out, "{:<28} {display_label}", "Display")?;
+    writeln!(out)?;
+
+    if issues.is_empty() {
+        writeln!(
+            out,
+            "All bridge capabilities green. Ready for `neon stream init`."
+        )?;
+    } else {
+        writeln!(out, "Issues to address ({}):", issues.len())?;
+        writeln!(out)?;
+        for (i, issue) in issues.iter().enumerate() {
+            let r = crate::bridge::remediation::remediation_for(issue);
+            writeln!(out, "{}. {}", i + 1, r.title)?;
+            for line in r.detail.lines() {
+                writeln!(out, "   {line}")?;
+            }
+            writeln!(out)?;
+        }
     }
     Ok(())
 }
