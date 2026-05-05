@@ -199,13 +199,23 @@ cargo build --features experimental-bridge
 cargo test --features experimental-bridge --lib --jobs 2
 ```
 
-### What `experimental-bridge` enables (in V1.0 binaries)
+### What `experimental-bridge` enables
 
-- The `neon stream <url>` subcommand becomes visible in `neon --help`.
-- Invoking `neon stream <url>` returns a **stub error** pointing at ROADMAP.md — V1.0 ships only the architectural seam, not the V3 implementation.
-- The `neon::bridge` module is compiled into the library crate; nothing else is reachable yet.
+- The `neon stream <subcommand>` group becomes visible in `neon --help` (`init`, `status`, `start`, `stop`, `repair`, `uninstall`, `license`).
+- The `neon::bridge` module is compiled into the library crate, including the unattended-XML generator, libvirt domain XML renderer, ISO download manager, license posture management, and a mock-mode libvirt orchestrator.
+- V3-Phase C's `neon stream init` and `neon stream status` are wired and run end-to-end under NOOP test environment variables (no real VM, no real ISO download). The remaining `start`/`stop`/`repair`/`uninstall`/`license` subcommands return "queued for V3-Phase D / F" stub errors.
 
 Default builds (no flag) compile **none** of the V3 code; the binary is byte-equivalent to V1.0's stable surface.
+
+### `experimental-bridge-libvirt` (Linux only, additive)
+
+To actually orchestrate a libvirt VM (rather than the mock path), enable this additional flag:
+
+```sh
+cargo install neon --features experimental-bridge,experimental-bridge-libvirt
+```
+
+This pulls in the [`virt`](https://crates.io/crates/virt) crate (libvirt-rs bindings), which dynamically links against `libvirt0`. Hosts must have `libvirt-dev` (Debian/Ubuntu) or `libvirt` (Arch) installed before building. Without `experimental-bridge-libvirt`, `neon stream init` will return a clear error pointing the user at the flag.
 
 ### Adding a new experimental feature
 
