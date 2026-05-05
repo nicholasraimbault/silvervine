@@ -183,7 +183,147 @@ CI on `v2-rust-rewrite` runs the same matrix on macOS + Linux for every push (th
 
 `src/daemon/power/macos.rs` (≈145 lines): macOS-only. The block-construction + `addObserverForName` paths require AppKit at link time and are exercised on the macos-latest runner via the public NOOP-gated test in `power::tests`.
 
-## Files most recently changed
+## V3-Phase B — status (complete 2026-05-04)
+
+| # | Deliverable | Status | Notes |
+|---|---|---|---|
+| A | `src/platform/capabilities/mod.rs` public API + per-OS dispatch | done | `BridgeCapabilities` (TPM/IOMMU/Virt/GPU/Kernel/Disk/RAM/Display); `CapabilityRoots` injectable filesystem roots; `detect()` / `detect_with()` entry points; `NEON_TEST_CAPS_NOOP` env var; default V2 builds compile this module so the `bridge` wrapper compiles even without the feature flag (feature-gating is at the `bridge::HardwareCapabilities` wrapper). |
+| A | `src/platform/capabilities/linux.rs` impls | done | TPM via `/sys/class/tpm/tpm0/`, virt via `/proc/cpuinfo`, IOMMU via cmdline + `/sys/kernel/iommu_groups/`, GPU via `/sys/class/drm/card*/`, kernel via `/proc/sys/kernel/osrelease` (or `uname(2)` fallback), disk via `statvfs(2)`, RAM via `/proc/meminfo`, display via env vars + DRM connector `hdr_output_metadata`. |
+| A | `src/platform/capabilities/macos.rs` impls | done | `system_profiler SPHardwareDataType -json` + `SPDisplaysDataType -json` parsed via serde; Secure Enclave / T2 detection; DART always-on; `physical_memory` parsing. Subprocess gated by `NEON_TEST_CAPS_NOOP`. |
+| A | `src/platform/capabilities/tests.rs` | done | 25 tests using `tempfile::TempDir`-synthesized `/sys` / `/proc` / `/dev` trees (Linux); 7 macOS-only tests; 3 OS-agnostic tests (`CapabilityRoots::host`, NOOP env, end-to-end smoke). |
+| B | `src/bridge/remediation.rs` | done | `CapabilityIssue` enum, `issues_for(...)`, `remediation_for(...)`. Hardcoded BIOS-key tables for ASUS, Gigabyte, MSI, ASRock, Lenovo, Dell, HP, Apple, Framework. Dummy plug Amazon link, GRUB cmdline guidance, ACS-override pointer. 7 unit tests cover every issue + remediation pair. |
+| C | `src/cli/doctor.rs` `--bridge` flag | done | Pretty table renderer (no `tabled` dep — hand-rolled). JSON mode via `--json doctor --bridge`. Exit code: 0 if all green, 1 if any issue. Feature-gated so default `neon doctor --help` doesn't list `--bridge`. |
+| D | `src/bridge/mod.rs` `HardwareCapabilities` widening | done | Wraps `crate::platform::capabilities::BridgeCapabilities`; `detect()` delegates to the platform module; `with(...)` constructor for tests; `issues()` convenience method. |
+| E | env_mutex flake fix | done | Added `src/test_support.rs` with shared `env_lock()` global mutex (replaces 8 per-module `static ENV_MUTEX: Mutex<()>` declarations); recovers from poisoning via `unwrap_or_else(PoisonError::into_inner)`. 30 consecutive `cargo test --lib --jobs 2` runs clean (was ~10% flake rate previously). |
+| F | Tests + verification | done | `cargo build` and `cargo build --features experimental-bridge`: clean. `cargo fmt --check`: clean. `cargo clippy --all-targets --jobs 2 -- -D warnings`: clean for both feature states. **494 tests on default; 508 with `experimental-bridge`** (was 466 / 469). |
+
+## V3-Phase B public contracts
+
+```rust
+// src/platform/capabilities/mod.rs (V3-Phase B)
+pub struct BridgeCapabilities {
+    pub tpm: TpmStatus,
+    pub iommu: IommuStatus,
+    pub virtualization: VirtStatus,
+    pub gpu: GpuStatus,
+    pub kernel: KernelStatus,
+    pub disk: DiskStatus,
+    pub ram: RamStatus,
+    pub display: DisplayStatus,
+}
+pub fn detect() -> BridgeCapabilities;
+pub fn detect_with(roots: &CapabilityRoots) -> BridgeCapabilities;
+pub const NOOP_ENV: &str = "NEON_TEST_CAPS_NOOP";
+pub fn noop_enabled() -> bool;
+
+pub enum TpmStatus {
+    Present { version: String, vendor: Option<String> },
+    Absent,
+    NotChecked,
+}
+pub enum IommuStatus { Enabled { kind: IommuKind }, Disabled, Absent }
+pub enum IommuKind { IntelVtD, AmdViO }
+pub enum VirtStatus { Enabled { kind: VirtKind }, Disabled, Absent }
+pub enum VirtKind { VtX, AmdV }
+pub enum GpuStatus { Detected { devices: Vec<GpuDevice> }, NotDetected }
+pub struct GpuDevice {
+    pub vendor: String,             // "Intel" / "NVIDIA" / "AMD" / "Apple" / "Unknown (...)"
+    pub model: String,
+    pub iommu_group: Option<u32>,
+    pub clean_isolation: bool,
+    pub hdr_capable: bool,
+}
+pub struct KernelStatus { pub version: String, pub kvmfr_supported: bool }
+pub struct DiskStatus { pub free_bytes: u64, pub mountpoint: PathBuf }
+pub struct RamStatus { pub total_bytes: u64, pub available_bytes: u64 }
+pub struct DisplayStatus { pub session_type: SessionType, pub hdr_capable: bool }
+pub enum SessionType {
+    Wayland { compositor: Option<String> },
+    X11,
+    Headless,
+}
+
+pub struct CapabilityRoots {
+    pub sys: PathBuf,
+    pub proc_: PathBuf,
+    pub dev: PathBuf,
+    pub home: Option<PathBuf>,
+}
+impl CapabilityRoots {
+    pub fn host() -> Self;
+}
+
+// src/bridge/remediation.rs (gated experimental-bridge)
+pub fn issues_for(caps: &BridgeCapabilities) -> Vec<CapabilityIssue>;
+pub fn remediation_for(issue: &CapabilityIssue) -> RemediationStep;
+pub enum CapabilityIssue {
+    TpmAbsent, TpmUnknownVersion,
+    IommuDisabled, IommuAbsent,
+    VirtAbsent, VirtDisabled,
+    GpuAbsent, GpuIsolationDirty,
+    DiskTooSmall { free_bytes: u64, required_bytes: u64 },
+    RamLow { total_bytes: u64, recommended_bytes: u64 },
+    NeedsDummyPlug,
+}
+pub struct RemediationStep { pub title: String, pub detail: String }
+
+// src/bridge/mod.rs (gated experimental-bridge)
+pub struct HardwareCapabilities { pub inner: BridgeCapabilities }
+impl HardwareCapabilities {
+    pub fn detect() -> Self;
+    pub fn with(inner: BridgeCapabilities) -> Self;
+    pub fn issues(&self) -> Vec<CapabilityIssue>;
+}
+
+// src/test_support.rs (only built with cfg(any(test, debug_assertions)))
+pub fn env_lock() -> std::sync::MutexGuard<'static, ()>;
+```
+
+## Decisions log (V3-Phase B)
+
+- **2026-05-04 (V3-Phase B)** — `platform::capabilities` is **always compiled**, not gated on `experimental-bridge`. Rationale: the bridge wrapper at `src/bridge/mod.rs` is the only feature-gated consumer, and gating the platform module would have meant gating the runtime probes — which means the V2 binary couldn't include them even if a future non-bridge feature wanted to read them (e.g. `neon doctor` showing GPU model on default). Gating is at the bridge wrapper, where it matters.
+
+- **2026-05-04 (V3-Phase B)** — `CapabilityRoots` carries a single `home: Option<PathBuf>` rather than reflecting the `FsRoots` from `migration.rs` which has `system_root` + `home`. Reasoning: capability detection probes across `/sys`, `/proc`, `/dev`, and `$HOME` independently; rolling them under a single `system_root` would have meant test fixtures relying on the /sys-under-/system-root path layout, which is wrong (real `/sys` is at `/sys`, not under `/`).
+
+- **2026-05-04 (V3-Phase B)** — IOMMU detection looks at **both** `/proc/cmdline` (kernel cmdline) **and** `/sys/kernel/iommu_groups/` (groups populated). The product matrix:
+  - groups + virt-vendor known → `Enabled { kind: <vendor> }`
+  - no groups + cmdline-says-on + virt-vendor known → `Disabled` (BIOS toggle off)
+  - no groups + no cmdline + no virt → `Absent` (CPU lacks the feature)
+  - everything else → `Disabled` (best-effort)
+
+- **2026-05-04 (V3-Phase B)** — GPU "clean isolation" detection skips PCIe bridges (PCI class 0x06xxxx) and same-PCI-function siblings (e.g. 67:00.0 and 67:00.1 share root `0000:67:00`). This matches the real-world VFIO usage pattern: a GPU + its audio companion at function .1 are both passed through to the same guest, and PCIe bridges in the same group don't need to be unbound.
+
+- **2026-05-04 (V3-Phase B)** — `bytes_to_gib` uses `as f64` casting which is `clippy::cast_precision_loss`-flagged. We `#[allow(...)]` the lint locally because (a) we're rendering for human display, (b) display strings are formatted to 1 decimal place which is well below f64 mantissa precision for any plausible disk/RAM size on consumer hardware (max ~200TB before precision loss matters).
+
+- **2026-05-04 (V3-Phase B)** — macOS DART detection reports `IommuKind::AmdViO` on aarch64 and `IommuKind::IntelVtD` on x86_64 as a marker. These are arbitrary; the wizard doesn't differentiate Apple from x86 for IOMMU. macOS users use Parallels/UTM for the Windows side anyway; this field is informational.
+
+- **2026-05-04 (V3-Phase B)** — `env_mutex` flake fix is **shared** across all test modules via a single `crate::test_support::env_lock()` function. Previously each module had its own `static ENV_MUTEX: Mutex<()>`, which serialized within the module but allowed cross-module env-var races. The new shared lock + `unwrap_or_else(PoisonError::into_inner)` recovery brings the test flake rate from ~10% to ~0% (30 consecutive clean runs verified).
+
+- **2026-05-04 (V3-Phase B)** — `test_support` module is `#[cfg(any(test, debug_assertions))]` rather than `#[cfg(test)]`. Rationale: test modules in *other* files reference `crate::test_support::env_lock()`, and `cfg(test)` only fires for the crate currently being tested; a sibling integration test that depends on the lib pulling its own test scaffolding would not see it. `debug_assertions` is enabled in `dev` profile (which is what `cargo test` uses) and disabled in `release` builds (so the production binary doesn't include the symbol). This is the same pattern other crates use for "test helpers exposed at the lib level".
+
+- **2026-05-04 (V3-Phase B)** — `neon doctor --bridge` exits with **non-zero** when any capability issue surfaces, not just on "hard" issues like missing TPM. Single-GPU hosts get a `NeedsDummyPlug` issue which is informational but treated as exit-code-1 by design (the wizard expects `doctor --bridge` to be a strict gate before `stream init`). Users with single-GPU hosts run `doctor --bridge` once, install the dummy plug, then proceed.
+
+- **2026-05-04 (V3-Phase B)** — Hardware-acceptance smoke check on Nick's actual machine (Linux, AMD desktop, Wayland niri): all probes returned plausible values (TPM 2.0 detected, IOMMU enabled with clean group, AMD GPU at IOMMU 21, 29 GB RAM, 2.9 TB free, kernel 7.0.3-1-cachyos). One issue surfaced: `NeedsDummyPlug` (correct — single-GPU host).
+
+## Files most recently changed (V3-Phase B + Phase 3)
+
+V3-Phase B:
+
+- `src/platform/capabilities/mod.rs` (V3-Phase B — new, public types + dispatch)
+- `src/platform/capabilities/linux.rs` (V3-Phase B — new, Linux impls)
+- `src/platform/capabilities/macos.rs` (V3-Phase B — new, macOS impls)
+- `src/platform/capabilities/tests.rs` (V3-Phase B — new, 35 tests)
+- `src/platform/mod.rs` (V3-Phase B — added `pub mod capabilities`)
+- `src/bridge/mod.rs` (V3-Phase B — `HardwareCapabilities` wraps real platform detection; new `with()` + `issues()` methods)
+- `src/bridge/remediation.rs` (V3-Phase B — new, gated `experimental-bridge`)
+- `src/cli/doctor.rs` (V3-Phase B — `--bridge` flag + renderer)
+- `src/main.rs` (V3-Phase B — `--bridge` flag wiring under `Doctor` variant)
+- `src/test_support.rs` (V3-Phase B — new, shared `env_lock()`)
+- `src/lib.rs` (V3-Phase B — added `pub mod test_support` under `cfg(any(test, debug_assertions))`)
+- `tests/fixtures/macos_system_profiler.json` (V3-Phase B — new committed fixture)
+- 8 test modules (`notify.rs`, `hooks.rs`, `daemon/{mod,lifecycle/{mod,linux,macos},power/mod}.rs`, `cli/{init,uninstall,repair}.rs`) — `static ENV_MUTEX` removed, replaced with `crate::test_support::env_lock()` calls.
+
+Phase 3:
 
 - `src/lib.rs` (Phase 3 — added `pub mod daemon;`)
 - `src/daemon/mod.rs` (Phase 3 — façade declaring `pub mod lifecycle; pub mod power;` so daemon team can extend)
