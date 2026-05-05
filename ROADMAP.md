@@ -76,9 +76,37 @@ This is bounded but involved — two-three weeks of focused work. Apple Silicon 
 
 Apple deprecated `codesign --deep` as of macOS 13. V1 still uses it because that's what V0 used and the deprecation doesn't break things yet. V2 migrates to inside-out codesigning: sign the framework's `.dylib` first, then sign the framework, then sign the bundle. Each layer's signature is verifiable independently. Documented at `https://developer.apple.com/documentation/security/notarizing_macos_software_before_distribution/resolving_common_notarization_issues`.
 
-## V3 — `neon localhost-bridge` (shipping in V1.x)
+## V3 — `neon stream` localhost-bridge (experimental in V1.x)
 
-**Status:** code-complete behind the `experimental-bridge` Cargo feature flag. Hardware acceptance pending Nick's end-to-end test on real GPU+TPM passthrough hardware. After acceptance, ships as part of V1.x as an opt-in feature flag.
+**Status:** code-complete behind the `experimental-bridge` Cargo feature flag. **Ships as experimental, not promoted on the front page.** Default install (`curl | sh`) gets V2 only. Opt-in only via `cargo install neon --features experimental-bridge,experimental-bridge-libvirt`.
+
+### Hardware that actually works
+
+V3 requires a **dual-GPU host**. Verified working configurations (per Proxmox forum threads + V3 hardware acceptance):
+
+- **Desktop with iGPU + dGPU** (Intel UHD + NVIDIA RTX 2070+ recommended). Host runs on iGPU; guest gets dGPU; Looking Glass shows on iGPU display.
+- **Laptop with hybrid graphics** (NVIDIA Optimus / AMD Hybrid). Same architecture as desktop, laptop form factor.
+
+Hardware that does NOT work (be explicit):
+
+- **Single-GPU laptop** — Linux desktop has no GPU left while VM runs. Dummy plug doesn't fix this; nothing fixes it until Looking Glass IDD-host ships upstream (paused; no timeline).
+- **Single-GPU desktop without dummy plug** — same problem.
+- **AMD GPUs** — less verified than NVIDIA; PlayReady SL3000 attestation may or may not engage. Test before committing.
+- **Apple Silicon Mac** — V3 is Linux-only (macOS gets only `neon doctor --bridge` for capability detection, points users to Parallels/UTM).
+
+### Quality ceiling
+
+- **4K resolution: yes**, verified working on the configurations above.
+- **True HDR end-to-end: NO** — Looking Glass currently captures the guest framebuffer and tone-maps to SDR on the Linux host display because Wayland HDR through Looking Glass isn't ready. Users get 4K with tone-mapped HDR until the Wayland HDR + LG HDR passthrough confluence (~2026 estimated).
+- **Dolby Vision: NO** — needs licensed components Linux doesn't have.
+- **Netflix specifically**: confirmed 4K-SDR-with-tone-mapped-HDR.
+- **Disney+, HBO Max, Apple TV+**: less verified; some are stricter about VM detection.
+
+### Why ship V3 at all given the limitations
+
+Because the gap analysis was real: WinBoat (21k stars) explicitly walked away from Looking Glass complexity and shipped CPU-only RDP. Shadow.tech and similar cloud SaaS players ban VOD streaming in their ToS. There is no actively-maintained tool that does what V3 does. The audience is small (~50-200k de-Googled-browser users on dual-GPU Linux), but it's an empty space and our V3 fills it cleanly *for users who have the hardware*.
+
+For users without dual-GPU hardware (probably most of Neon's audience): **V2 at 720p is the right answer.** This is documented in [docs/v3/hardware-compat.md](docs/v3/hardware-compat.md) and on the V3 init wizard's capability gate, which refuses to provision when the host can't actually use it.
 
 - Architecture and scaffolding plan: [V3 scaffolding plan](docs/superpowers/specs/2026-05-04-neon-v3-localhost-bridge-scaffolding-plan.md)
 - Six-sub-phase orchestration: [V3 orchestration plan](docs/superpowers/plans/2026-05-04-neon-v3-orchestration-plan.md)
@@ -87,14 +115,15 @@ Apple deprecated `codesign --deep` as of macOS 13. V1 still uses it because that
 Activated by:
 
 ```sh
-cargo install neon --features experimental-bridge
+cargo install neon --features experimental-bridge,experimental-bridge-libvirt
 ```
 
 Once installed, the `neon stream` subcommand tree provisions a Windows
 guest VM, attaches it to the host's GPU + TPM via VFIO passthrough, and
-streams the guest desktop back via Looking Glass. Apple-level UX is
-the design constraint — every error path has specific remediation, and
-`neon stream repair` recovers from broken state.
+streams the guest desktop back via Looking Glass. The init wizard runs
+a hardware-capability gate first — refuses to proceed if the host
+can't actually deliver the feature. Every error path has specific
+remediation; `neon stream repair` recovers from broken state.
 
 | Subcommand | Purpose |
 |---|---|
@@ -108,33 +137,26 @@ the design constraint — every error path has specific remediation, and
 | `neon stream` (no args) | Auto-dispatch: `init` if not provisioned, `status` otherwise |
 
 
-The L3 ceiling is real. There's no software path to 4K HDR on a de-Googled Chromium fork. But there's a hardware path: a Win11 IoT VM with GPU + TPM passthrough, running Edge or Chrome with a real signed Widevine binary, streamed back to the host via Looking Glass.
-
-We've verified the gap analysis: this space is empty. **WinBoat (21k stars)** explicitly walked away from Looking Glass complexity and shipped CPU-only RDP. **Shadow.tech** and similar cloud SaaS players ban VOD streaming in their ToS — none of them target this use case. Addressable audience: ~50–200k de-Googled-browser users on x86_64 Linux who'd pay for premium DRM.
+The L3 ceiling is real. There's no software-only path to 4K HDR on a de-Googled Chromium fork. V3 takes the hardware path: a Win11 IoT VM with GPU + TPM passthrough, running Edge with a real signed Widevine binary, streamed back to the host via Looking Glass. **The user trades hardware (a second GPU and ~$5 in adapters) for a streaming experience that desktop-Linux DRM otherwise forbids.**
 
 The recipe:
 
-1. **Win11 IoT LTSC.** Free for evaluation; **BYO production license** (mitigates the licensing grey area — Neon doesn't ship Microsoft binaries; user provides their own LTSC license).
-2. **Looking Glass B7** for ultra-low-latency frame transport over a shared memory ring buffer between host + guest. ~3-5 ms vs. RDP's ~25-40 ms.
-3. **GPU passthrough** via VFIO (single-GPU passthrough or dual-GPU).
-4. **TPM passthrough** via swtpm (software TPM emulator) — Widevine L1 needs a TPM 2.0 endorsement key chain.
-5. **HEVC** (free in IoT LTSC, paid in retail Win11) — Netflix and Disney+ deliver HEVC at higher quality tiers.
-6. **Looking Glass IDD driver** (status: paused upstream; mitigated by **$5 dummy HDMI plug** to give Windows a "real" display target without forcing GPU resync).
+1. **Win11 IoT LTSC** — free for evaluation; **BYO production license**. Neon never distributes Microsoft binaries; user provides their own LTSC license. HEVC is bundled in IoT LTSC at no extra cost (unlike retail Win11).
+2. **Looking Glass B7** — ultra-low-latency frame transport over a shared-memory ring buffer between host + guest (~3-5 ms vs. RDP's ~25-40 ms).
+3. **GPU passthrough via VFIO** — **dual-GPU host required** (single-GPU passthrough leaves the Linux host with no display).
+4. **TPM passthrough** via swtpm — Widevine L1 needs a TPM 2.0 endorsement key chain.
+5. **Looking Glass IDD driver** — paused upstream; mitigation is a $5 HDMI dummy plug, but only if you have dual GPUs to begin with.
 
-Three blockers, all mitigated:
+The known blockers, with honest mitigations:
 
-- **Licensing grey-area** — mitigated by BYO posture; Neon never distributes Microsoft binaries.
-- **Looking Glass IDD paused upstream** — mitigated by dummy HDMI plug ($5 from Amazon).
-- **Niche pricing** — mitigated by shipping it free, as a Neon Cargo feature, no separate product / paywall.
+| Blocker | Mitigation | Residual cost to user |
+|---|---|---|
+| Licensing grey-area for Win11 IoT LTSC | BYO posture; Neon never ships MS binaries | User finds + pins URL/SHA in `~/.config/neon/bridge.toml` |
+| Single-GPU laptop can't do it | None today; waits on Looking Glass IDD-host upstream | V3 not for laptops; use V2 instead |
+| HDR end-to-end needs Wayland HDR + LG HDR confluence | Settles at "4K with tone-mapped HDR" until ~2026 | Lower visual quality than what 4K HDR could be |
+| Pinned ISO URL/SHA goes stale | `bridge.toml` override lets users update without source edits | Periodic manual pin |
 
-The interface would be:
-
-```sh
-cargo install neon --features experimental-bridge
-neon localhost-bridge install              # downloads Win11 IoT LTSC ISO; configures VM
-neon localhost-bridge configure-passthrough  # wizard for GPU + TPM
-neon localhost-bridge launch                # starts VM + Looking Glass client; pipes audio
-```
+Niche pricing isn't a blocker because we ship it free as a feature flag — no separate product, no paywall. Users who can use it, can. Users who can't, get clear remediation telling them why.
 
 The Cargo feature flag means it stays out of the default binary entirely. Default builds remain ~10 MB. With the feature, we add VM management + Looking Glass client glue (probably ~5 MB more, plus runtime deps for QEMU + KVM). The user opts into the complexity.
 
