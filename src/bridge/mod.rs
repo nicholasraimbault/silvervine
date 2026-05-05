@@ -32,6 +32,7 @@
 use crate::error::{Error, Result};
 use crate::platform::capabilities::BridgeCapabilities;
 
+pub mod idd_fallback;
 pub mod install;
 pub mod iso;
 #[cfg(target_os = "linux")]
