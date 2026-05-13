@@ -147,11 +147,12 @@ where
     // surfaces "guest not ready" cleanly.
     let _sunshine_reachable = wait_for_sunshine_handshake(Duration::from_secs(5));
 
-    // Step 6: launch Looking Glass.
+    // Step 6: launch Looking Glass. Linux-only; on macOS there's no
+    // host-side LG and the function would have returned earlier
+    // before this point. The Linux-gated handle is forget()-ed
+    // below so the LG client survives `neon stream start` exiting.
     #[cfg(target_os = "linux")]
     let lg_handle = launch_looking_glass()?;
-    #[cfg(not(target_os = "linux"))]
-    let lg_handle = ();
 
     if !args.output.quiet {
         writeln!(out, "Step 3/3: Looking Glass client launched").map_err(Error::from)?;
@@ -197,11 +198,9 @@ where
 
     // Detach the LG handle so the process keeps running after this
     // function returns. Drop sends SIGTERM; we want the LG window to
-    // outlive `neon stream start`.
+    // outlive `neon stream start`. macOS has no handle to detach.
     #[cfg(target_os = "linux")]
     std::mem::forget(lg_handle);
-    #[cfg(not(target_os = "linux"))]
-    drop(lg_handle);
 
     Ok(())
 }
