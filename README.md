@@ -15,11 +15,11 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 neon setup
 ```
 
-Once v2.0.0 stable lands, this snippet collapses to `…/releases/latest/download/neon-installer.sh` (URL updated on each release).
+Once v2.0.0 stable lands, this snippet swaps the pinned tag for `…/releases/latest/download/neon-installer.sh` and self-updates with each release.
 
 The installer drops a single statically-linked binary into `$CARGO_HOME/bin` (typically `~/.cargo/bin`); `neon setup` then detects your browsers, downloads the Widevine CDM from Mozilla's GMP manifest, patches each browser, and registers a user-session daemon (LaunchAgent on macOS, systemd-user unit on Linux) that re-patches automatically on browser self-updates.
 
-**Mac users heads-up.** `brew install nicholasraimbault/neon/neon` still installs **v1.0.0** (the V1 bash scripts). The tap is intentionally pinned at v1 during the rc — v2 hasn't been end-to-end validated on macOS yet. To try v2 on a Mac, use the `curl … | sh` snippet above. We auto-publish a v2 Formula to the tap once the macOS path is validated.
+**Mac users heads-up.** `brew install nicholasraimbault/neon/neon` still installs **v1.0.0** — the bash-script implementation that predated this Rust rewrite. The tap is intentionally pinned at v1 during the rc because v2 hasn't been end-to-end validated on macOS yet. To try v2 on a Mac, use the `curl … | sh` snippet above. We'll auto-publish a v2 Formula to the tap once the macOS path is validated.
 
 If you previously installed Neon via the V1 bash script, Homebrew tap, AUR package, or .deb — `neon setup` detects and migrates the old install (with a pkg-manager-aware uninstall hint for AUR / .deb / .rpm). See [MIGRATION.md](MIGRATION.md).
 
@@ -59,7 +59,7 @@ Patched Widevine is **software-only L3**. Streaming services cap L3 playback at 
 
 Hardware-DRM L1 requires a Widevine binary signed by your device's TPM/Secure Enclave + browser binary signed by the browser vendor + CDN-side allow-listing. None of that exists for de-Googled Chromium forks. If you need 4K HDR, you need a device blessed by the studios — Apple TV, smart TV, official Edge/Safari/Chrome.
 
-There's an experimental escape hatch — `neon stream` — that runs a Win11 IoT VM with GPU + TPM passthrough and streams its desktop back via Looking Glass. **It requires dual-GPU hardware** (single-GPU laptops can't use it; the host has no GPU left while the VM runs). And it gives you 4K *with tone-mapped HDR*, not true HDR end-to-end (Wayland HDR + Looking Glass HDR confluence is ~2026). Behind the `experimental-bridge` Cargo feature flag, off by default. See [ROADMAP.md](ROADMAP.md#v3--neon-stream-localhost-bridge-experimental-in-v1x) for the honest hardware-and-quality matrix before you opt in.
+There's an experimental escape hatch — `neon stream` — that runs a Win11 IoT VM with GPU + TPM passthrough and streams its desktop back via Looking Glass. **It requires dual-GPU hardware** (single-GPU laptops can't use it; the host has no GPU left while the VM runs). And it gives you 4K *with tone-mapped HDR*, not true HDR end-to-end (Wayland HDR + Looking Glass HDR confluence is ~2026). Behind the `experimental-bridge` Cargo feature flag, off by default. See the V3 section in [ROADMAP.md](ROADMAP.md) for the honest hardware-and-quality matrix before you opt in.
 
 ## Features
 
@@ -71,7 +71,7 @@ There's an experimental escape hatch — `neon stream` — that runs a Win11 IoT
 - **`neon repair`** brings any broken state back to working in one command.
 - **Opt-in error reporting.** Default off. If enabled in `neon init`, categorized failure reports flow to a Cloudflare Worker so trends become visible without depending on user-filed issues. No PII; no telemetry; only failures.
 - **Mozilla manifest fallback chain.** Primary: `hg.mozilla.org`. Fallback: GitHub mirror. Final fallback: 24h-cached manifest. Survives `hg.mozilla.org` flakes (which is why Mozilla mirrors the manifest themselves).
-- **Migration from V1.** Detects and cleans up legacy bash installs, V1 Homebrew formula installs, AUR packages, and .deb installs.
+- **Migration from V1.** Detects and cleans up legacy bash installs, V1 Homebrew formula installs, AUR / `.deb` / `.rpm` packages, with a pkg-manager-aware uninstall hint sniffed from `/etc/os-release`.
 
 ## CLI reference
 
@@ -103,7 +103,7 @@ Global flags: `-v`/`-vv` for verbose logging, `-q` to silence non-error output, 
 4. **Daemon.** The daemon (LaunchAgent / systemd-user unit) watches each browser's framework path via `notify` (FSEvents on macOS, inotify on Linux). When a browser self-updates, the watcher fires, the daemon checks the browser is closed, re-patches, and emits a desktop notification.
 5. **Sleep/wake hooks.** On wake-from-sleep, the daemon re-verifies every browser's patch status (browsers can update via package manager while the laptop is asleep).
 
-The full module layout, atomic-rename protocol, and IPC schema are documented in `docs/superpowers/specs/2026-05-04-neon-rust-rewrite-design.md`.
+Module-level rustdoc covers the patch protocol, atomic-rename mechanics, and the daemon IPC envelope in detail — `cargo doc --open` after cloning to browse it locally.
 
 ## Why Neon
 
@@ -121,7 +121,7 @@ If you're using regular Chrome, regular Edge, regular Brave, or Firefox — you 
 - On Linux: any tray bar that speaks the StatusNotifierItem protocol — KDE Plasma, sway/Hyprland with waybar, Quickshell-based shells (noctalia, Caelestia), Cinnamon, etc. Vanilla GNOME [removed tray support in 2017](https://blogs.gnome.org/aday/2017/08/31/status-icons-and-gnome/) and needs the [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/). Without a working tray bar, the daemon falls back to notifications-only.
 - A Chromium-family browser to patch.
 
-ARM64 Linux (Asahi, Pi) is **not** supported in V2 — see [ROADMAP.md](ROADMAP.md) for the future ELF-patching plan. Windows is **not** supported in V2 — see [ROADMAP.md](ROADMAP.md) for the contributor-driven port.
+ARM64 Linux (Asahi, Pi) and Windows aren't supported in V2 — see [ROADMAP.md](ROADMAP.md) for the future plans.
 
 ## Project posture
 
