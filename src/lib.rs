@@ -33,6 +33,13 @@
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
+// macOS FFI prose references Apple framework names (`AppKit`,
+// `NSWorkspace`, `NSNotificationCenter`, …) too densely for the
+// doc_markdown lint to be useful — backticking every instance in
+// every doc paragraph is busywork that obscures the prose. Linux
+// clippy never flagged this lint (cross-platform code doesn't trip
+// it); keeping it on globally only created macOS-specific failures.
+#![allow(clippy::doc_markdown)]
 
 pub mod browsers;
 pub mod cli;

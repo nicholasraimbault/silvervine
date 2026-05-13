@@ -37,7 +37,7 @@ use objc2::rc::Retained;
 use objc2_app_kit::NSWorkspace;
 use objc2_foundation::{NSNotification, NSNotificationCenter, NSObject, NSString};
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 use super::WakeCallback;
 
@@ -54,6 +54,10 @@ pub(super) struct Handle {
 }
 
 /// Subscribe to `NSWorkspaceDidWakeNotification`.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "Result return matches the Linux subscribe() signature; future failures can fit in here without rippling through callers"
+)]
 pub(super) fn subscribe(callback: WakeCallback) -> Result<Handle> {
     // `NSNotificationCenter::addObserverForName:object:queue:usingBlock:`
     // is what we want. The `object:` arg is the sender filter (nil =
@@ -77,6 +81,10 @@ pub(super) fn subscribe(callback: WakeCallback) -> Result<Handle> {
     // SAFETY: The static is initialized by AppKit at framework load.
     // We treat the resulting pointer as a `&NSString` valid for the
     // lifetime of the process.
+    #[allow(
+        clippy::needless_borrow,
+        reason = "the extern static is `NSString`, not `&NSString`; the borrow is load-bearing"
+    )]
     let wake_name: &NSString = unsafe { &objc2_app_kit::NSWorkspaceDidWakeNotification };
 
     // Build a block that wraps the user callback. `block2::RcBlock`
@@ -112,6 +120,10 @@ pub(super) fn subscribe(callback: WakeCallback) -> Result<Handle> {
 }
 
 /// Drop a handle: un-register the observer.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "consume-by-value is intentional — handle's fields drop at end of scope and release AppKit refs"
+)]
 pub(super) fn drop_handle(handle: Handle) {
     // SAFETY: `removeObserver:` is the documented inverse of
     // `addObserverForName:`. After this call AppKit no longer holds

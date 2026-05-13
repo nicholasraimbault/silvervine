@@ -62,6 +62,7 @@ pub(super) struct HardwareItem {
     #[serde(default)]
     pub physical_memory: Option<String>,
     #[serde(default, rename = "platform_UUID")]
+    #[allow(dead_code, reason = "captured for completeness; not surfaced today")]
     pub platform_uuid: Option<String>,
 }
 
@@ -88,6 +89,7 @@ pub(super) struct ConnectedDisplay {
     #[serde(default)]
     pub spdisplays_display_type: Option<String>,
     #[serde(default)]
+    #[allow(dead_code, reason = "captured for completeness; not surfaced today")]
     pub spdisplays_pixels: Option<String>,
 }
 
@@ -265,11 +267,10 @@ pub(super) fn detect_kernel_macos() -> KernelStatus {
 
 #[must_use]
 pub(super) fn detect_disk_macos(roots: &CapabilityRoots) -> DiskStatus {
-    let path = roots
-        .home
-        .as_ref()
-        .map(|h| h.join(".local/share/neon/bridge"))
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let path = roots.home.as_ref().map_or_else(
+        || PathBuf::from("/tmp"),
+        |h| h.join(".local/share/neon/bridge"),
+    );
     DiskStatus {
         free_bytes: 0, // statvfs would need a real path; defer to wizard.
         mountpoint: path,
@@ -308,6 +309,11 @@ pub(super) fn parse_macos_memory(s: &str) -> Option<u64> {
         "tb" => value * 1024.0 * 1024.0 * 1024.0 * 1024.0,
         _ => return None,
     };
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "system_profiler size strings are small positive byte counts; saturating-cast to u64 is fine"
+    )]
     Some(bytes as u64)
 }
 

@@ -864,6 +864,10 @@ impl Tray {
     /// the change without a tray-icon rebuild. On macOS the daemon's
     /// main loop drops + reconstructs `Tray` when state changes
     /// non-trivially (a follow-up can wire `tray-icon`'s `set_menu`).
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Linux branch moves `state` into the ksni update closure; macOS branch only stores a clone. Borrow-only signature would require caller-side cloning on every call."
+    )]
     pub fn set_state(&self, state: MenuState) {
         *self.state.lock().unwrap() = state.clone();
         #[cfg(target_os = "linux")]
@@ -877,7 +881,7 @@ impl Tray {
             });
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = state;
+        drop(state);
     }
 
     /// Render the current menu layout (pure-data view).

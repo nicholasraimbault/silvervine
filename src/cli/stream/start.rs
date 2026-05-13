@@ -201,7 +201,7 @@ where
     #[cfg(target_os = "linux")]
     std::mem::forget(lg_handle);
     #[cfg(not(target_os = "linux"))]
-    let _ = lg_handle;
+    drop(lg_handle);
 
     Ok(())
 }
@@ -348,6 +348,7 @@ mod tests {
 
     /// Save a fresh trial license posture so `current_posture` returns
     /// `Some(...)`.
+    #[allow(dead_code, reason = "used by Linux-gated test cases below")]
     fn write_trial_posture(config_root: &std::path::Path) {
         let bridge_toml = config_root.join("neon").join("bridge.toml");
         std::fs::create_dir_all(bridge_toml.parent().unwrap()).expect("mkdir");

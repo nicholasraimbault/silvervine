@@ -17,6 +17,7 @@ use tempfile::TempDir;
 use super::*;
 
 /// Build an empty `CapabilityRoots` rooted at `tmp.path()`.
+#[allow(dead_code, reason = "used by Linux-gated tests below")]
 fn empty_roots(tmp: &TempDir) -> CapabilityRoots {
     let sys = tmp.path().join("sys");
     let proc_ = tmp.path().join("proc");
@@ -32,6 +33,7 @@ fn empty_roots(tmp: &TempDir) -> CapabilityRoots {
     }
 }
 
+#[allow(dead_code, reason = "used by Linux-gated tests below")]
 fn write(p: &Path, body: &str) {
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent).unwrap();

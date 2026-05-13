@@ -135,6 +135,8 @@ pub struct BundleLayout {
 /// 3. Inside `Versions/`, prefer `Current` if it exists and is a symlink;
 ///    otherwise pick the only non-symlink `<version>` entry.
 ///
+/// # Errors
+///
 /// Returns [`crate::ErrorCategory::UnknownBundleStructure`] if any step
 /// fails — the caller (the orchestrator) categorizes the error and
 /// surfaces it through the patch flow.
@@ -245,9 +247,7 @@ fn active_version_dir(versions: &Path) -> Result<PathBuf> {
 }
 
 fn is_symlink(p: &Path) -> bool {
-    fs::symlink_metadata(p)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
+    fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 fn write_cdm_into(layout: &BundleLayout, cdm_source: &Path) -> Result<()> {
