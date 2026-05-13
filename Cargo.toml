@@ -249,23 +249,26 @@ lto = "thin"
 cargo-dist-version = "0.31.0"
 # CI backends to support
 ci = "github"
-# The installers to generate for each app
-#  - shell:   the universal `curl … | sh` installer; works on Linux + macOS
-#             when the user doesn't have a native package manager preference.
-#  - homebrew: macOS users overwhelmingly reach for `brew install`. cargo-dist
-#             auto-publishes a Formula to the tap repo below on every release
-#             tag, so we get first-class macOS install UX without owning any
-#             Formula edits or version bumps by hand.
-installers = ["shell", "homebrew"]
-# Homebrew tap that receives the auto-generated Formula. The repo already
-# exists from V1; cargo-dist will land PRs against its default branch on
-# each release tag. When V1 retires (~30 days post-V2.0.0 stable), the
-# legacy bash-script Formula gets replaced by the V2 binary Formula here.
-tap = "nicholasraimbault/homebrew-neon"
-# Activate the Homebrew publish job in the generated release workflow.
-# Needs a `HOMEBREW_TAP_TOKEN` repo secret (a PAT with `contents:write`
-# on the tap repo) for cargo-dist to push the Formula commit.
-publish-jobs = ["homebrew"]
+# The installers to generate for each app.
+#  - shell: the universal `curl … | sh` installer; works on Linux + macOS
+#           when the user doesn't have a native package manager preference.
+#
+# TODO(macos-validation): once the V2 binary is smoke-tested end-to-end on
+# a real Mac, flip this to `["shell", "homebrew"]` and uncomment `tap` +
+# `publish-jobs` below. cargo-dist will then auto-publish a Formula to
+# the homebrew-neon tap on every release tag. Until then, Mac users
+# continue to get V1 via the existing `brew install` (the tap repo
+# still points at v1.0.0 bash scripts) — known-good rather than
+# unvalidated-V2.
+installers = ["shell"]
+# Homebrew tap that will receive the auto-generated Formula once the
+# `homebrew` installer above is re-enabled.
+# tap = "nicholasraimbault/homebrew-neon"
+# Activate the Homebrew publish job. Needs a `HOMEBREW_TAP_TOKEN` repo
+# secret (a fine-grained PAT scoped to homebrew-neon with
+# `contents:write` + `pull-requests:write`) for cargo-dist to push the
+# Formula commit.
+# publish-jobs = ["homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-musl"]
 # Path that installers should place binaries in
