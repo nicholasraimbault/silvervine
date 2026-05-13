@@ -258,14 +258,7 @@ where
             writeln!(out, "Removing {} legacy artifact(s)…", install.len()).map_err(Error::from)?;
             match migration::remove_legacy(install) {
                 Ok(outcome) => {
-                    writeln!(
-                        out,
-                        "Migration: removed={} migrated={} skipped={}",
-                        outcome.removed.len(),
-                        outcome.migrated.len(),
-                        outcome.skipped.len()
-                    )
-                    .map_err(Error::from)?;
+                    migration::write_migration_summary(out, &outcome).map_err(Error::from)?;
                 }
                 Err(e) => {
                     writeln!(out, "Migration: warning — {e}").map_err(Error::from)?;
