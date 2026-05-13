@@ -1,6 +1,6 @@
 [package]
 name = "neon"
-version = "0.1.0"
+version = "2.0.0-rc.1"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Nicholas Raimbault <nraimbault16@gmail.com>"]
