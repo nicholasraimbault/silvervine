@@ -61,7 +61,7 @@ use crate::error::{Error, Result};
 /// Whether the platform's tray icon backend is usable at runtime.
 ///
 /// On Linux this hinges on a reachable session D-Bus (the
-/// StatusNotifierItem protocol that `ksni` implements is pure D-Bus —
+/// `StatusNotifierItem` protocol that `ksni` implements is pure D-Bus —
 /// no GTK / libappindicator runtime required). On macOS the Cocoa
 /// backend is always present.
 ///
@@ -550,12 +550,12 @@ pub struct Tray {
 }
 
 /// Wrapper around the platform-specific tray handle. Platform-split:
-/// Linux uses `ksni` (StatusNotifierItem over D-Bus, no GTK runtime),
-/// macOS uses Tauri's `tray-icon` (Cocoa NSStatusItem).
+/// Linux uses `ksni` (`StatusNotifierItem` over D-Bus, no GTK runtime),
+/// macOS uses Tauri's `tray-icon` (Cocoa `NSStatusItem`).
 #[cfg(target_os = "linux")]
 struct TrayInner {
     /// Spawn handle from `ksni`. Dropping the handle (when [`Tray`]
-    /// drops) shuts the StatusNotifierItem service down cleanly.
+    /// drops) shuts the `StatusNotifierItem` service down cleanly.
     handle: ksni::blocking::Handle<NeonKsniTray>,
 }
 #[cfg(target_os = "macos")]
@@ -730,6 +730,11 @@ fn ksni_menu_from_specs(
 /// channel by alpha/255 so half-transparent pixels don't render with
 /// halos against dark/light tray backgrounds.
 #[cfg(target_os = "linux")]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "ARGB32 byte math: products fit u8 by construction (premultiply ≤255), and 22×22 icon dimensions fit i32 trivially"
+)]
 fn neon_tray_icon_pixmap() -> Vec<ksni::Icon> {
     /// Embedded PNG — 22×22 RGBA, the same icon the V0 Linux app
     /// shipped. Ships as part of the binary; no install step.
@@ -780,9 +785,9 @@ fn neon_tray_icon_pixmap() -> Vec<ksni::Icon> {
 impl Tray {
     /// Build a new tray icon with the supplied initial menu state.
     ///
-    /// On Linux this spawns a `ksni` StatusNotifierItem service over
+    /// On Linux this spawns a `ksni` `StatusNotifierItem` service over
     /// the user session D-Bus; on macOS it constructs a Cocoa
-    /// NSStatusItem via the `tray-icon` crate. If the underlying
+    /// `NSStatusItem` via the `tray-icon` crate. If the underlying
     /// platform backend fails to initialize, returns
     /// [`crate::ErrorCategory::UnsupportedPlatform`] so the daemon
     /// can fall back to notifications-only mode.
@@ -794,7 +799,7 @@ impl Tray {
     ///
     /// * [`crate::ErrorCategory::UnsupportedPlatform`] if the
     ///   platform tray backend cannot initialize (typically: no
-    ///   session D-Bus on Linux, or NSStatusItem allocation failure
+    ///   session D-Bus on Linux, or `NSStatusItem` allocation failure
     ///   on macOS).
     /// * [`crate::ErrorCategory::Other`] for any other initialization
     ///   failure.
@@ -812,12 +817,9 @@ impl Tray {
             // compositor restart and tolerate startups before the
             // tray bar is up: ksni retries instead of failing fatally
             // when no SNI watcher is registered yet.
-            let handle = tray_impl
-                .assume_sni_available(true)
-                .spawn()
-                .map_err(|e| {
-                    Error::unsupported_platform(format!("ksni tray failed to spawn: {e}"))
-                })?;
+            let handle = tray_impl.assume_sni_available(true).spawn().map_err(|e| {
+                Error::unsupported_platform(format!("ksni tray failed to spawn: {e}"))
+            })?;
             TrayInner { handle }
         };
 
@@ -1114,6 +1116,10 @@ mod tests {
     /// placeholder in the user's tray bar.
     #[cfg(target_os = "linux")]
     #[test]
+    #[allow(
+        clippy::cast_sign_loss,
+        reason = "ksni::Icon width/height are i32 but always positive for our 22×22 icon"
+    )]
     fn neon_tray_icon_pixmap_decodes_to_nonempty_argb_buffer() {
         let icons = neon_tray_icon_pixmap();
         assert_eq!(icons.len(), 1, "expected exactly one icon size");
@@ -1130,12 +1136,7 @@ mod tests {
         // byte at position 0 mod 4. Asserting on the *count* of
         // non-zero alpha bytes locks the conversion math against
         // future regressions.
-        let alpha_bytes_set = icon
-            .data
-            .iter()
-            .step_by(4)
-            .filter(|&&b| b > 0)
-            .count();
+        let alpha_bytes_set = icon.data.iter().step_by(4).filter(|&&b| b > 0).count();
         assert_eq!(
             alpha_bytes_set, 104,
             "expected 104 visible pixels (matches reference PNG)"

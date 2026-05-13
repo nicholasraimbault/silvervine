@@ -485,8 +485,11 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let cdm = tmp.path().join("WidevineCdm");
         fs::create_dir_all(&cdm).expect("mkdir cdm");
-        fs::write(cdm.join("manifest.json"), br#"{"version":"4.10.2934.0","name":"Widevine CDM"}"#)
-            .expect("write manifest");
+        fs::write(
+            cdm.join("manifest.json"),
+            br#"{"version":"4.10.2934.0","name":"Widevine CDM"}"#,
+        )
+        .expect("write manifest");
         let b = Browser {
             name: "x".into(),
             install_path: tmp.path().to_path_buf(),
@@ -535,8 +538,7 @@ mod tests {
             .join("147.0.7727.137");
         let cdm = framework_versions.join("Libraries").join("WidevineCdm");
         fs::create_dir_all(&cdm).expect("mkdir cdm");
-        fs::write(cdm.join("manifest.json"), b"{}")
-            .expect("touch manifest");
+        fs::write(cdm.join("manifest.json"), b"{}").expect("touch manifest");
         let b = Browser {
             name: "Helium".into(),
             install_path: bundle,

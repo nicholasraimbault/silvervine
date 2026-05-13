@@ -215,9 +215,9 @@ impl Hypervisor {
                     "libvirt qemu:///system connection failed: {e}. Is libvirtd running?"
                 ))
             })?;
-            return Ok(Self {
+            Ok(Self {
                 mode: HvMode::Real(conn),
-            });
+            })
         }
         #[cfg(not(all(target_os = "linux", feature = "experimental-bridge-libvirt")))]
         {
