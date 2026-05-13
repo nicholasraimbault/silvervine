@@ -178,7 +178,14 @@ objc2 = "0.5"
 # sleep/wake observer in src/daemon/power/macos.rs.
 # (NSNotificationCenter ships under the NSNotification feature; no
 # separate feature flag exists for it in 0.2.x.)
-objc2-foundation = { version = "0.2", features = ["NSString", "NSNotification"] }
+objc2-foundation = { version = "0.2", features = [
+    "NSString",
+    "NSNotification",
+    # `block2` exposes the block-taking methods (e.g.
+    # `addObserverForName:object:queue:usingBlock:` on
+    # NSNotificationCenter, which we use for the wake observer).
+    "block2",
+] }
 # objc2-app-kit 0.2 likewise gates NSWorkspace (and the
 # NSWorkspaceDidWakeNotification static) behind the NSWorkspace feature.
 objc2-app-kit = { version = "0.2", features = ["NSWorkspace"] }
