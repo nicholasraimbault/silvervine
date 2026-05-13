@@ -34,9 +34,8 @@
 //! the captured callback) is freed.
 
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
 use objc2_app_kit::NSWorkspace;
-use objc2_foundation::{NSNotification, NSNotificationCenter, NSString};
+use objc2_foundation::{NSNotification, NSNotificationCenter, NSObject, NSString};
 
 use crate::error::{Error, Result};
 
@@ -49,7 +48,7 @@ use super::WakeCallback;
 /// drop.
 pub(super) struct Handle {
     /// The observer object returned by AppKit. Drop runs `removeObserver:`.
-    observer: Retained<AnyObject>,
+    observer: Retained<NSObject>,
     /// Cached pointer to the notification center we registered against.
     notification_center: Retained<NSNotificationCenter>,
 }

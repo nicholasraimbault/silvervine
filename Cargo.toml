@@ -179,6 +179,9 @@ objc2 = "0.5"
 # (NSNotificationCenter ships under the NSNotification feature; no
 # separate feature flag exists for it in 0.2.x.)
 objc2-foundation = { version = "0.2", features = [
+    # NSObject is the typed root class — used as the observer handle
+    # returned by `addObserverForName:`.
+    "NSObject",
     "NSString",
     "NSNotification",
     # NSOperation covers NSOperationQueue, which appears as the `queue:`
