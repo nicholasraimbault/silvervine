@@ -15,16 +15,22 @@
 //! | Path | What it is | Action |
 //! |---|---|---|
 //! | `/Library/LaunchDaemons/com.neon.fix-drm.plist` | Mac legacy `LaunchDaemon` | unload + remove (root) |
-//! | `/etc/systemd/system/neon-fix-drm.path` | Linux legacy systemd path unit | disable + remove (root) |
-//! | `/etc/systemd/system/neon-fix-drm.service` | Linux legacy systemd service | remove (root) |
+//! | `/etc/systemd/system/neon-fix-drm.{path,service}` | Linux raw `install.sh` units | disable + remove (root) |
+//! | `/usr/lib/systemd/system/neon-fix-drm.{path,service}` | Linux AUR / RPM-installed units | leave; surface pkg-manager hint |
+//! | `/lib/systemd/system/neon-fix-drm.{path,service}` | Linux Debian / pre-merged-usr units | leave; surface pkg-manager hint |
 //! | `~/Library/LaunchAgents/com.neon.app.plist` | Mac DMG/Swift app legacy | unload + remove (user) |
 //! | `~/.config/autostart/neon.desktop` | Linux tray-app legacy | remove (user) |
 //! | `~/.local/share/WidevineCdm/` | Legacy CDM cache | migrate to `~/.cache/neon/widevine/<version>/` |
-//! | `/usr/lib/neon/` | Linux .deb install | leave (user removes manually) |
+//! | `/usr/lib/neon/` | Linux packaged install (AUR / .deb / .rpm) | leave; surface pkg-manager hint |
 //!
-//! Per the migration matrix in the spec, `/usr/lib/neon/` is detected and
-//! reported but **not removed** — it's a system-managed package and the
-//! user should run `dpkg -r neon-drm` themselves.
+//! Artifacts under `/usr/lib/` and `/lib/` are owned by the system package
+//! manager — we **never** `rm` files behind its back (that desyncs its file
+//! database). Instead the migration emits an advisory pointing at the right
+//! uninstall command, sniffed from `/etc/os-release` (`pacman -R neon-drm`
+//! on Arch, `dpkg -r neon-drm` on Debian, etc.).
+//!
+//! Merged-usr layouts (Arch, Fedora 27+, where `/lib -> /usr/lib`) are
+//! deduplicated by canonical path so each on-disk unit is reported once.
 //!
 //! ## Test strategy
 //!
@@ -62,6 +68,13 @@ pub struct LegacyArtifact {
     /// `true` if removing this requires elevated privileges. Drives the
     /// migration UX ("we'll prompt for your password to remove these").
     pub needs_root: bool,
+    /// `true` when the artifact is owned by the system package manager
+    /// (e.g. an AUR-installed unit under `/usr/lib/systemd/system/`).
+    /// Such artifacts are NOT removed directly — `rm`-ing files behind
+    /// the package manager's back desyncs its file database. Instead,
+    /// removal surfaces an advisory pointing the user at the correct
+    /// uninstall command.
+    pub package_managed: bool,
 }
 
 /// Categorization of legacy artifacts.
@@ -82,7 +95,10 @@ pub enum LegacyKind {
     LinuxAutostart,
     /// `~/.local/share/WidevineCdm/` (Linux user CDM cache; migrates).
     LinuxLegacyCdmCache,
-    /// `/usr/lib/neon/` (Linux .deb install; reported, not removed).
+    /// `/usr/lib/neon/` — Linux packaged install (AUR / .deb / .rpm).
+    /// Reported with a pkg-manager-aware uninstall hint; never `rm`'d
+    /// directly. Variant name kept for back-compat with stable log
+    /// strings.
     LinuxDebPackage,
 }
 
@@ -117,6 +133,27 @@ pub struct LegacyInstall {
     /// Every legacy artifact found, in detection order. Empty list →
     /// no legacy install detected.
     pub artifacts: Vec<LegacyArtifact>,
+    /// Host package manager (sniffed from `/etc/os-release`). Drives
+    /// the uninstall hint we surface for package-managed artifacts.
+    pub package_manager: PackageManager,
+}
+
+/// Linux package manager family, detected from `/etc/os-release`.
+///
+/// Used to format the uninstall hint for package-managed legacy
+/// artifacts (e.g. AUR's `pacman -R neon-drm` vs Debian's `dpkg -r
+/// neon-drm`). `Unknown` is the safe fallback — emits a generic hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PackageManager {
+    /// Arch family — `pacman` (AUR users typically wrap with `paru` / `yay`).
+    Pacman,
+    /// Debian family — `dpkg` / `apt`.
+    Dpkg,
+    /// RHEL / Fedora / SUSE family — `rpm` / `dnf`.
+    Rpm,
+    /// Couldn't sniff. Emits a generic uninstall hint.
+    #[default]
+    Unknown,
 }
 
 impl LegacyInstall {
@@ -189,6 +226,7 @@ pub fn detect_legacy_install_in(roots: &FsRoots) -> LegacyInstall {
             kind: LegacyKind::MacLaunchDaemon,
             path: mac_daemon,
             needs_root: true,
+            package_managed: false,
         });
     }
     // macOS: LaunchAgent (user)
@@ -199,30 +237,48 @@ pub fn detect_legacy_install_in(roots: &FsRoots) -> LegacyInstall {
                 kind: LegacyKind::MacLaunchAgent,
                 path: mac_agent,
                 needs_root: false,
+                package_managed: false,
             });
         }
     }
 
-    // Linux: systemd path + service (root)
-    let sys_path = roots
-        .system_root
-        .join("etc/systemd/system/neon-fix-drm.path");
-    if sys_path.exists() {
-        artifacts.push(LegacyArtifact {
-            kind: LegacyKind::LinuxSystemdPath,
-            path: sys_path,
-            needs_root: true,
-        });
-    }
-    let sys_service = roots
-        .system_root
-        .join("etc/systemd/system/neon-fix-drm.service");
-    if sys_service.exists() {
-        artifacts.push(LegacyArtifact {
-            kind: LegacyKind::LinuxSystemdService,
-            path: sys_service,
-            needs_root: true,
-        });
+    // Linux: systemd units. Probe every directory systemd loads from:
+    //   /etc/systemd/system/   ← raw `install.sh` writes here.
+    //   /usr/lib/systemd/system/ ← Arch (AUR) and Fedora/RPM packages.
+    //   /lib/systemd/system/   ← Debian / pre-merged-usr Ubuntu.
+    // Units under /usr/lib and /lib are package-managed; we defer
+    // removal to the system package manager rather than rm-ing files
+    // behind its back.
+    //
+    // Dedup via canonicalized paths so merged-usr distros (Arch,
+    // Fedora 27+) where `/lib -> /usr/lib` don't report each unit
+    // twice. `/etc/` is probed first so its (non-package-managed)
+    // result wins for any file shared across locations.
+    let mut seen_units: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for (dir, package_managed) in [
+        ("etc/systemd/system", false),
+        ("usr/lib/systemd/system", true),
+        ("lib/systemd/system", true),
+    ] {
+        for (unit_name, kind) in [
+            ("neon-fix-drm.path", LegacyKind::LinuxSystemdPath),
+            ("neon-fix-drm.service", LegacyKind::LinuxSystemdService),
+        ] {
+            let p = roots.system_root.join(dir).join(unit_name);
+            if !p.exists() {
+                continue;
+            }
+            let canonical = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+            if !seen_units.insert(canonical) {
+                continue; // Already detected via another path (merged-usr symlink).
+            }
+            artifacts.push(LegacyArtifact {
+                kind,
+                path: p,
+                needs_root: true,
+                package_managed,
+            });
+        }
     }
 
     // Linux: autostart + WidevineCdm cache (user)
@@ -233,6 +289,7 @@ pub fn detect_legacy_install_in(roots: &FsRoots) -> LegacyInstall {
                 kind: LegacyKind::LinuxAutostart,
                 path: autostart,
                 needs_root: false,
+                package_managed: false,
             });
         }
         let legacy_cdm = home.join(".local/share/WidevineCdm");
@@ -241,21 +298,133 @@ pub fn detect_legacy_install_in(roots: &FsRoots) -> LegacyInstall {
                 kind: LegacyKind::LinuxLegacyCdmCache,
                 path: legacy_cdm,
                 needs_root: false,
+                package_managed: false,
             });
         }
     }
 
-    // Linux: .deb install (root, but not removed — reported only)
+    // Linux: packaged install dir (root, never removed directly).
     let deb_install = roots.system_root.join("usr/lib/neon");
     if deb_install.exists() {
         artifacts.push(LegacyArtifact {
             kind: LegacyKind::LinuxDebPackage,
             path: deb_install,
             needs_root: true,
+            package_managed: true,
         });
     }
 
-    LegacyInstall { artifacts }
+    LegacyInstall {
+        artifacts,
+        package_manager: detect_package_manager_in(roots),
+    }
+}
+
+/// Sniff the host's package manager from `/etc/os-release`.
+///
+/// Reads `ID` and `ID_LIKE`, lower-cases everything, then matches
+/// against well-known distro families. Unknown distros fall through
+/// to [`PackageManager::Unknown`], which renders a generic hint.
+#[must_use]
+pub fn detect_package_manager_in(roots: &FsRoots) -> PackageManager {
+    let os_release = roots.system_root.join("etc/os-release");
+    let Ok(contents) = std::fs::read_to_string(&os_release) else {
+        return PackageManager::Unknown;
+    };
+    let mut tokens: Vec<String> = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        for prefix in ["ID=", "ID_LIKE="] {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                let rest = rest.trim().trim_matches('"');
+                for tok in rest.split_whitespace() {
+                    tokens.push(tok.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    let has = |needles: &[&str]| tokens.iter().any(|t| needles.contains(&t.as_str()));
+    if has(&[
+        "arch",
+        "archlinux",
+        "manjaro",
+        "endeavouros",
+        "cachyos",
+        "garuda",
+        "artix",
+    ]) {
+        PackageManager::Pacman
+    } else if has(&["debian", "ubuntu", "linuxmint", "mint", "pop", "elementary"]) {
+        PackageManager::Dpkg
+    } else if has(&[
+        "fedora",
+        "rhel",
+        "centos",
+        "rocky",
+        "almalinux",
+        "opensuse",
+        "suse",
+        "sles",
+    ]) {
+        PackageManager::Rpm
+    } else {
+        PackageManager::Unknown
+    }
+}
+
+/// Render a one-shot migration summary to `out`.
+///
+/// Always emits `Migration: removed=X migrated=Y skipped=Z`. When the
+/// outcome has any skipped artifacts, also emits one indented line per
+/// unique skip reason so the user sees the actionable uninstall hint
+/// without scrolling through one repetition per affected path.
+///
+/// # Errors
+///
+/// Propagates IO errors from the underlying writer.
+pub fn write_migration_summary(
+    out: &mut dyn std::io::Write,
+    outcome: &MigrationOutcome,
+) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "Migration: removed={} migrated={} skipped={}",
+        outcome.removed.len(),
+        outcome.migrated.len(),
+        outcome.skipped.len()
+    )?;
+    let mut seen_reasons: Vec<&str> = Vec::new();
+    for skip in &outcome.skipped {
+        if !seen_reasons.contains(&skip.reason.as_str()) {
+            seen_reasons.push(skip.reason.as_str());
+            writeln!(out, "  → {}", skip.reason)?;
+        }
+    }
+    Ok(())
+}
+
+/// Format the uninstall hint surfaced for a package-managed legacy
+/// artifact (e.g. AUR-installed systemd units, `/usr/lib/neon/`).
+///
+/// `pkg` is the source package name on the host (currently always
+/// `"neon-drm"`, but kept as a parameter so test cases can exercise
+/// the formatter directly).
+#[must_use]
+pub fn legacy_package_uninstall_hint(pm: PackageManager, pkg: &str) -> String {
+    match pm {
+        PackageManager::Pacman => format!(
+            "packaged install — run `pacman -R {pkg}` (or `paru -R {pkg}` / `yay -R {pkg}` for AUR) to remove cleanly"
+        ),
+        PackageManager::Dpkg => {
+            format!(".deb package — run `dpkg -r {pkg}` (or `apt remove {pkg}`) to remove")
+        }
+        PackageManager::Rpm => {
+            format!("packaged install — run `rpm -e {pkg}` (or `dnf remove {pkg}`) to remove")
+        }
+        PackageManager::Unknown => format!(
+            "packaged install — use your system package manager to remove `{pkg}`"
+        ),
+    }
 }
 
 /// Where legacy CDM caches get migrated to.
@@ -308,6 +477,7 @@ pub fn remove_legacy_with(
     cdm_destination: &Path,
 ) -> Result<MigrationOutcome> {
     let mut outcome = MigrationOutcome::default();
+    let pkg_hint = legacy_package_uninstall_hint(install.package_manager, "neon-drm");
 
     // Pass 1: batch every elevation-required operation into a single
     // shell script, then run that script under one `run_as_root_script`
@@ -318,9 +488,20 @@ pub fn remove_legacy_with(
     // tolerated (`|| true`) — best-effort cleanup that mirrors the
     // previous per-call behavior. Surfaced errors come from the
     // elevation itself, not the cleanup ops.
+    //
+    // Package-managed artifacts are *not* removed in this pass — we
+    // skip them with a pkg-manager-aware advisory so the user can
+    // uninstall cleanly via their distro's tooling.
     let mut root_script: Vec<String> = Vec::new();
     let mut needs_systemd_reload = false;
     for art in &install.artifacts {
+        if art.package_managed {
+            outcome.skipped.push(SkipReason {
+                path: art.path.clone(),
+                reason: pkg_hint.clone(),
+            });
+            continue;
+        }
         match art.kind {
             LegacyKind::MacLaunchDaemon => {
                 let p = sh_quote(&art.path)?;
@@ -359,6 +540,9 @@ pub fn remove_legacy_with(
 
     // Pass 2: user-level operations (no elevation).
     for art in install.artifacts {
+        if art.package_managed {
+            continue; // Already handled in Pass 1 (skip + advisory).
+        }
         match art.kind {
             LegacyKind::MacLaunchDaemon
             | LegacyKind::LinuxSystemdPath
@@ -375,10 +559,10 @@ pub fn remove_legacy_with(
                 migrate_legacy_cdm(&art.path, cdm_destination, &mut outcome)?;
             }
             LegacyKind::LinuxDebPackage => {
-                outcome.skipped.push(SkipReason {
-                    path: art.path.clone(),
-                    reason: ".deb package — run `dpkg -r neon-drm` to remove".into(),
-                });
+                // /usr/lib/neon/ is always package-managed; the
+                // `package_managed` short-circuit above handles it.
+                // Falling through here would indicate a logic bug.
+                debug_assert!(false, "LinuxDebPackage should be package_managed");
             }
         }
     }
@@ -828,5 +1012,369 @@ mod tests {
         unload_and_remove_user(&plist, &mut out).expect("ok");
         assert!(!plist.exists());
         assert_eq!(out.removed.len(), 1);
+    }
+
+    // --- Packaged-install detection (AUR / RPM systemd units in /usr/lib) ---
+
+    #[test]
+    fn detect_finds_systemd_units_in_usr_lib_systemd() {
+        let tmp = TempDir::new().unwrap();
+        let system_root = tmp.path().to_path_buf();
+        fs::create_dir_all(system_root.join("usr/lib/systemd/system")).unwrap();
+        fs::write(
+            system_root.join("usr/lib/systemd/system/neon-fix-drm.path"),
+            b"[Path]\n",
+        )
+        .unwrap();
+        fs::write(
+            system_root.join("usr/lib/systemd/system/neon-fix-drm.service"),
+            b"[Service]\n",
+        )
+        .unwrap();
+        let roots = FsRoots {
+            system_root,
+            home: None,
+        };
+        let install = detect_legacy_install_in(&roots);
+        let kinds: Vec<LegacyKind> = install.artifacts.iter().map(|a| a.kind).collect();
+        assert!(kinds.contains(&LegacyKind::LinuxSystemdPath), "{kinds:?}");
+        assert!(
+            kinds.contains(&LegacyKind::LinuxSystemdService),
+            "{kinds:?}"
+        );
+        // Units under /usr/lib are package-managed — removal must defer
+        // to the package manager rather than `rm`.
+        for art in &install.artifacts {
+            if matches!(
+                art.kind,
+                LegacyKind::LinuxSystemdPath | LegacyKind::LinuxSystemdService
+            ) {
+                assert!(
+                    art.package_managed,
+                    "{:?} at {} should be flagged package_managed",
+                    art.kind,
+                    art.path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn detect_finds_systemd_units_in_lib_systemd() {
+        let tmp = TempDir::new().unwrap();
+        let system_root = tmp.path().to_path_buf();
+        fs::create_dir_all(system_root.join("lib/systemd/system")).unwrap();
+        fs::write(
+            system_root.join("lib/systemd/system/neon-fix-drm.path"),
+            b"[Path]\n",
+        )
+        .unwrap();
+        let roots = FsRoots {
+            system_root,
+            home: None,
+        };
+        let install = detect_legacy_install_in(&roots);
+        let kinds: Vec<LegacyKind> = install.artifacts.iter().map(|a| a.kind).collect();
+        assert!(kinds.contains(&LegacyKind::LinuxSystemdPath), "{kinds:?}");
+    }
+
+    #[test]
+    fn migration_summary_renders_counts_only_when_clean() {
+        let outcome = MigrationOutcome::default();
+        let mut buf = Vec::new();
+        write_migration_summary(&mut buf, &outcome).expect("write ok");
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert!(s.contains("removed=0 migrated=0 skipped=0"), "got: {s}");
+        assert!(
+            !s.contains("→"),
+            "no skip-hint arrow without skips, got: {s}"
+        );
+    }
+
+    #[test]
+    fn migration_summary_dedupes_repeated_skip_reasons() {
+        // Realistic AUR case: three paths skipped, all under the same
+        // pacman uninstall hint. The summary should show the hint once,
+        // not three times.
+        let reason = "packaged install — run `pacman -R neon-drm` to remove";
+        let outcome = MigrationOutcome {
+            removed: vec![],
+            migrated: vec![],
+            skipped: vec![
+                SkipReason {
+                    path: PathBuf::from("/usr/lib/systemd/system/neon-fix-drm.path"),
+                    reason: reason.into(),
+                },
+                SkipReason {
+                    path: PathBuf::from("/usr/lib/systemd/system/neon-fix-drm.service"),
+                    reason: reason.into(),
+                },
+                SkipReason {
+                    path: PathBuf::from("/usr/lib/neon"),
+                    reason: reason.into(),
+                },
+            ],
+        };
+        let mut buf = Vec::new();
+        write_migration_summary(&mut buf, &outcome).expect("write ok");
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert!(s.contains("skipped=3"), "got: {s}");
+        assert_eq!(
+            s.matches("pacman -R neon-drm").count(),
+            1,
+            "skip hint should be deduplicated, got: {s}"
+        );
+    }
+
+    #[test]
+    fn migration_summary_lists_distinct_skip_reasons() {
+        let outcome = MigrationOutcome {
+            removed: vec![],
+            migrated: vec![],
+            skipped: vec![
+                SkipReason {
+                    path: PathBuf::from("/a"),
+                    reason: "reason A".into(),
+                },
+                SkipReason {
+                    path: PathBuf::from("/b"),
+                    reason: "reason B".into(),
+                },
+            ],
+        };
+        let mut buf = Vec::new();
+        write_migration_summary(&mut buf, &outcome).expect("write ok");
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert!(s.contains("reason A"), "got: {s}");
+        assert!(s.contains("reason B"), "got: {s}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_dedupes_units_under_merged_usr_symlink() {
+        // Reproduce the Arch / Fedora "merged usr" layout where `/lib`
+        // is a symlink to `/usr/lib`. Both
+        //   <root>/usr/lib/systemd/system/neon-fix-drm.path
+        //   <root>/lib/systemd/system/neon-fix-drm.path
+        // resolve to the same file. The detector must report it once.
+        let tmp = TempDir::new().unwrap();
+        let system_root = tmp.path().to_path_buf();
+        fs::create_dir_all(system_root.join("usr/lib/systemd/system")).unwrap();
+        fs::write(
+            system_root.join("usr/lib/systemd/system/neon-fix-drm.path"),
+            b"[Path]\n",
+        )
+        .unwrap();
+        fs::write(
+            system_root.join("usr/lib/systemd/system/neon-fix-drm.service"),
+            b"[Service]\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(system_root.join("usr/lib"), system_root.join("lib")).unwrap();
+
+        let roots = FsRoots {
+            system_root,
+            home: None,
+        };
+        let install = detect_legacy_install_in(&roots);
+        let path_count = install
+            .artifacts
+            .iter()
+            .filter(|a| a.kind == LegacyKind::LinuxSystemdPath)
+            .count();
+        let service_count = install
+            .artifacts
+            .iter()
+            .filter(|a| a.kind == LegacyKind::LinuxSystemdService)
+            .count();
+        assert_eq!(path_count, 1, "merged-usr should yield one path unit");
+        assert_eq!(service_count, 1, "merged-usr should yield one service unit");
+    }
+
+    #[test]
+    fn etc_systemd_units_are_not_package_managed() {
+        let tmp = TempDir::new().unwrap();
+        let roots = synthesize_full_legacy(tmp.path());
+        let install = detect_legacy_install_in(&roots);
+        for art in &install.artifacts {
+            if matches!(
+                art.kind,
+                LegacyKind::LinuxSystemdPath | LegacyKind::LinuxSystemdService
+            ) {
+                assert!(
+                    !art.package_managed,
+                    "/etc/-housed unit at {} must not be package_managed",
+                    art.path.display()
+                );
+            }
+        }
+    }
+
+    // --- /etc/os-release -> PackageManager detection ---
+
+    fn write_os_release(system_root: &Path, body: &[u8]) {
+        fs::create_dir_all(system_root.join("etc")).unwrap();
+        fs::write(system_root.join("etc/os-release"), body).unwrap();
+    }
+
+    #[test]
+    fn detect_package_manager_pacman_from_id() {
+        let tmp = TempDir::new().unwrap();
+        write_os_release(tmp.path(), b"ID=arch\n");
+        let roots = FsRoots {
+            system_root: tmp.path().to_path_buf(),
+            home: None,
+        };
+        assert_eq!(detect_package_manager_in(&roots), PackageManager::Pacman);
+    }
+
+    #[test]
+    fn detect_package_manager_pacman_via_id_like() {
+        let tmp = TempDir::new().unwrap();
+        write_os_release(tmp.path(), b"ID=cachyos\nID_LIKE=arch\n");
+        let roots = FsRoots {
+            system_root: tmp.path().to_path_buf(),
+            home: None,
+        };
+        assert_eq!(detect_package_manager_in(&roots), PackageManager::Pacman);
+    }
+
+    #[test]
+    fn detect_package_manager_dpkg_from_id_like() {
+        let tmp = TempDir::new().unwrap();
+        write_os_release(tmp.path(), b"ID=ubuntu\nID_LIKE=debian\n");
+        let roots = FsRoots {
+            system_root: tmp.path().to_path_buf(),
+            home: None,
+        };
+        assert_eq!(detect_package_manager_in(&roots), PackageManager::Dpkg);
+    }
+
+    #[test]
+    fn detect_package_manager_rpm_from_id() {
+        let tmp = TempDir::new().unwrap();
+        write_os_release(tmp.path(), b"ID=fedora\n");
+        let roots = FsRoots {
+            system_root: tmp.path().to_path_buf(),
+            home: None,
+        };
+        assert_eq!(detect_package_manager_in(&roots), PackageManager::Rpm);
+    }
+
+    #[test]
+    fn detect_package_manager_unknown_without_os_release() {
+        let tmp = TempDir::new().unwrap();
+        let roots = FsRoots {
+            system_root: tmp.path().to_path_buf(),
+            home: None,
+        };
+        assert_eq!(detect_package_manager_in(&roots), PackageManager::Unknown);
+    }
+
+    #[test]
+    fn detect_package_manager_handles_quoted_values() {
+        let tmp = TempDir::new().unwrap();
+        write_os_release(tmp.path(), b"ID=\"arch\"\nID_LIKE=\"\"\n");
+        let roots = FsRoots {
+            system_root: tmp.path().to_path_buf(),
+            home: None,
+        };
+        assert_eq!(detect_package_manager_in(&roots), PackageManager::Pacman);
+    }
+
+    // --- Uninstall-hint formatting per package manager ---
+
+    #[test]
+    fn uninstall_hint_pacman_mentions_pacman() {
+        let h = legacy_package_uninstall_hint(PackageManager::Pacman, "neon-drm");
+        assert!(h.contains("pacman -R neon-drm"), "got: {h}");
+    }
+
+    #[test]
+    fn uninstall_hint_dpkg_mentions_dpkg() {
+        let h = legacy_package_uninstall_hint(PackageManager::Dpkg, "neon-drm");
+        assert!(h.contains("dpkg -r neon-drm"), "got: {h}");
+    }
+
+    #[test]
+    fn uninstall_hint_rpm_mentions_rpm_or_dnf() {
+        let h = legacy_package_uninstall_hint(PackageManager::Rpm, "neon-drm");
+        assert!(
+            h.contains("rpm -e neon-drm") || h.contains("dnf remove neon-drm"),
+            "got: {h}"
+        );
+    }
+
+    #[test]
+    fn uninstall_hint_unknown_is_generic() {
+        let h = legacy_package_uninstall_hint(PackageManager::Unknown, "neon-drm");
+        assert!(
+            h.to_lowercase().contains("package manager"),
+            "expected a generic 'package manager' hint, got: {h}"
+        );
+    }
+
+    // --- Integration: packaged systemd units must be skipped, not removed ---
+
+    #[test]
+    fn remove_legacy_skips_package_managed_units_with_pacman_hint() {
+        let tmp = TempDir::new().unwrap();
+        let system_root = tmp.path().join("system");
+        fs::create_dir_all(system_root.join("usr/lib/systemd/system")).unwrap();
+        fs::create_dir_all(system_root.join("usr/lib/neon")).unwrap();
+        fs::write(
+            system_root.join("usr/lib/systemd/system/neon-fix-drm.path"),
+            b"[Path]\n",
+        )
+        .unwrap();
+        fs::write(
+            system_root.join("usr/lib/systemd/system/neon-fix-drm.service"),
+            b"[Service]\n",
+        )
+        .unwrap();
+        write_os_release(&system_root, b"ID=arch\n");
+        let roots = FsRoots {
+            system_root,
+            home: None,
+        };
+
+        unsafe { std::env::set_var("NEON_TEST_ESCALATE_NOOP", "1") };
+        let install = detect_legacy_install_in(&roots);
+        assert_eq!(install.package_manager, PackageManager::Pacman);
+        let cdm_dest = tmp.path().join("v2-cache/widevine/legacy");
+        let outcome = remove_legacy_with(install, &cdm_dest).expect("ok");
+        unsafe { std::env::remove_var("NEON_TEST_ESCALATE_NOOP") };
+
+        // Units under /usr/lib are reported as skipped with a pacman hint.
+        let unit_skips: Vec<&SkipReason> = outcome
+            .skipped
+            .iter()
+            .filter(|s| {
+                s.path.ends_with("neon-fix-drm.path") || s.path.ends_with("neon-fix-drm.service")
+            })
+            .collect();
+        assert_eq!(unit_skips.len(), 2, "skipped={:?}", outcome.skipped);
+        for u in &unit_skips {
+            assert!(u.reason.contains("pacman -R neon-drm"), "got: {}", u.reason);
+        }
+        // /usr/lib/neon/ also gets the pacman-flavored hint.
+        let pkg_skip = outcome
+            .skipped
+            .iter()
+            .find(|s| s.path.ends_with("usr/lib/neon"))
+            .expect("usr/lib/neon entry");
+        assert!(
+            pkg_skip.reason.contains("pacman -R neon-drm"),
+            "got: {}",
+            pkg_skip.reason
+        );
+        // Packaged units must NOT be in `removed` (we deferred to pacman).
+        for p in &outcome.removed {
+            assert!(
+                !p.starts_with(roots.system_root.join("usr/lib")),
+                "packaged unit {} should not be in removed",
+                p.display()
+            );
+        }
     }
 }
