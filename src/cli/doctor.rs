@@ -195,7 +195,14 @@ pub fn run(args: &Args) -> Result<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let d = build_diagnostics(&detected, heartbeat_at, current_cdm, legacy_present, tray, now);
+    let d = build_diagnostics(
+        &detected,
+        heartbeat_at,
+        current_cdm,
+        legacy_present,
+        tray,
+        now,
+    );
 
     if args.share {
         writeln!(handle, "{}", share_url(&d)).map_err(Error::from)?;
@@ -453,7 +460,14 @@ mod tests {
 
     #[test]
     fn build_diagnostics_no_browsers_no_heartbeat() {
-        let d = build_diagnostics(&[], None, None, false, TrayAvailability::Available, 1_700_000_000);
+        let d = build_diagnostics(
+            &[],
+            None,
+            None,
+            false,
+            TrayAvailability::Available,
+            1_700_000_000,
+        );
         assert!(d.browsers.is_empty());
         assert!(d.heartbeat_at.is_none());
         assert!(!d.heartbeat_stale);
@@ -462,14 +476,28 @@ mod tests {
 
     #[test]
     fn build_diagnostics_marks_stale_heartbeat() {
-        let d = build_diagnostics(&[], Some(1_700_000_000), None, false, TrayAvailability::Available, 1_700_000_500);
+        let d = build_diagnostics(
+            &[],
+            Some(1_700_000_000),
+            None,
+            false,
+            TrayAvailability::Available,
+            1_700_000_500,
+        );
         assert_eq!(d.heartbeat_at, Some(1_700_000_000));
         assert!(d.heartbeat_stale);
     }
 
     #[test]
     fn build_diagnostics_fresh_heartbeat_not_stale() {
-        let d = build_diagnostics(&[], Some(1_700_000_000), None, false, TrayAvailability::Available, 1_700_000_100);
+        let d = build_diagnostics(
+            &[],
+            Some(1_700_000_000),
+            None,
+            false,
+            TrayAvailability::Available,
+            1_700_000_100,
+        );
         assert!(!d.heartbeat_stale);
     }
 
@@ -483,7 +511,14 @@ mod tests {
     fn build_diagnostics_includes_browser_snapshot() {
         let tmp = TempDir::new().unwrap();
         let detected = vec![fake_browser("Helium", tmp.path().join("h"))];
-        let d = build_diagnostics(&detected, None, Some("4.10.0".into()), false, TrayAvailability::Available, 0);
+        let d = build_diagnostics(
+            &detected,
+            None,
+            Some("4.10.0".into()),
+            false,
+            TrayAvailability::Available,
+            0,
+        );
         assert_eq!(d.browsers.len(), 1);
         assert_eq!(d.browsers[0].name, "Helium");
         assert_eq!(d.current_cdm_version.as_deref(), Some("4.10.0"));
