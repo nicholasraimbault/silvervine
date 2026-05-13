@@ -209,14 +209,16 @@ mod tests {
     #[test]
     fn signal_looking_glass_under_noop_does_not_panic() {
         let _g = crate::test_support::env_lock();
-        // SAFETY: env behind env_lock.
-        unsafe {
-            #[cfg(target_os = "linux")]
-            std::env::set_var(crate::bridge::looking_glass::NOOP_ENV, "1");
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: env behind env_lock.
+            unsafe {
+                std::env::set_var(crate::bridge::looking_glass::NOOP_ENV, "1");
+            }
         }
         signal_looking_glass();
+        #[cfg(target_os = "linux")]
         unsafe {
-            #[cfg(target_os = "linux")]
             std::env::remove_var(crate::bridge::looking_glass::NOOP_ENV);
         }
     }

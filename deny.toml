@@ -41,9 +41,24 @@ allow = [
     # for our use (no copyleft, no patent retaliation).
     # https://cdla.dev/permissive-2-0/
     "CDLA-Permissive-2.0",
+    # `ksni` (the SNI tray crate that replaced libappindicator in V2)
+    # is dedicated to the public domain via the Unlicense. Effectively
+    # equivalent to CC0 — no attribution required, no copyleft.
+    # https://unlicense.org/
+    "Unlicense",
 ]
 confidence-threshold = 0.93
-exceptions = []
+
+# Per-crate LGPL allowance for the V3 `experimental-bridge` libvirt
+# bindings. `virt`/`virt-sys` are FFI wrappers around libvirt itself.
+# Static linking against an LGPL-2.1 library imposes copyleft on the
+# linked binary; we accept this *only* when the user opts into the
+# `experimental-bridge` Cargo feature (the dep is `optional = true`).
+# Default `cargo install neon` builds do not pull these in at all.
+exceptions = [
+    { name = "virt", allow = ["LGPL-2.1", "LGPL-2.1-only"] },
+    { name = "virt-sys", allow = ["LGPL-2.1", "LGPL-2.1-only"] },
+]
 
 [[licenses.clarify]]
 crate = "ring"

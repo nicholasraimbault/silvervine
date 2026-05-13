@@ -176,6 +176,12 @@ objc2 = "0.5"
 objc2-foundation = "0.2"
 objc2-app-kit = "0.2"
 block2 = "0.5"
+# NSStatusItem-backed tray for macOS via Tauri's tray-icon crate.
+# Default features pull libxdo for keyboard accelerators we don't use,
+# so opt out. The ksni migration in commit 735dcfe moved this dep here
+# from the cross-platform [dependencies] block; the move was documented
+# but the line itself was dropped, which broke macOS builds.
+tray-icon = { version = "0.23", default-features = false }
 
 # Linux-specific deps:
 #  - `zbus` for the systemd-logind PrepareForSleep signal. Default
