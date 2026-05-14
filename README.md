@@ -69,7 +69,6 @@ There's an experimental escape hatch — `neon stream` — that runs a Win11 IoT
 - **Tray icon + native notifications.** Per-browser status, one-click re-patch, native success/failure notifications via libnotify (Linux) or NSUserNotificationCenter (macOS).
 - **`neon doctor`** produces structured diagnostics with EME error-code translation (Netflix N-codes, Disney+ codes, Spotify codes, etc.) — paste a Netflix code right into `neon doctor N8156-6024` for actionable advice.
 - **`neon repair`** brings any broken state back to working in one command.
-- **Opt-in error reporting.** Default off. If enabled in `neon init`, categorized failure reports flow to a Cloudflare Worker so trends become visible without depending on user-filed issues. No PII; no telemetry; only failures.
 - **Mozilla manifest fallback chain.** Primary: `hg.mozilla.org`. Fallback: GitHub mirror. Final fallback: 24h-cached manifest. Survives `hg.mozilla.org` flakes (which is why Mozilla mirrors the manifest themselves).
 - **Migration from V1.** Detects and cleans up legacy bash installs, V1 Homebrew formula installs, AUR / `.deb` / `.rpm` packages, with a pkg-manager-aware uninstall hint sniffed from `/etc/os-release`.
 

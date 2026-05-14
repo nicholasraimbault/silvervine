@@ -61,7 +61,6 @@ Once V1.0 ships, future entries will be auto-generated from
   GitHub mirror → 24h on-disk cache).
 - Sleep/wake hooks (NSWorkspace on macOS, logind on Linux).
 - Migration logic for V0 installs (bash, Homebrew, AUR, .deb, Mac DMG).
-- Opt-in error reporting (Cloudflare Worker + D1).
 - Single distribution channel: `cargo-dist`-driven `curl | sh` installer.
 - User hook system (`~/.config/neon/hooks/post-patch`, `post-update`).
 

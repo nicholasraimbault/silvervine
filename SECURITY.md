@@ -41,7 +41,7 @@ In scope:
 - Network paths that fetch unsigned content and act on it (Widevine CDM is hash-verified against the manifest; the manifest is fetched over HTTPS but is itself signed by Mozilla).
 - Race conditions in the atomic-patch protocol that can leave a browser bundle destroyed.
 - Lockfile / IPC race conditions that can be triggered by an unprivileged local user to interfere with the daemon.
-- Default-on telemetry. (Neon has **opt-in** error reporting; default-off; this should never become default-on without an explicit major-version migration.)
+- Any default-on telemetry. Neon ships **no** telemetry or error-reporting endpoint; this should never change without an explicit major-version migration.
 
 Out of scope:
 
@@ -61,7 +61,7 @@ Both prompt the user. Both require user consent each time (Neon does not cache c
 
 User-installed browsers in `~/Applications` (macOS) or `~/.local/...` (Linux) don't require escalation. Custom-path browsers configured in `~/.config/neon/config.toml` follow the path's actual permissions.
 
-The opt-in error reporter (V2.0 feature) sends only categorized failure metadata — no PII, no command-line arguments, no file paths beyond redacted shapes (e.g., `<HOME>/.config/neon/config.toml` becomes `~/.config/neon/config.toml`). Default off; the user opts in during `neon init`.
+Neon ships **no** telemetry or error-reporting endpoint. The binary never POSTs failure metadata anywhere — bug reports go through GitHub Issues, full stop.
 
 ## Known limitations
 

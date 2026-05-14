@@ -1,15 +1,12 @@
 //! `neon setup` — non-interactive equivalent of `init`.
 //!
 //! Runs the same flow as [`crate::cli::init`] without prompting:
-//! detect → migrate → CDM → patch → daemon → config. Designed for
-//! scripts and CI.
+//! detect → migrate → CDM → patch → daemon. Designed for scripts and CI.
 //!
 //! ## Flags
 //!
 //! * `--no-daemon` — skip the daemon registration step.
 //! * `--no-eme-test` — already the default; explicit flag for symmetry.
-//! * `--reporting={on,off}` — flip the opt-in reporting bit. Defaults
-//!   to `off`; CI runs typically don't enable it.
 
 use std::io::Write;
 
@@ -28,8 +25,6 @@ pub struct Args {
     /// Skip the EME health check (already the default; explicit flag
     /// for parity with `init`).
     pub no_eme_test: bool,
-    /// Enable opt-in error reporting.
-    pub reporting_on: bool,
     /// Output flags inherited from the global parser.
     pub output: OutputOptions,
 }
@@ -52,8 +47,6 @@ pub fn build_plan(
         run_migration: legacy_present,
         install_daemon: !args.no_daemon,
         run_eme_test: false,
-        opt_in_error_reporting: args.reporting_on,
-        config_path: None,
     }
 }
 
@@ -76,7 +69,6 @@ pub fn run(args: &Args) -> Result<()> {
         &plan,
         production_cdm_provider,
         patcher.as_ref(),
-        None,
         &mut handle,
         PatchOptions::default(),
     )
@@ -91,9 +83,8 @@ fn production_cdm_provider() -> Result<LocalFileCdm> {
 fn write_args_summary(args: &Args, out: &mut dyn Write) -> std::io::Result<()> {
     writeln!(
         out,
-        "neon setup — daemon: {} | reporting: {} | eme-test: {}",
+        "neon setup — daemon: {} | eme-test: {}",
         if args.no_daemon { "no" } else { "yes" },
-        if args.reporting_on { "on" } else { "off" },
         if args.no_eme_test {
             "no"
         } else {
@@ -123,7 +114,6 @@ mod tests {
         let plan = build_plan(&Args::default(), vec![], false);
         assert!(plan.install_daemon);
         assert!(!plan.run_migration);
-        assert!(!plan.opt_in_error_reporting);
         assert!(plan.browsers_to_manage.is_empty());
     }
 
@@ -135,16 +125,6 @@ mod tests {
         };
         let plan = build_plan(&args, vec![], false);
         assert!(!plan.install_daemon);
-    }
-
-    #[test]
-    fn build_plan_reporting_on_flag_enables_reporting() {
-        let args = Args {
-            reporting_on: true,
-            ..Default::default()
-        };
-        let plan = build_plan(&args, vec![], false);
-        assert!(plan.opt_in_error_reporting);
     }
 
     #[test]
@@ -167,7 +147,6 @@ mod tests {
     fn write_args_summary_includes_each_flag_state() {
         let args = Args {
             no_daemon: true,
-            reporting_on: true,
             no_eme_test: true,
             ..Default::default()
         };
@@ -175,6 +154,6 @@ mod tests {
         write_args_summary(&args, &mut buf).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("daemon: no"));
-        assert!(s.contains("reporting: on"));
+        assert!(s.contains("eme-test"));
     }
 }

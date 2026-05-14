@@ -66,10 +66,6 @@ enum Command {
         /// Skip the EME health check (already off by default).
         #[arg(long)]
         no_eme_test: bool,
-
-        /// `--reporting=on|off` for the opt-in error reporter.
-        #[arg(long, value_enum, default_value_t = ReportingFlag::Off)]
-        reporting: ReportingFlag,
     },
 
     /// Patch one or more browsers with the Widevine CDM.
@@ -170,13 +166,6 @@ enum Command {
         #[command(subcommand)]
         sub: Option<StreamSubcommand>,
     },
-}
-
-/// Reporting opt-in flag for `setup --reporting=...`.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-enum ReportingFlag {
-    On,
-    Off,
 }
 
 #[derive(Debug, Subcommand)]
@@ -313,11 +302,9 @@ fn dispatch(cmd: Command, output: cli::OutputOptions, as_root: bool) -> neon::Re
         Command::Setup {
             no_daemon,
             no_eme_test,
-            reporting,
         } => cli::setup::run(&cli::setup::Args {
             no_daemon,
             no_eme_test,
-            reporting_on: matches!(reporting, ReportingFlag::On),
             output,
         }),
         Command::Patch {

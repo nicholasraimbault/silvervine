@@ -7,10 +7,6 @@
 //! on_success = true
 //! on_failure = true
 //!
-//! [reporting]
-//! opt_in_error_reporting = false
-//! endpoint = "https://errors.neon.example/v1/report"
-//!
 //! [[browsers]]
 //! name = "MyCustomBrowser"
 //! # macOS:
@@ -61,8 +57,6 @@ pub fn default_config_path() -> Option<PathBuf> {
 pub struct Config {
     /// `[notifications]` block — when to surface tray/desktop notifications.
     pub notifications: NotificationsConfig,
-    /// `[reporting]` block — opt-in error reporting endpoint.
-    pub reporting: ReportingConfig,
     /// Zero or more `[[browsers]]` entries adding to the auto-discovered list.
     #[serde(rename = "browsers", default)]
     pub browsers: Vec<CustomBrowserConfig>,
@@ -87,21 +81,6 @@ impl Default for NotificationsConfig {
             on_failure: true,
         }
     }
-}
-
-/// `[reporting]` section.
-///
-/// The default is "reporting off, no endpoint set". The first-run wizard
-/// (Phase 4) flips `opt_in_error_reporting` on with the user's consent and
-/// fills in the production Cloudflare Worker endpoint.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ReportingConfig {
-    /// Whether to send categorized error reports to the configured endpoint.
-    /// **Default: `false`.**
-    pub opt_in_error_reporting: bool,
-    /// HTTP endpoint to POST error reports to. **Default: `None`.**
-    pub endpoint: Option<String>,
 }
 
 /// One `[[browsers]]` entry in the config.
@@ -232,8 +211,6 @@ mod tests {
         let cfg = Config::default();
         assert!(cfg.notifications.on_success);
         assert!(cfg.notifications.on_failure);
-        assert!(!cfg.reporting.opt_in_error_reporting);
-        assert!(cfg.reporting.endpoint.is_none());
         assert!(cfg.browsers.is_empty());
         assert!(cfg.hooks.post_patch.is_none());
     }
@@ -244,10 +221,6 @@ mod tests {
 [notifications]
 on_success = true
 on_failure = true
-
-[reporting]
-opt_in_error_reporting = false
-endpoint = "https://errors.neon.example/v1/report"
 
 [[browsers]]
 name = "MyCustomBrowser"
@@ -265,11 +238,6 @@ post_update = "~/.config/neon/hooks/post-update"
         let cfg = Config::from_toml_str(toml).expect("spec example must parse");
         assert!(cfg.notifications.on_success);
         assert!(cfg.notifications.on_failure);
-        assert!(!cfg.reporting.opt_in_error_reporting);
-        assert_eq!(
-            cfg.reporting.endpoint.as_deref(),
-            Some("https://errors.neon.example/v1/report")
-        );
         assert_eq!(cfg.browsers.len(), 2);
         assert_eq!(cfg.browsers[0].name, "MyCustomBrowser");
         assert_eq!(
@@ -328,10 +296,6 @@ typo_field = false
             notifications: NotificationsConfig {
                 on_success: false,
                 on_failure: true,
-            },
-            reporting: ReportingConfig {
-                opt_in_error_reporting: true,
-                endpoint: Some("https://example.com/r".into()),
             },
             browsers: vec![CustomBrowserConfig {
                 name: "X".into(),

@@ -24,7 +24,6 @@ V2 is the first Rust-rewrite release. The prior bash + Swift + Go implementation
 - **Mozilla manifest URL fallback chain.** `hg.mozilla.org` → GitHub mirror → 24h on-disk cache.
 - **`neon doctor` with EME error-code translation** across Netflix, Disney+, HBO Max, Spotify, Hulu; `--share` produces a pre-filled GitHub issue URL.
 - **`neon repair`.** Uninstall + setup composition; preserves user config.
-- **Opt-in error reporting.** Cloudflare Worker + D1. Default off. No PII; only categorized failures.
 - **Migration from V1.** Detects bash installs and packaged installs (AUR / .deb / .rpm) with a pkg-manager-aware uninstall hint sniffed from `/etc/os-release`. Probes `/etc/systemd/system/`, `/usr/lib/systemd/system/`, `/lib/systemd/system/`; dedupes merged-usr symlinks. See [MIGRATION.md](MIGRATION.md).
 - **Sleep/wake hooks.** `NSWorkspaceDidWakeNotification` on macOS; `org.freedesktop.login1.PrepareForSleep` on Linux.
 - **Distribution.** `cargo-dist`-driven `curl … | sh` installer + tarballs at GitHub Releases. AUR PKGBUILD ships V1 today; will switch to V2-bin after V2.0 stable. Homebrew tap holds V1 during the rc — V2 auto-publish wires up once macOS is validated end-to-end (`[needs macOS verifier]`).

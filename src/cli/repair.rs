@@ -50,7 +50,6 @@ pub fn run(args: &Args) -> Result<()> {
     let setup_args = setup::Args {
         no_daemon: false,
         no_eme_test: true,
-        reporting_on: false,
         output: args.output,
     };
     setup::run(&setup_args)

@@ -178,7 +178,7 @@ The codebase is split by team ownership boundary, with each team owning a slice 
 | `src/log.rs` + `src/config.rs` | cli | Tracing + TOML config |
 | `src/main.rs` | cli | Clap dispatcher |
 | `src/lib.rs`, `src/error.rs`, `src/lockfile.rs` | core-engine | Library surface, error type, flock |
-| `Cargo.toml`, `.github/`, `cloudflare-worker/` | infra | Build, CI, release, error reporting |
+| `Cargo.toml`, `.github/` | infra | Build, CI, release |
 
 Cross-team interfaces are stable; teams don't reach into each other's internals. See the per-team handoff docs for public API contracts.
 

@@ -10,8 +10,6 @@
 //! 5. **Patch each browser** — `patch::patch_browser(...)`.
 //! 6. **Install daemon** — `daemon::lifecycle::register()`.
 //! 7. **Run EME health check** (skippable) — `cli::test::run`.
-//! 8. **Ask about opt-in error reporting** — write
-//!    `~/.config/neon/config.toml`.
 //!
 //! ## Test strategy
 //!
@@ -23,11 +21,9 @@
 //! [`PromptInput`] trait so tests can supply canned answers.
 
 use std::io::{IsTerminal, Write};
-use std::path::{Path, PathBuf};
 
 use crate::browsers::{self, Browser};
 use crate::cli::OutputOptions;
-use crate::config::{Config, ReportingConfig};
 use crate::error::{Error, Result};
 use crate::migration;
 use crate::patch::{self, PatchOptions, PlatformPatcher};
@@ -46,12 +42,7 @@ pub struct Args {
 /// The plan produced from the wizard's input phase. `execute_plan`
 /// runs the side effects in this order; tests inspect the plan
 /// without needing to actually side-effect.
-///
-/// The four boolean toggles are intentionally separate fields rather
-/// than a packed bitset — each represents an independent user choice
-/// and the wizard renders them as distinct prompts.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct Plan {
     /// Browsers the user opted in to managing.
     pub browsers_to_manage: Vec<Browser>,
@@ -61,10 +52,6 @@ pub struct Plan {
     pub install_daemon: bool,
     /// Whether to run the post-install EME health check.
     pub run_eme_test: bool,
-    /// Whether to enable opt-in error reporting in the written config.
-    pub opt_in_error_reporting: bool,
-    /// Where to write the config file. `None` = default location.
-    pub config_path: Option<PathBuf>,
 }
 
 impl Plan {
@@ -76,36 +63,8 @@ impl Plan {
             run_migration: false,
             install_daemon: false,
             run_eme_test: false,
-            opt_in_error_reporting: false,
-            config_path: None,
         }
     }
-
-    /// Convert this plan's reporting choice into a [`Config`] suitable
-    /// for `Config::to_toml_string()`.
-    #[must_use]
-    pub fn into_config(&self) -> Config {
-        Config {
-            reporting: ReportingConfig {
-                opt_in_error_reporting: self.opt_in_error_reporting,
-                endpoint: if self.opt_in_error_reporting {
-                    Some(default_reporting_endpoint().into())
-                } else {
-                    None
-                },
-            },
-            ..Default::default()
-        }
-    }
-}
-
-/// Default reporting endpoint for the opt-in error reporter.
-///
-/// The Cloudflare Worker that ingests these (per the spec) lives at the
-/// URL embedded here; users can override it by editing
-/// `~/.config/neon/config.toml` after running the wizard.
-fn default_reporting_endpoint() -> &'static str {
-    "https://errors.neon.example/v1/report"
 }
 
 /// Trait abstracting interactive prompt input.
@@ -213,12 +172,6 @@ pub fn build_plan_from_input(
         false,
     )?;
 
-    // Step 5: opt-in error reporting.
-    plan.opt_in_error_reporting = prompts.confirm(
-        "Send anonymized error reports to help improve Neon? (default: no)",
-        false,
-    )?;
-
     Ok(plan)
 }
 
@@ -237,12 +190,11 @@ pub fn build_plan_from_input(
 ///
 /// Aborts on the first irrecoverable error. Recoverable per-browser
 /// failures are recorded but don't stop the wizard.
-#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value)]
 pub fn execute_plan<F>(
     plan: &Plan,
     cdm_provider: F,
     patcher: &dyn PlatformPatcher,
-    config_dest: Option<&Path>,
     out: &mut dyn Write,
     patch_options: PatchOptions,
 ) -> Result<()>
@@ -336,9 +288,6 @@ where
         .map_err(Error::from)?;
     }
 
-    // Step 6: write config file.
-    write_config(plan, config_dest, out)?;
-
     if patch_failures > 0 {
         writeln!(
             out,
@@ -349,38 +298,6 @@ where
     } else {
         writeln!(out, "Setup complete.").map_err(Error::from)?;
     }
-    Ok(())
-}
-
-/// Write the user's chosen config (currently just the reporting block)
-/// to disk. If a config already exists, we read it, set the reporting
-/// fields, and write it back — preserving any other user-edited
-/// blocks.
-fn write_config(plan: &Plan, dest: Option<&Path>, out: &mut dyn Write) -> Result<()> {
-    let path = if let Some(p) = dest {
-        p.to_path_buf()
-    } else {
-        let Some(p) = crate::config::default_config_path() else {
-            writeln!(out, "Skipping config: cannot resolve default path.").map_err(Error::from)?;
-            return Ok(());
-        };
-        p
-    };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(Error::from)?;
-    }
-    let mut config = if path.exists() {
-        crate::config::load_config_from(&path).unwrap_or_default()
-    } else {
-        Config::default()
-    };
-    config.reporting.opt_in_error_reporting = plan.opt_in_error_reporting;
-    if plan.opt_in_error_reporting && config.reporting.endpoint.is_none() {
-        config.reporting.endpoint = Some(default_reporting_endpoint().to_string());
-    }
-    let toml = config.to_toml_string()?;
-    std::fs::write(&path, toml).map_err(Error::from)?;
-    writeln!(out, "Wrote config: {}", path.display()).map_err(Error::from)?;
     Ok(())
 }
 
@@ -403,7 +320,6 @@ pub fn run(args: &Args) -> Result<()> {
         &plan,
         production_cdm_provider,
         patcher.as_ref(),
-        None,
         &mut handle,
         PatchOptions::default(),
     )
@@ -423,7 +339,7 @@ mod tests {
     use crate::browsers::BrowserKind;
     use std::cell::RefCell;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
@@ -523,8 +439,8 @@ mod tests {
         let h = tmp.path().join("h");
         fs::create_dir_all(&h).unwrap();
         let detected = vec![make_browser(h, "Helium")];
-        // Confirms popped in reverse order: opt-in last, eme penultimate, ...
-        let prompts = CannedPrompts::new(vec![true, false, true, true]); // pop order: true,true,false,true
+        // Confirms popped from the end of the vec: migration → daemon → eme.
+        let prompts = CannedPrompts::new(vec![false, true, true]);
         let plan = build_plan_from_input(&prompts, &detected, true).expect("ok");
         assert_eq!(plan.browsers_to_manage.len(), 1);
         assert!(plan.run_migration); // legacy_present=true and answer=true (popped first)
@@ -532,38 +448,15 @@ mod tests {
 
     #[test]
     fn build_plan_with_no_legacy_does_not_set_migration() {
-        let prompts = CannedPrompts::new(vec![false, false, true]);
+        let prompts = CannedPrompts::new(vec![false, true]);
         let plan = build_plan_from_input(&prompts, &[], false).expect("ok");
         assert!(!plan.run_migration);
-    }
-
-    #[test]
-    fn plan_into_config_sets_reporting_endpoint() {
-        let plan = Plan {
-            opt_in_error_reporting: true,
-            ..Plan::empty()
-        };
-        let config = plan.into_config();
-        assert!(config.reporting.opt_in_error_reporting);
-        assert!(config.reporting.endpoint.is_some());
-    }
-
-    #[test]
-    fn plan_into_config_no_opt_in_no_endpoint() {
-        let plan = Plan {
-            opt_in_error_reporting: false,
-            ..Plan::empty()
-        };
-        let config = plan.into_config();
-        assert!(!config.reporting.opt_in_error_reporting);
-        assert!(config.reporting.endpoint.is_none());
     }
 
     #[test]
     fn execute_plan_with_no_browsers_skips_cdm_resolution() {
         let _g = crate::test_support::env_lock();
         let _life = ScopedEnv::set(crate::daemon::lifecycle::NOOP_ENV, Path::new("1"));
-        let tmp = TempDir::new().unwrap();
         let plan = Plan {
             browsers_to_manage: vec![],
             install_daemon: true,
@@ -577,7 +470,6 @@ mod tests {
             &plan,
             cdm_provider,
             &patcher,
-            Some(&tmp.path().join("config.toml")),
             &mut buf,
             PatchOptions::default(),
         )
@@ -587,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_plan_patches_browsers_and_writes_config() {
+    fn execute_plan_patches_browsers() {
         let _g = crate::test_support::env_lock();
         let _life = ScopedEnv::set(crate::daemon::lifecycle::NOOP_ENV, Path::new("1"));
         let tmp = TempDir::new().unwrap();
@@ -601,8 +493,6 @@ mod tests {
             run_migration: false,
             install_daemon: false,
             run_eme_test: false,
-            opt_in_error_reporting: true,
-            config_path: None,
         };
         let mut buf = Vec::new();
         let opts = PatchOptions {
@@ -612,12 +502,10 @@ mod tests {
             ..Default::default()
         };
         let patcher = MockPatcher::default();
-        let config_dest = tmp.path().join("config.toml");
         execute_plan(
             &plan,
             || Ok(make_cdm(&cache, "4.10.0")),
             &patcher,
-            Some(&config_dest),
             &mut buf,
             opts,
         )
@@ -625,12 +513,6 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("Patched Helium"));
         assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 1);
-        // Config was written with reporting opt-in.
-        assert!(config_dest.exists());
-        let toml = fs::read_to_string(&config_dest).unwrap();
-        let parsed = Config::from_toml_str(&toml).unwrap();
-        assert!(parsed.reporting.opt_in_error_reporting);
-        assert!(parsed.reporting.endpoint.is_some());
     }
 
     #[test]
@@ -667,7 +549,6 @@ mod tests {
             &plan,
             || Ok(make_cdm(&cache, "4.10.2934.0")),
             &patcher,
-            Some(&tmp.path().join("config.toml")),
             &mut buf,
             opts,
         )
@@ -720,7 +601,6 @@ mod tests {
             &plan,
             || Ok(make_cdm(&cache, "4.10.2934.0")),
             &patcher,
-            Some(&tmp.path().join("config.toml")),
             &mut buf,
             opts,
         )
@@ -769,7 +649,6 @@ mod tests {
             &plan,
             || Ok(make_cdm(&cache, "1.0")),
             &FailingPatcher,
-            Some(&tmp.path().join("config.toml")),
             &mut buf,
             opts,
         )
@@ -780,39 +659,12 @@ mod tests {
     }
 
     #[test]
-    fn write_config_preserves_existing_unrelated_fields() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("config.toml");
-        // Pre-write a config with hooks set.
-        let pre = Config {
-            hooks: crate::config::HooksConfig {
-                post_patch: Some("/tmp/hook".into()),
-                post_update: None,
-            },
-            ..Default::default()
-        };
-        fs::write(&path, pre.to_toml_string().unwrap()).unwrap();
-
-        let plan = Plan {
-            opt_in_error_reporting: true,
-            ..Plan::empty()
-        };
-        let mut buf = Vec::new();
-        write_config(&plan, Some(&path), &mut buf).unwrap();
-        let toml = fs::read_to_string(&path).unwrap();
-        let parsed = Config::from_toml_str(&toml).unwrap();
-        assert!(parsed.reporting.opt_in_error_reporting);
-        assert_eq!(parsed.hooks.post_patch.as_deref(), Some("/tmp/hook"));
-    }
-
-    #[test]
     fn plan_empty_constructor_has_safe_defaults() {
         let p = Plan::empty();
         assert!(p.browsers_to_manage.is_empty());
         assert!(!p.run_migration);
         assert!(!p.install_daemon);
         assert!(!p.run_eme_test);
-        assert!(!p.opt_in_error_reporting);
     }
 
     #[test]
