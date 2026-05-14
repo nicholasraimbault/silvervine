@@ -83,7 +83,7 @@ dirs = "5"
 # `flock`-based exclusive lockfile.
 fs2 = "0.4"
 # SHA-512 verification for the Widevine CRX3 download (Phase 2).
-sha2 = "0.10"
+sha2 = "0.11"
 # CRX3 ZIP body extraction. Default features pull lots of compression
 # methods we don't need; only deflate is required for Mozilla's CRX3.
 zip = { version = "2", default-features = false, features = ["deflate"] }
