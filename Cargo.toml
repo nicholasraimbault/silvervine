@@ -172,7 +172,7 @@ indicatif = { version = "0.18", optional = true }
 # handler argument; objc2-app-kit doesn't enable the dep transitively
 # under default features.
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.5"
+objc2 = "0.6"
 # objc2-foundation 0.2 feature-gates every Foundation class behind its
 # own cargo feature. We need NSString and NSNotification for the
 # sleep/wake observer in src/daemon/power/macos.rs.
