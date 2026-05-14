@@ -29,7 +29,7 @@ Neon patches any Chromium-family browser. The following are auto-discovered out 
 
 | Browser | macOS path | Linux path(s) |
 |---|---|---|
-| [Helium](https://helium.computer) | `/Applications/Helium.app` | `/opt/helium-browser-bin` |
+| [Helium](https://helium.computer) | `/Applications/Helium.app` | `/opt/helium` (apt), `/opt/helium-browser-bin` (AUR) |
 | [Thorium](https://thorium.rocks) | `/Applications/Thorium.app` | `/opt/chromium.org/thorium`, `/opt/thorium-browser` |
 | [ungoogled-chromium](https://ungoogled-software.github.io/ungoogled-chromium-binaries/) | `/Applications/Chromium.app` | `/usr/lib/chromium`, `/usr/lib64/chromium` |
 | [Chromium](https://www.chromium.org/) | `/Applications/Chromium.app` | `/usr/lib/chromium-browser` |
