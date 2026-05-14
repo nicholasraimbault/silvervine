@@ -164,7 +164,7 @@ png = "0.18"
 # the default V2 build doesn't pull them in. `quick-xml` parses the
 # generated `autounattend.xml` for schema validation; `indicatif`
 # powers the install progress bars in `cli::stream::init`.
-quick-xml = { version = "0.36", optional = true }
+quick-xml = { version = "0.37", optional = true }
 indicatif = { version = "0.17", optional = true }
 
 # macOS-specific deps: ObjC FFI for NSWorkspace wake notifications.
