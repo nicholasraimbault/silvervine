@@ -86,7 +86,7 @@ fs2 = "0.4"
 sha2 = "0.11"
 # CRX3 ZIP body extraction. Default features pull lots of compression
 # methods we don't need; only deflate is required for Mozilla's CRX3.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 # Process scanning for browser-running detection (Phase 2).
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 # Direct FFI for `renameat2(RENAME_EXCHANGE)` (Linux) and
