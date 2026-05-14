@@ -37,7 +37,10 @@ pub const KNOWN: &[KnownBrowser] = &[
     KnownBrowser {
         name: "Helium",
         macos_framework: "Helium Framework",
-        linux_paths: &["/opt/helium-browser-bin"],
+        // `/opt/helium` is the official .deb path used on Debian/Ubuntu/Pop!_OS
+        // (apt repo pkg.helium.computer); `/opt/helium-browser-bin` is the AUR
+        // path on Arch.
+        linux_paths: &["/opt/helium", "/opt/helium-browser-bin"],
     },
     KnownBrowser {
         name: "Thorium",
@@ -178,6 +181,26 @@ mod tests {
         // Other known browsers don't have dirs in the sandbox, so they
         // don't surface.
         assert!(!names.contains(&"Thorium"));
+    }
+
+    #[test]
+    fn known_linux_resolves_helium_at_opt_helium() {
+        // The official Helium .deb (apt repo pkg.helium.computer, used on
+        // Debian / Ubuntu / Pop!_OS) installs to `/opt/helium`, not the
+        // Arch AUR path `/opt/helium-browser-bin`. Both must resolve.
+        let tmp = TempDir::new().expect("tempdir");
+        fs::create_dir_all(tmp.path().join("opt").join("helium")).expect("mkdir helium");
+        let roots = FilesystemRoots {
+            macos_applications: vec![],
+            linux_search: vec![],
+            sandbox_root: Some(tmp.path().to_path_buf()),
+        };
+        let found = known_for_os(Os::Linux, &roots);
+        let helium = found
+            .iter()
+            .find(|b| b.name == "Helium")
+            .expect("Helium found via /opt/helium");
+        assert!(helium.install_path.ends_with("opt/helium"));
     }
 
     #[test]
