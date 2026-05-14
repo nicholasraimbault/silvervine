@@ -142,7 +142,7 @@ jobs:
           tool: cargo-tarpaulin
       - run: cargo tarpaulin --out Xml --workspace --skip-clean --timeout 300
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v6
         with:
           files: cobertura.xml
           fail_ci_if_error: false
