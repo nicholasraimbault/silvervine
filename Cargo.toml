@@ -134,7 +134,7 @@ notify = "8"
 dialoguer = { version = "0.11", default-features = false }
 # Cross-platform terminal control for `neon status --watch`. We use only
 # the cursor + clear primitives; no async event polling needed.
-crossterm = { version = "0.27", default-features = false }
+crossterm = { version = "0.29", default-features = false }
 # Shell completion script generation for `neon completion <shell>`.
 clap_complete = "4.6"
 # Man-page generation for `neon manpage`.
