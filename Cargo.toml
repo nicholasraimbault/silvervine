@@ -88,7 +88,7 @@ sha2 = "0.11"
 # methods we don't need; only deflate is required for Mozilla's CRX3.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # Process scanning for browser-running detection (Phase 2).
-sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 # Direct FFI for `renameat2(RENAME_EXCHANGE)` (Linux) and
 # `renameatx_np(RENAME_SWAP)` (macOS): used by `crate::platform` for the
 # atomic-rename helper. nix's renameat2 wrapper is gated on
