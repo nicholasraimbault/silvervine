@@ -79,7 +79,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # URL type used in the public `fetch_manifest` API.
 url = "2"
 # XDG / platform-conventional paths.
-dirs = "5"
+dirs = "6"
 # `flock`-based exclusive lockfile.
 fs2 = "0.4"
 # SHA-512 verification for the Widevine CRX3 download (Phase 2).
