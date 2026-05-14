@@ -1390,7 +1390,7 @@ dependencies = [
  "notify-rust",
  "objc2 0.5.2",
  "objc2-app-kit 0.2.2",
- "objc2-foundation 0.2.2",
+ "objc2-foundation 0.3.2",
  "png",
  "quick-xml 0.40.0",
  "reqwest",
