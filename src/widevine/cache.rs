@@ -154,6 +154,11 @@ pub fn ensure_cdm_for_with(
     }
     std::fs::rename(&staging, &target_dir).map_err(Error::from)?;
 
+    // Bundle promoted — the downloaded CRX3 is now redundant. Without
+    // this, every CDM upgrade leaks 5–7 MB into `<cache>/downloads/`
+    // indefinitely (`prune_in` deliberately skips that subdir).
+    let _ = std::fs::remove_file(&crx_path);
+
     advance_current(cache_root, &version)?;
     Ok(CachedCdm::new(version, target_dir))
 }
@@ -367,6 +372,18 @@ pub fn prune_in(cache_root: &Path, keep: usize) -> Result<usize> {
                 if name.starts_with(".staging-") {
                     let _ = std::fs::remove_dir_all(&path);
                 }
+            }
+        }
+    }
+    // Sweep stale CRX3 archives left behind by earlier neon versions
+    // (pre-cleanup-on-success) under <cache_root>/downloads/. Each is
+    // ~5–7 MB and they accumulate per CDM upgrade.
+    let downloads_dir = cache_root.join("downloads");
+    if let Ok(entries) = std::fs::read_dir(&downloads_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("crx3") {
+                let _ = std::fs::remove_file(&path);
             }
         }
     }
@@ -699,6 +716,31 @@ mod tests {
         fs::create_dir_all(&staging).expect("mkdir staging");
         let _ = prune_in(tmp.path(), 3).expect("prune");
         assert!(!staging.exists());
+    }
+
+    /// `prune_in` sweeps stale `.crx3` archives from `downloads/`. They
+    /// pile up because old neon versions didn't remove the downloaded
+    /// CRX3 after extracting it. Each is ~5–7 MB and `list_versions`
+    /// explicitly skips the `downloads/` subdir, so without this sweep
+    /// the disk usage grows unbounded.
+    #[test]
+    fn prune_in_sweeps_stale_crx3_from_downloads() {
+        let tmp = TempDir::new().expect("tempdir");
+        let downloads = tmp.path().join("downloads");
+        fs::create_dir_all(&downloads).expect("mkdir downloads");
+        let stale = downloads.join("4.10.2891.0.crx3");
+        let stale2 = downloads.join("4.10.2934.0.crx3");
+        let unrelated = downloads.join("README.txt");
+        fs::write(&stale, b"old crx").unwrap();
+        fs::write(&stale2, b"old crx").unwrap();
+        fs::write(&unrelated, b"keep me").unwrap();
+        let _ = prune_in(tmp.path(), 3).expect("prune");
+        assert!(!stale.exists(), "stale crx3 must be removed");
+        assert!(!stale2.exists(), "stale crx3 must be removed");
+        assert!(
+            unrelated.exists(),
+            "non-crx3 files in downloads/ must be left alone"
+        );
     }
 
     #[test]
