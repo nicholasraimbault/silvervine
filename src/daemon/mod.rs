@@ -255,7 +255,7 @@ pub fn run_with(options: &RunOptions) -> Result<()> {
     // clicks Quit / sends SIGTERM. In test mode (`single_iteration`) we run
     // one iteration then return.
     let _ = config;
-    let result = run_event_loop(&tray, &stop, options.single_iteration);
+    let result = run_event_loop(&tray, &stop, options.single_iteration, Some(&ipc_state));
 
     // Tear down: writes shutdown stamp + joins threads.
     tracing::info!(target: "neon::daemon", "neon daemon shutting down");
@@ -573,7 +573,12 @@ fn resolve_socket_path(options: &RunOptions) -> PathBuf {
 /// Run the main event loop. Reads tray commands; dispatches to the
 /// patch / update / lifecycle / quit handlers. Returns `Ok(())` on
 /// graceful shutdown.
-fn run_event_loop(tray: &Tray, stop: &Arc<AtomicBool>, single_iteration: bool) -> Result<()> {
+fn run_event_loop(
+    tray: &Tray,
+    stop: &Arc<AtomicBool>,
+    single_iteration: bool,
+    state: Option<&Arc<IpcSharedState>>,
+) -> Result<()> {
     loop {
         if stop.load(Ordering::SeqCst) {
             return Ok(());
@@ -590,7 +595,7 @@ fn run_event_loop(tray: &Tray, stop: &Arc<AtomicBool>, single_iteration: bool) -
             Some(TrayCommand::PatchAll) => {
                 tracing::info!(target: "neon::daemon", "tray PatchAll");
                 if !daemon_patch_noop() {
-                    let detected = browsers::detect_browsers().unwrap_or_default();
+                    let detected = detected_browsers_from(state);
                     let results = drive_patch_flow(&detected, None, false);
                     notify_user::notify_info(&summarize_patch_results(&results));
                 }
@@ -598,7 +603,7 @@ fn run_event_loop(tray: &Tray, stop: &Arc<AtomicBool>, single_iteration: bool) -
             Some(TrayCommand::PatchOne(name)) => {
                 tracing::info!(target: "neon::daemon", browser = %name, "tray PatchOne");
                 if !daemon_patch_noop() {
-                    let detected = browsers::detect_browsers().unwrap_or_default();
+                    let detected = detected_browsers_from(state);
                     let results = drive_patch_flow(&detected, Some(&name), false);
                     notify_user::notify_info(&summarize_patch_results(&results));
                 }
@@ -932,6 +937,23 @@ pub fn needs_patch(browser: &Browser, cached_version: Option<&str>, force: bool)
     match cached_version {
         Some(c) => installed != c,
         None => true,
+    }
+}
+
+/// Resolve the current detected-browser list. Prefers the shared daemon
+/// state (a snapshot taken at daemon start, behind a Mutex) over a fresh
+/// `detect_browsers` walk so tray clicks don't trigger a full filesystem
+/// scan on the event-loop thread. Falls back to `detect_browsers` when
+/// state isn't available — that happens in tests that drive the loop
+/// directly without spinning up `run_with`.
+fn detected_browsers_from(state: Option<&Arc<IpcSharedState>>) -> Vec<Browser> {
+    match state {
+        Some(s) => s
+            .browsers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+        None => browsers::detect_browsers().unwrap_or_default(),
     }
 }
 
@@ -1383,7 +1405,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         // Synthesize a Quit before calling the loop.
         tray.synthesize(TrayCommand::Quit);
-        run_event_loop(&tray, &stop, false).unwrap();
+        run_event_loop(&tray, &stop, false, None).unwrap();
         assert!(stop.load(Ordering::SeqCst));
     }
 
@@ -1398,7 +1420,7 @@ mod tests {
             bridge: tray::BridgeMenuState::default(),
         });
         let stop = Arc::new(AtomicBool::new(false));
-        run_event_loop(&tray, &stop, true).unwrap();
+        run_event_loop(&tray, &stop, true, None).unwrap();
     }
 
     /// `run_event_loop` exits when the stop flag is pre-set.
@@ -1411,7 +1433,7 @@ mod tests {
             bridge: tray::BridgeMenuState::default(),
         });
         let stop = Arc::new(AtomicBool::new(true));
-        run_event_loop(&tray, &stop, false).unwrap();
+        run_event_loop(&tray, &stop, false, None).unwrap();
     }
 
     /// `read_heartbeat_now` returns None when no file exists.
@@ -1455,7 +1477,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         tray.synthesize(TrayCommand::ToggleLaunchAtLogin(true));
         // Loop will run the toggle handler — it must not panic.
-        run_event_loop(&tray, &stop, true).unwrap();
+        run_event_loop(&tray, &stop, true, None).unwrap();
     }
 
     /// Tray `PatchAll` command is logged but doesn't crash the loop.
@@ -1471,7 +1493,7 @@ mod tests {
         });
         let stop = Arc::new(AtomicBool::new(false));
         tray.synthesize(TrayCommand::PatchAll);
-        run_event_loop(&tray, &stop, true).unwrap();
+        run_event_loop(&tray, &stop, true, None).unwrap();
     }
 
     /// Tray `PatchOne` command carries through to the loop.
@@ -1487,7 +1509,7 @@ mod tests {
         });
         let stop = Arc::new(AtomicBool::new(false));
         tray.synthesize(TrayCommand::PatchOne("Helium".into()));
-        run_event_loop(&tray, &stop, true).unwrap();
+        run_event_loop(&tray, &stop, true, None).unwrap();
     }
 
     /// Tray `UpdateWidevine` command runs.
@@ -1503,7 +1525,7 @@ mod tests {
         });
         let stop = Arc::new(AtomicBool::new(false));
         tray.synthesize(TrayCommand::UpdateWidevine);
-        run_event_loop(&tray, &stop, true).unwrap();
+        run_event_loop(&tray, &stop, true, None).unwrap();
     }
 
     /// Build a fake browser whose `WidevineCdm/manifest.json` reports

@@ -9,11 +9,13 @@
 //! ## Debouncing
 //!
 //! A single browser update touches dozens of files within milliseconds.
-//! We debounce per-browser: after the *first* event for a given install
-//! path, we wait [`DEFAULT_DEBOUNCE_MS`] before invoking the user
-//! callback. Subsequent events within the debounce window reset the
-//! timer. This keeps the patch flow from running 30 times during a
-//! single update.
+//! We debounce per-browser on the **trailing edge**: every event resets
+//! a timer to `now + DEFAULT_DEBOUNCE_MS`, and the user callback only
+//! fires once that timer elapses with no new events. This keeps the
+//! patch flow from (a) running 30 times during a single update, and
+//! (b) running on top of an in-flight update — the leading-edge
+//! variant we used to have fired on the very first event of the storm,
+//! before the browser bundle finished writing.
 //!
 //! ## Browser-running deferral
 //!
@@ -410,75 +412,31 @@ fn run_dispatch(
     }
 }
 
-/// Process one filesystem event: resolve which browser it's for, apply
-/// the debounce + running deferral, fire the callback if appropriate.
+/// Process one filesystem event: resolve which browser it's for and
+/// (re-)arm the trailing-edge debounce timer for that install path.
+///
+/// The callback is *not* fired here. The tick loop drains
+/// [`WatcherState::next_dispatch_at`] once a path has been quiet for the
+/// full debounce window. This avoids patching on top of an in-flight
+/// browser update (the prior leading-edge behavior fired on the very
+/// first event of a 30-event update storm, before the browser bundle
+/// finished writing).
 fn handle_fs_event(
     path: &Path,
     inner: &Arc<Mutex<WatcherState>>,
-    callback: &WatcherCallback,
-    is_running: &RunningPredicate,
+    _callback: &WatcherCallback,
+    _is_running: &RunningPredicate,
     debounce: Duration,
 ) {
     let now = Instant::now();
-    let (browser_to_fire, deferred_register): (Option<Browser>, Option<(PathBuf, Browser)>) = {
-        let mut state = inner.lock().unwrap();
-        let Some((install_root, browser)) = find_owning_browser(&state.browsers, path) else {
-            return;
-        };
-        let install_root = install_root.clone();
-        let browser_clone = browser.clone();
-
-        // Debounce decision. We fire on the *first* event for a given
-        // install path (no entry in `next_dispatch_at`), then suppress
-        // subsequent events that fall within the debounce window. Each
-        // observed event extends the window by `debounce` from `now`.
-        match state.next_dispatch_at.get(&install_root).copied() {
-            Some(next) if now < next => {
-                // Inside debounce window → suppress and extend.
-                state.next_dispatch_at.insert(install_root, now + debounce);
-                return;
-            }
-            _ => {
-                // No prior window OR prior window has elapsed → fire and
-                // open a new window.
-                state
-                    .next_dispatch_at
-                    .insert(install_root.clone(), now + debounce);
-            }
-        }
-
-        // Decide: defer if running, fire otherwise.
-        if is_running(&browser_clone) {
-            tracing::info!(
-                target: "neon::watcher",
-                browser = %browser_clone.name(),
-                "browser is running; deferring patch until quit"
-            );
-            (None, Some((install_root, browser_clone)))
-        } else {
-            (Some(browser_clone), None)
-        }
+    let mut state = inner.lock().unwrap();
+    let Some((install_root, _)) = find_owning_browser(&state.browsers, path) else {
+        return;
     };
-
-    if let Some((path, browser)) = deferred_register {
-        let mtime = mtime_of(&path);
-        let mut state = inner.lock().unwrap();
-        state.deferred.insert(
-            path,
-            DeferredState {
-                last_mtime: mtime,
-                last_check: Instant::now(),
-                first_seen: Instant::now(),
-            },
-        );
-        // Keep `browser` reachable for the deferred-tick path: store it
-        // back into `browsers` (it should already be there, but defensive).
-        let _ = browser;
-    }
-
-    if let Some(b) = browser_to_fire {
-        callback(&b);
-    }
+    let install_root = install_root.clone();
+    // Every event resets the timer — the path needs `debounce` of quiet
+    // before the tick loop will fire the callback.
+    state.next_dispatch_at.insert(install_root, now + debounce);
 }
 
 /// Periodic tick: walk deferred entries, fire any whose bundle's mtime
@@ -494,6 +452,45 @@ fn handle_tick(
     let mut to_fire: Vec<Browser> = Vec::new();
     {
         let mut state = inner.lock().unwrap();
+
+        // Step 1: drain expired debounce timers from `next_dispatch_at`.
+        // An entry whose dispatch instant has been reached means the
+        // install path has been quiet for `debounce`. Promote it: fire
+        // the callback now if the browser isn't running, or move it to
+        // `deferred` to wait out the running browser.
+        let expired: Vec<PathBuf> = state
+            .next_dispatch_at
+            .iter()
+            .filter(|(_, t)| now >= **t)
+            .map(|(p, _)| p.clone())
+            .collect();
+        for install in expired {
+            state.next_dispatch_at.remove(&install);
+            let Some(browser) = state.browsers.get(&install).cloned() else {
+                continue;
+            };
+            if is_running(&browser) {
+                tracing::info!(
+                    target: "neon::watcher",
+                    browser = %browser.name(),
+                    "debounce window elapsed but browser is running; deferring until quit"
+                );
+                state.deferred.insert(
+                    install,
+                    DeferredState {
+                        last_mtime: mtime_of(browser.install_path()),
+                        last_check: now,
+                        first_seen: now,
+                    },
+                );
+            } else {
+                to_fire.push(browser);
+            }
+        }
+
+        // Step 2: walk deferred entries (browsers that were running when
+        // their debounce timer expired). Fire when mtime has stabilized
+        // for [`POST_QUIT_STABLE_S`] and the browser has quit.
         let install_paths: Vec<PathBuf> = state.deferred.keys().cloned().collect();
         for install in install_paths {
             let Some(browser) = state.browsers.get(&install).cloned() else {
@@ -501,7 +498,9 @@ fn handle_tick(
                 continue;
             };
             let current_mtime = mtime_of(&install);
-            let entry = state.deferred.get_mut(&install).unwrap();
+            let Some(entry) = state.deferred.get_mut(&install) else {
+                continue;
+            };
             // If mtime changed, reset the stable-since timer.
             if entry.last_mtime != current_mtime {
                 entry.last_mtime = current_mtime;
@@ -519,14 +518,14 @@ fn handle_tick(
                 // running-detection will refuse if the browser truly is
                 // still running, which is a more actionable error than an
                 // indefinitely-deferred state.
-                let entry = state.deferred.remove(&install).unwrap();
+                let entry = state.deferred.remove(&install);
                 tracing::warn!(
                     target: "neon::watcher",
                     install = %install.display(),
-                    deferred_for_s = ?entry.first_seen.elapsed(),
+                    deferred_for_s = ?entry.map(|e| e.first_seen.elapsed()),
                     "giving up on deferred state and firing anyway"
                 );
-                to_fire.push(state.browsers.get(&install).unwrap().clone());
+                to_fire.push(browser);
             }
         }
     }
@@ -643,15 +642,60 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
 
-        // First event passes the (initial) debounce-empty check and fires;
-        // the next 9 are inside the window. Wait long enough that the
-        // dispatch had a chance to run.
-        std::thread::sleep(Duration::from_millis(700));
+        // Trailing-edge debounce: the callback fires only after the path
+        // has been quiet for the full window. Wait past debounce + the
+        // 500ms tick interval so the dispatch had a chance to run.
+        std::thread::sleep(Duration::from_millis(900));
         let n = count.load(Ordering::SeqCst);
-        // Implementation fires on first event when no prior window exists,
-        // then suppresses subsequent ones. We assert <=2 to absorb any
-        // ordering quirks but the typical value is exactly 1.
-        assert!(n <= 2, "debounce should suppress most events; got {n}");
+        assert!(
+            n <= 2,
+            "trailing-edge debounce should collapse the burst; got {n}"
+        );
+        watcher.close();
+    }
+
+    /// Trailing-edge debounce contract: a burst of events must NOT fire
+    /// the callback during the burst itself. The leading-edge variant
+    /// (which we replaced) fired immediately on the first event and then
+    /// suppressed — meaning a 30-event browser-update storm patched on
+    /// top of an in-flight write. With trailing edge, the callback only
+    /// runs after the quiet period that follows the burst, so the patch
+    /// sees the post-update bundle.
+    #[test]
+    fn burst_does_not_fire_during_window() {
+        let tmp = TempDir::new().unwrap();
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).unwrap();
+        let browser = fake_browser("Test", install.clone());
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_for_cb = Arc::clone(&count);
+        let cb: WatcherCallback = Arc::new(move |_b: &Browser| {
+            count_for_cb.fetch_add(1, Ordering::SeqCst);
+        });
+        let not_running: RunningPredicate = Arc::new(|_| false);
+        let mut watcher =
+            Watcher::with_options(cb, not_running, Duration::from_millis(500)).unwrap();
+        watcher.watch(browser).unwrap();
+
+        // Continuous events well shorter than the debounce window — every
+        // event resets the timer, so the callback must not fire while the
+        // burst is in flight.
+        for i in 0..6 {
+            fs::write(install.join(format!("touch_{i}")), b"x").unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Right after the burst (no quiet period yet), count must still
+        // be 0 — that's the trailing-edge guarantee.
+        let mid_burst = count.load(Ordering::SeqCst);
+        assert_eq!(
+            mid_burst, 0,
+            "trailing-edge debounce must not fire during the burst; got {mid_burst}"
+        );
+
+        // Now let the quiet period elapse so the callback eventually fires.
+        let fired = wait_until(Duration::from_secs(2), || count.load(Ordering::SeqCst) >= 1);
+        assert!(fired, "callback must fire after the burst quiets");
         watcher.close();
     }
 

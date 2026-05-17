@@ -124,38 +124,59 @@ pub fn ensure_cdm_for_with(
     std::fs::create_dir_all(cache_root).map_err(Error::from)?;
     let target_dir = cache_root.join(&version);
 
-    // Short-circuit if cache hit verifies.
-    if target_dir.exists() {
-        if integrity_check_dir(&target_dir, entry).is_ok() {
-            advance_current(cache_root, &version)?;
-            return Ok(CachedCdm::new(version, target_dir));
+    // Fast path: cache hit + integrity passes → no lock needed.
+    if target_dir.exists() && integrity_check_dir(&target_dir, entry).is_ok() {
+        advance_current(cache_root, &version)?;
+        return Ok(CachedCdm::new(version, target_dir));
+    }
+
+    // Slow path: a download (or re-download) is needed. Serialize across
+    // processes with a download-scoped lockfile. Two concurrent neon
+    // invocations (CLI + daemon, double-click, etc.) used to race the
+    // staging rename — the loser corrupted the winner's cache. The lock
+    // is *separate* from `patch.lock` so a long-running patch doesn't
+    // block CDM refreshes and vice-versa.
+    let lock_path = cache_root.join("download.lock");
+    crate::lockfile::with_lock(&lock_path, || {
+        // Re-check inside the lock: a sibling process may have promoted
+        // this version while we were waiting.
+        if target_dir.exists() {
+            if integrity_check_dir(&target_dir, entry).is_ok() {
+                advance_current(cache_root, &version)?;
+                return Ok(CachedCdm::new(version.clone(), target_dir.clone()));
+            }
+            // Corrupted; clear and re-download.
+            let _ = std::fs::remove_dir_all(&target_dir);
         }
-        // Cache hit but corrupted; remove and re-download.
-        let _ = std::fs::remove_dir_all(&target_dir);
-    }
 
-    // Download + extract via a staging dir to avoid leaving a half-extracted
-    // tree under <version>/ on crash.
-    let staging = cache_root.join(format!(".staging-{version}"));
-    if staging.exists() {
-        let _ = std::fs::remove_dir_all(&staging);
-    }
-    let crx_path = download::download_to(entry, &cache_root.join("downloads"))?;
-    extract::extract_crx3(&crx_path, &staging)?;
-    // Verify the layout before promoting.
-    let _ = extract::verify_widevine_layout(&staging)?;
-    integrity_check_dir(&staging, entry)?;
+        // Download + extract via a staging dir to avoid leaving a
+        // half-extracted tree under <version>/ on crash.
+        let staging = cache_root.join(format!(".staging-{version}"));
+        if staging.exists() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+        let crx_path = download::download_to(entry, &cache_root.join("downloads"))?;
+        extract::extract_crx3(&crx_path, &staging)?;
+        let _ = extract::verify_widevine_layout(&staging)?;
+        integrity_check_dir(&staging, entry)?;
 
-    // Atomic-ish promote: rename(staging, target). If `target` already
-    // exists by the time we get here (concurrent ensure call), the
-    // rename will fail; we fall back to overwriting.
-    if target_dir.exists() {
-        let _ = std::fs::remove_dir_all(&target_dir);
-    }
-    std::fs::rename(&staging, &target_dir).map_err(Error::from)?;
+        // Promote staging → target. Lock guarantees no concurrent
+        // promoter, so the `exists() + remove_dir_all` check is now
+        // race-free.
+        if target_dir.exists() {
+            let _ = std::fs::remove_dir_all(&target_dir);
+        }
+        std::fs::rename(&staging, &target_dir).map_err(Error::from)?;
 
-    advance_current(cache_root, &version)?;
-    Ok(CachedCdm::new(version, target_dir))
+        // Bundle promoted — the downloaded CRX3 is now redundant.
+        // Without this, every CDM upgrade leaks 5–7 MB into
+        // `<cache>/downloads/` indefinitely (`prune_in` skips that
+        // subdir except for this sweep).
+        let _ = std::fs::remove_file(&crx_path);
+
+        advance_current(cache_root, &version)?;
+        Ok(CachedCdm::new(version.clone(), target_dir.clone()))
+    })
 }
 
 /// Resolve the currently-active CDM via the `current` symlink, wrapped
@@ -367,6 +388,18 @@ pub fn prune_in(cache_root: &Path, keep: usize) -> Result<usize> {
                 if name.starts_with(".staging-") {
                     let _ = std::fs::remove_dir_all(&path);
                 }
+            }
+        }
+    }
+    // Sweep stale CRX3 archives left behind by earlier neon versions
+    // (pre-cleanup-on-success) under <cache_root>/downloads/. Each is
+    // ~5–7 MB and they accumulate per CDM upgrade.
+    let downloads_dir = cache_root.join("downloads");
+    if let Ok(entries) = std::fs::read_dir(&downloads_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("crx3") {
+                let _ = std::fs::remove_file(&path);
             }
         }
     }
@@ -701,6 +734,31 @@ mod tests {
         assert!(!staging.exists());
     }
 
+    /// `prune_in` sweeps stale `.crx3` archives from `downloads/`. They
+    /// pile up because old neon versions didn't remove the downloaded
+    /// CRX3 after extracting it. Each is ~5–7 MB and `list_versions`
+    /// explicitly skips the `downloads/` subdir, so without this sweep
+    /// the disk usage grows unbounded.
+    #[test]
+    fn prune_in_sweeps_stale_crx3_from_downloads() {
+        let tmp = TempDir::new().expect("tempdir");
+        let downloads = tmp.path().join("downloads");
+        fs::create_dir_all(&downloads).expect("mkdir downloads");
+        let stale = downloads.join("4.10.2891.0.crx3");
+        let stale2 = downloads.join("4.10.2934.0.crx3");
+        let unrelated = downloads.join("README.txt");
+        fs::write(&stale, b"old crx").unwrap();
+        fs::write(&stale2, b"old crx").unwrap();
+        fs::write(&unrelated, b"keep me").unwrap();
+        let _ = prune_in(tmp.path(), 3).expect("prune");
+        assert!(!stale.exists(), "stale crx3 must be removed");
+        assert!(!stale2.exists(), "stale crx3 must be removed");
+        assert!(
+            unrelated.exists(),
+            "non-crx3 files in downloads/ must be left alone"
+        );
+    }
+
     #[test]
     fn integrity_check_dir_passes_for_present_so() {
         let tmp = TempDir::new().expect("tempdir");
@@ -888,6 +946,27 @@ mod tests {
             }
         });
         format!("http://{local}/widevine.crx3")
+    }
+
+    /// The download-scoped lockfile must be created the first time
+    /// `ensure_cdm_for_with` takes its slow path. Two concurrent neon
+    /// processes (CLI + daemon, double-click installer) used to race
+    /// the staging→target rename and corrupt the cache; the lock
+    /// serializes them. Verify the lockfile is materialized as
+    /// evidence the gate fired.
+    #[test]
+    fn ensure_cdm_for_with_creates_download_lockfile() {
+        let crx = build_synthetic_crx3();
+        let url = spawn_crx_server(crx.clone());
+        let manifest = manifest_for_crx(&url, &crx, "4.10.7.1");
+
+        let tmp = TempDir::new().expect("tempdir");
+        let _ = ensure_cdm_for_with(&manifest, Platform::LinuxX86_64, tmp.path())
+            .expect("first download must succeed");
+        assert!(
+            tmp.path().join("download.lock").exists(),
+            "lockfile must exist after ensure_cdm_for_with promoted a version"
+        );
     }
 
     /// End-to-end: download → extract → cache promotion → integrity check.

@@ -476,13 +476,35 @@ pub fn remove_legacy_with(
     install: LegacyInstall,
     cdm_destination: &Path,
 ) -> Result<MigrationOutcome> {
+    remove_legacy_with_elevator(install, cdm_destination, &platform::run_as_root_script)
+}
+
+/// Same as [`remove_legacy_with`] but with the elevator function
+/// injected so tests can simulate user-cancelled sudo / pkexec dialogs.
+/// Pass 1's batched-script failure routes the corresponding paths to
+/// [`MigrationOutcome::skipped`] with the error reason — they are
+/// **not** falsely reported in [`MigrationOutcome::removed`].
+///
+/// # Errors
+///
+/// See [`remove_legacy`]. The elevator's error is not propagated as a
+/// hard error because Pass 2 (user-level ops) still has useful work to
+/// do; instead the elevated artifacts are reported as skipped.
+pub fn remove_legacy_with_elevator<E>(
+    install: LegacyInstall,
+    cdm_destination: &Path,
+    elevator: &E,
+) -> Result<MigrationOutcome>
+where
+    E: Fn(&str) -> Result<std::process::Output>,
+{
     let mut outcome = MigrationOutcome::default();
     let pkg_hint = legacy_package_uninstall_hint(install.package_manager, "neon-drm");
 
     // Pass 1: batch every elevation-required operation into a single
-    // shell script, then run that script under one `run_as_root_script`
-    // invocation. This turns N sudo/pkexec prompts into exactly one
-    // prompt regardless of how many legacy artifacts are present.
+    // shell script, then run that script under one elevation prompt.
+    // Turns N sudo/pkexec prompts into exactly one regardless of how
+    // many legacy artifacts are present.
     //
     // Failure of any individual sub-command inside the script is
     // tolerated (`|| true`) — best-effort cleanup that mirrors the
@@ -492,7 +514,15 @@ pub fn remove_legacy_with(
     // Package-managed artifacts are *not* removed in this pass — we
     // skip them with a pkg-manager-aware advisory so the user can
     // uninstall cleanly via their distro's tooling.
+    //
+    // We collect the paths Pass 1 *would* remove into a pending vec
+    // and only promote them to `outcome.removed` after the elevator
+    // returns success. If the elevator fails (e.g. user dismisses the
+    // sudo prompt), the paths are routed to `outcome.skipped` with the
+    // error reason so the caller can surface accurate state instead of
+    // falsely claiming the artifacts were removed.
     let mut root_script: Vec<String> = Vec::new();
+    let mut pending_removed: Vec<PathBuf> = Vec::new();
     let mut needs_systemd_reload = false;
     for art in &install.artifacts {
         if art.package_managed {
@@ -508,14 +538,14 @@ pub fn remove_legacy_with(
                 root_script.push(format!(
                     "launchctl unload -w {p} 2>/dev/null || true; rm -f {p}"
                 ));
-                outcome.removed.push(art.path.clone());
+                pending_removed.push(art.path.clone());
             }
             LegacyKind::LinuxSystemdPath => {
                 let p = sh_quote(&art.path)?;
                 root_script.push(format!(
                     "systemctl disable --now neon-fix-drm.path 2>/dev/null || true; rm -f {p}"
                 ));
-                outcome.removed.push(art.path.clone());
+                pending_removed.push(art.path.clone());
                 needs_systemd_reload = true;
             }
             LegacyKind::LinuxSystemdService => {
@@ -523,7 +553,7 @@ pub fn remove_legacy_with(
                 root_script.push(format!(
                     "systemctl disable --now neon-fix-drm.service 2>/dev/null || true; rm -f {p}"
                 ));
-                outcome.removed.push(art.path.clone());
+                pending_removed.push(art.path.clone());
                 needs_systemd_reload = true;
             }
             // Non-elevated kinds handled in Pass 2.
@@ -535,7 +565,18 @@ pub fn remove_legacy_with(
     }
     if !root_script.is_empty() {
         let script = root_script.join("\n");
-        let _ = platform::run_as_root_script(&script);
+        match elevator(&script) {
+            Ok(_) => outcome.removed.extend(pending_removed),
+            Err(e) => {
+                let reason = format!("elevated cleanup failed: {e}");
+                for path in pending_removed {
+                    outcome.skipped.push(SkipReason {
+                        path,
+                        reason: reason.clone(),
+                    });
+                }
+            }
+        }
     }
 
     // Pass 2: user-level operations (no elevation).
@@ -823,6 +864,56 @@ mod tests {
                 "no user-domain artifacts when home=None"
             );
         }
+    }
+
+    /// When the elevator fails (e.g. user cancels the sudo prompt),
+    /// elevated artifacts must land in `outcome.skipped` with a reason
+    /// — NOT in `outcome.removed` (which would falsely tell the user
+    /// the artifact had been cleaned up when it's still on disk).
+    #[test]
+    fn elevator_failure_routes_paths_to_skipped_not_removed() {
+        let tmp = TempDir::new().unwrap();
+        let roots = synthesize_full_legacy(tmp.path());
+        let install = detect_legacy_install_in(&roots);
+        let cdm_dest = tmp.path().join("v2-cache").join("widevine").join("legacy");
+        // Elevator always fails — simulates the user dismissing the
+        // sudo / pkexec / osascript prompt.
+        let elevator = |_script: &str| -> Result<std::process::Output> {
+            Err(crate::error::Error::permission_denied(
+                "user cancelled the prompt",
+            ))
+        };
+        let outcome =
+            remove_legacy_with_elevator(install, &cdm_dest, &elevator).expect("returns Ok");
+
+        // The elevated-only artifacts must NOT appear in `removed`.
+        assert!(
+            !outcome
+                .removed
+                .iter()
+                .any(|p| p.ends_with("Library/LaunchDaemons/com.neon.fix-drm.plist")),
+            "LaunchDaemon must not be reported as removed when elevator failed; \
+             removed={:?}",
+            outcome.removed
+        );
+        // They must appear in `skipped` with a reason that explains why.
+        let skipped_daemon = outcome.skipped.iter().find(|s| {
+            s.path
+                .ends_with("Library/LaunchDaemons/com.neon.fix-drm.plist")
+        });
+        assert!(
+            skipped_daemon.is_some(),
+            "LaunchDaemon must be in skipped; got skipped={:?}",
+            outcome.skipped
+        );
+        assert!(
+            skipped_daemon
+                .unwrap()
+                .reason
+                .contains("elevated cleanup failed"),
+            "skipped reason should mention the elevation failure; got {}",
+            skipped_daemon.unwrap().reason
+        );
     }
 
     /// `remove_legacy_with` removes all user artifacts cleanly when

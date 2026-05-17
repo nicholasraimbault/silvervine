@@ -86,8 +86,8 @@ pub(super) fn escalate_for_patch(target: &Path) -> Result<()> {
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(Error::permission_denied(format!(
-            "elevated patch failed (exit {:?}): {}",
-            output.status.code(),
+            "elevated patch failed ({}): {}",
+            super::format_exit_status(output.status),
             stderr.trim()
         )))
     }

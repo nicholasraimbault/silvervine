@@ -501,8 +501,8 @@ fn run_patch_via_escalation(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(Error::permission_denied(format!(
-            "elevated patch failed (exit {:?}) for {}: {}",
-            output.status.code(),
+            "elevated patch failed ({}) for {}: {}",
+            platform::format_exit_status(output.status),
             browser.install_path().display(),
             stderr.trim()
         )));

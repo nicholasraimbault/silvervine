@@ -270,6 +270,30 @@ pub fn is_running_as_root() -> bool {
     }
 }
 
+/// Format an [`ExitStatus`](std::process::ExitStatus) as a short
+/// human-readable string for error messages. Prefers the Unix exit
+/// code; falls back to a signal description when the child was killed
+/// (e.g. the user cancelled an `osascript` admin dialog, which the OS
+/// surfaces as a signal rather than an exit code).
+///
+/// Without this, format strings using `{:?}` on `status.code()` print
+/// `"None"` for signal-killed children, which is what issue-#30-style
+/// debugging needs to avoid.
+#[must_use]
+pub fn format_exit_status(status: std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return format!("killed by signal {sig}");
+        }
+    }
+    "terminated".to_string()
+}
+
 /// Construct a no-op [`Output`] used when `NEON_TEST_ESCALATE_NOOP=1`.
 fn noop_output() -> Output {
     use std::os::unix::process::ExitStatusExt;
@@ -362,6 +386,29 @@ mod tests {
     fn run_as_root_rejects_empty_command() {
         let r = run_as_root(&[]);
         assert!(r.is_err(), "empty command must error");
+    }
+
+    #[test]
+    fn format_exit_status_normal_exit() {
+        use std::os::unix::process::ExitStatusExt;
+        let s = std::process::ExitStatus::from_raw(0);
+        assert_eq!(format_exit_status(s), "exit 0");
+    }
+
+    #[test]
+    fn format_exit_status_nonzero_exit() {
+        use std::os::unix::process::ExitStatusExt;
+        // raw 256 = exit code 1 on Linux (status >> 8).
+        let s = std::process::ExitStatus::from_raw(256);
+        assert_eq!(format_exit_status(s), "exit 1");
+    }
+
+    #[test]
+    fn format_exit_status_signal_killed() {
+        use std::os::unix::process::ExitStatusExt;
+        // raw 9 = SIGKILL on both Linux and macOS (low 7 bits, no core).
+        let s = std::process::ExitStatus::from_raw(9);
+        assert_eq!(format_exit_status(s), "killed by signal 9");
     }
 
     /// Smoke test the path accessors — they must return non-empty paths
