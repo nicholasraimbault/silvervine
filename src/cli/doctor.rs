@@ -85,7 +85,7 @@ pub fn build_diagnostics(
             name: b.name().to_string(),
             install_path: b.install_path().display().to_string(),
             patched: b.is_patched(),
-            cdm_version: None,
+            cdm_version: b.installed_cdm_version(),
             last_patched_at: None,
         })
         .collect();
@@ -142,11 +142,47 @@ pub fn render_text(d: &Diagnostics, out: &mut dyn Write) -> std::io::Result<()> 
     } else {
         writeln!(out, "Browsers:")?;
         for b in &d.browsers {
-            let status = if b.patched { "patched" } else { "NOT patched" };
-            writeln!(out, "  {} — {} ({})", b.name, status, b.install_path)?;
+            write_browser_line(out, b, d.current_cdm_version.as_deref())?;
         }
     }
     Ok(())
+}
+
+/// Render one browser row inside the `Browsers:` block.
+///
+/// Format: `  {name} — {status}[, {detail}] ({install_path})`
+/// where detail is one of:
+///   * `CDM x.y.z` when patched and matching the cache;
+///   * `CDM x.y.z — out of date, cache has w.v.u; run "Patch Now"` when
+///     the on-disk CDM is older than what the cache holds;
+///   * nothing when the on-disk version can't be read.
+fn write_browser_line(
+    out: &mut dyn Write,
+    b: &crate::cli::status::BrowserStatus,
+    cached_cdm: Option<&str>,
+) -> std::io::Result<()> {
+    let status = if b.patched { "patched" } else { "NOT patched" };
+    match (b.patched, b.cdm_version.as_deref(), cached_cdm) {
+        (true, Some(on_disk), Some(cached)) if on_disk != cached => writeln!(
+            out,
+            "  {name} — {status} (CDM {on_disk} — out of date, \
+             cache has {cached}; run \"Patch Now\") ({path})",
+            name = b.name,
+            path = b.install_path,
+        ),
+        (true, Some(on_disk), _) => writeln!(
+            out,
+            "  {name} — {status} (CDM {on_disk}) ({path})",
+            name = b.name,
+            path = b.install_path,
+        ),
+        _ => writeln!(
+            out,
+            "  {name} — {status} ({path})",
+            name = b.name,
+            path = b.install_path,
+        ),
+    }
 }
 
 /// Build the `?body=<urlencoded>` string for a GitHub issue template.
@@ -458,6 +494,21 @@ mod tests {
         }
     }
 
+    /// Build a fake patched browser whose `WidevineCdm/manifest.json`
+    /// reports the given CDM version. Used to exercise the doctor's
+    /// version-freshness rendering.
+    fn fake_patched_browser(name: &str, tmp: &TempDir, cdm_version: &str) -> Browser {
+        let install = tmp.path().join(name);
+        let cdm = install.join("WidevineCdm");
+        std::fs::create_dir_all(&cdm).expect("mkdir cdm");
+        std::fs::write(
+            cdm.join("manifest.json"),
+            format!(r#"{{"version":"{cdm_version}"}}"#),
+        )
+        .expect("write manifest");
+        fake_browser(name, install)
+    }
+
     #[test]
     fn build_diagnostics_no_browsers_no_heartbeat() {
         let d = build_diagnostics(
@@ -552,6 +603,72 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("Helium"));
         assert!(s.contains("NOT patched"));
+    }
+
+    /// build_diagnostics must read the on-disk CDM version from each
+    /// patched browser's bundle so doctor can compare it to the cache.
+    #[test]
+    fn build_diagnostics_populates_installed_cdm_version() {
+        let tmp = TempDir::new().unwrap();
+        let detected = vec![fake_patched_browser("Helium", &tmp, "4.10.2891.0")];
+        let d = build_diagnostics(
+            &detected,
+            None,
+            Some("4.10.2934.0".into()),
+            false,
+            TrayAvailability::Available,
+            0,
+        );
+        assert_eq!(d.browsers[0].cdm_version.as_deref(), Some("4.10.2891.0"));
+    }
+
+    /// When the on-disk CDM matches the cache, doctor renders the version
+    /// inline but emits no out-of-date warning.
+    #[test]
+    fn render_text_shows_cdm_version_when_patched() {
+        let tmp = TempDir::new().unwrap();
+        let detected = vec![fake_patched_browser("Helium", &tmp, "4.10.2934.0")];
+        let d = build_diagnostics(
+            &detected,
+            None,
+            Some("4.10.2934.0".into()),
+            false,
+            TrayAvailability::Available,
+            0,
+        );
+        let mut buf = Vec::new();
+        render_text(&d, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("CDM 4.10.2934.0"), "expected version in: {s}");
+        assert!(
+            !s.to_lowercase().contains("out of date"),
+            "should not warn when fresh: {s}"
+        );
+    }
+
+    /// When the on-disk CDM is older than the cache, doctor flags it as
+    /// out-of-date and tells the user how to fix it.
+    #[test]
+    fn render_text_flags_stale_cdm() {
+        let tmp = TempDir::new().unwrap();
+        let detected = vec![fake_patched_browser("Helium", &tmp, "4.10.2891.0")];
+        let d = build_diagnostics(
+            &detected,
+            None,
+            Some("4.10.2934.0".into()),
+            false,
+            TrayAvailability::Available,
+            0,
+        );
+        let mut buf = Vec::new();
+        render_text(&d, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.to_lowercase().contains("out of date"),
+            "expected stale warning in: {s}"
+        );
+        assert!(s.contains("4.10.2891.0"), "expected on-disk version: {s}");
+        assert!(s.contains("4.10.2934.0"), "expected cache version: {s}");
     }
 
     #[test]

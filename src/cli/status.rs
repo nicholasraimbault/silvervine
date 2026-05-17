@@ -77,7 +77,7 @@ pub fn build_status(
             name: b.name().to_string(),
             install_path: b.install_path().display().to_string(),
             patched: b.is_patched(),
-            cdm_version: None,
+            cdm_version: b.installed_cdm_version(),
             last_patched_at: None,
         })
         .collect();
