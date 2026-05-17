@@ -271,6 +271,13 @@ pub fn patch_browser(
     patcher: &dyn PlatformPatcher,
     options: &PatchOptions,
 ) -> Result<PatchOutcome> {
+    // `--as-root` invocations are the privileged children of an escalation
+    // — the parent process holds the lockfile and is blocked waiting for
+    // this child to finish. Re-acquiring would deadlock both (issue #30).
+    // Skip the lockfile entirely; the parent's lock covers us.
+    if options.as_root {
+        return run_patch(browser, cdm, patcher, options);
+    }
     let lock = options
         .lock_path
         .clone()
@@ -279,6 +286,23 @@ pub fn patch_browser(
             Error::state_corrupted("cannot resolve patch lockfile path (no \\$HOME / cache dir)")
         })?;
     lockfile::with_lock(&lock, || run_patch(browser, cdm, patcher, options))
+}
+
+/// Decide whether `run_patch` must re-invoke itself under elevated
+/// privileges. Pure function so the truth-table is testable without
+/// touching geteuid or the filesystem.
+///
+/// Escalation is needed **only** when none of the privilege paths apply:
+///
+/// * `as_root` — already the elevated child of an escalation.
+/// * `running_as_root` — process started with euid 0 (e.g. `sudo neon`).
+///   Re-escalating in that case caused issue #30: a redundant osascript
+///   prompt followed by a deadlock against the parent's lockfile.
+/// * `target_writable` — the install path is writable by the current
+///   process anyway, so no elevation is needed.
+#[must_use]
+pub fn decide_escalate(as_root: bool, running_as_root: bool, target_writable: bool) -> bool {
+    !as_root && !running_as_root && !target_writable
 }
 
 /// Inner patch flow, run while the lockfile is held.
@@ -316,7 +340,11 @@ fn run_patch(
     // If no AND we're not already running as root, hand off to a
     // `pkexec` / `sudo` / `osascript`-elevated child invocation that
     // re-enters this code with `as_root = true` set.
-    if !options.as_root && !target_writable(browser.install_path()) {
+    if decide_escalate(
+        options.as_root,
+        platform::is_running_as_root(),
+        target_writable(browser.install_path()),
+    ) {
         return run_patch_via_escalation(browser, cdm, patcher, options, started, version_before);
     }
 
@@ -834,6 +862,61 @@ mod tests {
             fs::read(install.join("original.txt")).expect("read"),
             b"keep me"
         );
+    }
+
+    /// Truth-table pin for [`decide_escalate`]. Escalation is needed
+    /// **only** when the caller is not already privileged in any form AND
+    /// the install path is not writable.
+    #[test]
+    fn decide_escalate_truth_table() {
+        // (as_root, running_as_root, target_writable) → expected
+        let cases = [
+            ((false, false, false), true),
+            ((false, false, true), false),
+            ((false, true, false), false), // sudo neon: don't re-prompt
+            ((false, true, true), false),
+            ((true, false, false), false), // --as-root child: never recurse
+            ((true, false, true), false),
+            ((true, true, false), false),
+            ((true, true, true), false),
+        ];
+        for ((as_root, running, writable), expected) in cases {
+            assert_eq!(
+                decide_escalate(as_root, running, writable),
+                expected,
+                "decide_escalate({as_root}, {running}, {writable}) expected {expected}"
+            );
+        }
+    }
+
+    /// `patch_browser` with `as_root = true` must not touch the lockfile
+    /// path — it's the privileged child of an escalation that already
+    /// holds the lock (or running standalone under sudo). Re-acquiring
+    /// would deadlock against the parent (see issue #30).
+    ///
+    /// We verify by passing a `lock_path` that would fail to open
+    /// (parent is a regular file). If the function honors `as_root` and
+    /// skips the lock, the call succeeds without ever touching the path.
+    #[test]
+    fn as_root_skips_lockfile_acquisition() {
+        let tmp = TempDir::new().expect("tempdir");
+        let blocker = tmp.path().join("not-a-dir");
+        fs::write(&blocker, b"x").expect("write blocker");
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).expect("mkdir");
+        let browser = make_browser(install);
+        let cache_root = tmp.path().join("widevine");
+        let cdm = make_cached_cdm(&cache_root, "4.10.0.0");
+        let opts = PatchOptions {
+            force_while_running: true,
+            dry_run: false,
+            lock_path: Some(blocker.join("inside.lock")),
+            backups_dir: Some(tmp.path().join("backups")),
+            as_root: true,
+        };
+        let out =
+            patch_browser(&browser, &cdm, &MockPatcher::default(), &opts).expect("must succeed");
+        assert_eq!(out.cdm_version, "4.10.0.0");
     }
 
     #[test]

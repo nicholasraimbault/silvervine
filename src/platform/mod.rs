@@ -249,6 +249,27 @@ pub fn atomic_rename(src: &std::path::Path, dst: &std::path::Path) -> Result<()>
     imp::atomic_rename(src, dst)
 }
 
+/// Whether the current process is already running with effective UID 0
+/// (e.g. invoked under `sudo`). Used by [`crate::patch`] to short-circuit
+/// the re-escalation decision — escalating again would spawn an osascript
+/// / pkexec dialog redundantly, and on macOS the child blocks indefinitely
+/// on the parent's lockfile (issue #30).
+///
+/// Returns `false` on non-Unix platforms (no concept of euid).
+#[must_use]
+pub fn is_running_as_root() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid` is a thread-safe POSIX syscall with no
+        // arguments; it never fails per its spec.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 /// Construct a no-op [`Output`] used when `NEON_TEST_ESCALATE_NOOP=1`.
 fn noop_output() -> Output {
     use std::os::unix::process::ExitStatusExt;
