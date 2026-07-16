@@ -1,6 +1,0 @@
-#!/bin/bash
-set -e
-
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl disable --now neon-fix-drm.path 2>/dev/null || true
-fi

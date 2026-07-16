@@ -1,4 +1,4 @@
-//! `neon repair` — composition: uninstall (preserving config) + setup.
+//! `silvervine repair` — composition: uninstall (preserving config) + setup.
 //!
 //! Useful when state goes weird: the daemon won't start, the CDM cache
 //! is corrupt, or the patch state file says one thing while the
@@ -11,7 +11,7 @@ use std::io::Write;
 use crate::cli::{setup, uninstall, OutputOptions};
 use crate::error::{Error, Result};
 
-/// Args for `neon repair`.
+/// Args for `silvervine repair`.
 #[derive(Debug, Clone, Default)]
 pub struct Args {
     /// Output flags.
@@ -28,13 +28,13 @@ pub fn run(args: &Args) -> Result<()> {
     let mut handle = stdout.lock();
     writeln!(
         handle,
-        "neon repair: removing existing install + reinstalling…"
+        "silvervine repair: removing existing install + reinstalling…"
     )
     .map_err(Error::from)?;
 
     let cache_root = dirs::cache_dir()
         .ok_or_else(|| Error::other("cannot resolve ~/.cache directory"))?
-        .join("neon");
+        .join("silvervine");
     let config_path = crate::config::default_config_path()
         .ok_or_else(|| Error::other("cannot resolve config path"))?;
 

@@ -1,11 +1,11 @@
-//! `neon manpage` — emit a roff-formatted man page to stdout.
+//! `silvervine manpage` — emit a roff-formatted man page to stdout.
 //!
 //! Uses `clap_mangen` to render the binary's clap definition into
 //! `groff_man(7)`-style roff. Users redirect into the appropriate
 //! man directory:
 //!
 //! ```sh
-//! neon manpage > /usr/local/share/man/man1/neon.1
+//! silvervine manpage > /usr/local/share/man/man1/silvervine.1
 //! ```
 //!
 //! Or, more commonly, the package builder pipes the output during
@@ -47,7 +47,11 @@ mod tests {
     use clap::CommandFactory;
 
     #[derive(Debug, clap::Parser)]
-    #[command(name = "neon-test", version, about = "Test binary for manpage tests")]
+    #[command(
+        name = "silvervine-test",
+        version,
+        about = "Test binary for manpage tests"
+    )]
     struct TestCli {
         #[command(subcommand)]
         cmd: TestCommand,
@@ -67,7 +71,7 @@ mod tests {
         assert!(!s.is_empty());
         // roff man pages begin with `.TH`.
         assert!(s.starts_with(".ie") || s.contains(".TH"), "got: {s:?}");
-        assert!(s.to_uppercase().contains("NEON-TEST"));
+        assert!(s.to_uppercase().contains("SILVERVINE-TEST"));
     }
 
     #[test]

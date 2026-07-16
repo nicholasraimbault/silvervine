@@ -18,7 +18,7 @@
 //! │ ──────────────────               │
 //! │ ☐ Launch at Login                │  toggle → emits TrayCommand::ToggleLaunchAtLogin
 //! │ ──────────────────               │
-//! │ Quit Neon                        │  click → emits TrayCommand::Quit
+//! │ Quit Silvervine                        │  click → emits TrayCommand::Quit
 //! └──────────────────────────────────┘
 //! ```
 //!
@@ -51,7 +51,7 @@
 #![allow(clippy::missing_panics_doc)]
 
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -65,7 +65,7 @@ use crate::error::{Error, Result};
 /// no GTK / libappindicator runtime required). On macOS the Cocoa
 /// backend is always present.
 ///
-/// Used by `neon doctor` to surface the silent-fallback condition that
+/// Used by `silvervine doctor` to surface the silent-fallback condition that
 /// the daemon hits when the user's compositor doesn't expose a tray —
 /// without this, a casual user has to grep journalctl to discover that
 /// their tray is disabled.
@@ -82,7 +82,7 @@ pub enum TrayAvailability {
 
 /// Probe whether the platform tray backend is usable.
 ///
-/// Intended for diagnostics surfaces (`neon doctor`). Cheap enough to
+/// Intended for diagnostics surfaces (`silvervine doctor`). Cheap enough to
 /// call on every doctor invocation — opens a session D-Bus connection
 /// and immediately drops it.
 ///
@@ -131,7 +131,7 @@ pub enum TrayCommand {
     UpdateWidevine,
     /// User toggled "Launch at Login" — the boolean is the desired state.
     ToggleLaunchAtLogin(bool),
-    /// User clicked "Quit Neon".
+    /// User clicked "Quit Silvervine".
     Quit,
 }
 
@@ -270,7 +270,7 @@ pub fn menu_layout(state: &MenuState) -> Vec<MenuItemSpec> {
     out.push(MenuItemSpec::Separator);
     // 5. Quit.
     out.push(MenuItemSpec::Action {
-        label: "Quit Neon".into(),
+        label: "Quit Silvervine".into(),
         command: TrayCommand::Quit,
     });
     out
@@ -304,7 +304,7 @@ pub struct Tray {
 struct TrayInner {
     /// Spawn handle from `ksni`. Dropping the handle (when [`Tray`]
     /// drops) shuts the `StatusNotifierItem` service down cleanly.
-    handle: ksni::blocking::Handle<NeonKsniTray>,
+    handle: ksni::blocking::Handle<SilvervineKsniTray>,
 }
 #[cfg(target_os = "macos")]
 struct TrayInner {
@@ -329,7 +329,7 @@ struct TrayInner {
 /// daemon-side `MenuState` and pushes the new state into this struct
 /// so `menu()` re-renders with the latest layout.
 #[cfg(target_os = "linux")]
-struct NeonKsniTray {
+struct SilvervineKsniTray {
     /// Latest menu-state snapshot. Read by [`ksni::Tray::menu`] every
     /// time the SNI client requests the current menu.
     state: MenuState,
@@ -340,9 +340,9 @@ struct NeonKsniTray {
 }
 
 #[cfg(target_os = "linux")]
-impl ksni::Tray for NeonKsniTray {
+impl ksni::Tray for SilvervineKsniTray {
     fn id(&self) -> String {
-        "neon".into()
+        "silvervine".into()
     }
 
     fn icon_name(&self) -> String {
@@ -355,27 +355,27 @@ impl ksni::Tray for NeonKsniTray {
         // the pixmap.
         //
         // A future polish step can install our PNG into the user's
-        // icon theme (`~/.local/share/icons/hicolor/22x22/apps/neon.png`)
-        // during `neon setup`, then return "neon" here so name-based
+        // icon theme (`~/.local/share/icons/hicolor/22x22/apps/silvervine.png`)
+        // during `silvervine setup`, then return "silvervine" here so name-based
         // lookup is also viable. Until then, pixmap is the source of
         // truth.
         String::new()
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        neon_tray_icon_pixmap()
+        silvervine_tray_icon_pixmap()
     }
 
     fn title(&self) -> String {
-        "Neon".into()
+        "Silvervine".into()
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
         ksni::ToolTip {
-            title: "Neon — Widevine helper".into(),
+            title: "Silvervine — Widevine helper".into(),
             description: String::new(),
             icon_name: String::new(),
-            icon_pixmap: neon_tray_icon_pixmap(),
+            icon_pixmap: silvervine_tray_icon_pixmap(),
         }
     }
 
@@ -392,7 +392,7 @@ impl ksni::Tray for NeonKsniTray {
 fn ksni_menu_from_specs(
     specs: &[MenuItemSpec],
     tx: &Sender<TrayCommand>,
-) -> Vec<ksni::MenuItem<NeonKsniTray>> {
+) -> Vec<ksni::MenuItem<SilvervineKsniTray>> {
     use ksni::menu::{CheckmarkItem, StandardItem};
     use ksni::MenuItem as M;
 
@@ -410,7 +410,7 @@ fn ksni_menu_from_specs(
                 let tx = tx.clone();
                 StandardItem {
                     label: spec.label(),
-                    activate: Box::new(move |_: &mut NeonKsniTray| {
+                    activate: Box::new(move |_: &mut SilvervineKsniTray| {
                         let _ = tx.send(cmd.clone());
                     }),
                     ..Default::default()
@@ -451,73 +451,64 @@ fn ksni_menu_from_specs(
         .collect()
 }
 
-/// Decode the embedded `linux-app/neon.png` into the ARGB32
-/// premultiplied-alpha format that ksni's `Icon` expects. Returns an
-/// empty vec on decode failure — ksni then falls back to the
-/// `icon_name` lookup, which is what we want.
-///
-/// PNG bytes give us RGBA8 in row-major order; ksni wants ARGB32 in
-/// network byte order with premultiplied alpha. The transform is
-/// per-pixel: reorder R,G,B,A → A,R,G,B and multiply each color
-/// channel by alpha/255 so half-transparent pixels don't render with
-/// halos against dark/light tray backgrounds.
+const TRAY_PNG_BYTES: &[u8] = include_bytes!("../../assets/silvervine.png");
+static DECODED_TRAY_ICON: OnceLock<Option<DecodedTrayIcon>> = OnceLock::new();
+
+#[derive(Debug)]
+struct DecodedTrayIcon {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
+fn decode_tray_png(bytes: &[u8]) -> Option<DecodedTrayIcon> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info().ok()?;
+    let mut rgba = vec![0u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut rgba).ok()?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    rgba.truncate(info.buffer_size());
+    Some(DecodedTrayIcon {
+        width: info.width,
+        height: info.height,
+        rgba,
+    })
+}
+
+fn decoded_tray_icon() -> Option<&'static DecodedTrayIcon> {
+    DECODED_TRAY_ICON
+        .get_or_init(|| decode_tray_png(TRAY_PNG_BYTES))
+        .as_ref()
+}
+
+/// Convert the once-decoded RGBA icon into ksni's premultiplied ARGB32.
 #[cfg(target_os = "linux")]
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
-    reason = "ARGB32 byte math: products fit u8 by construction (premultiply ≤255), and 22×22 icon dimensions fit i32 trivially"
+    reason = "ARGB32 byte math fits u8 and bundled icon dimensions fit i32"
 )]
-fn neon_tray_icon_pixmap() -> Vec<ksni::Icon> {
-    /// Embedded PNG — 22×22 RGBA, the same icon the V0 Linux app
-    /// shipped. Ships as part of the binary; no install step.
-    const PNG_BYTES: &[u8] = include_bytes!("../../linux-app/neon.png");
-
-    // png 0.18 tightened `Decoder::new` to require `Read + Seek`; the bare
-    // `&[u8]` slice is `Read` only. Wrap in a Cursor to add Seek.
-    let decoder = png::Decoder::new(std::io::Cursor::new(PNG_BYTES));
-    let Ok(mut reader) = decoder.read_info() else {
+fn silvervine_tray_icon_pixmap() -> Vec<ksni::Icon> {
+    let Some(icon) = decoded_tray_icon() else {
         return vec![];
     };
-    let info = reader.info().clone();
-    // png 0.18: `output_buffer_size()` now returns `Option<usize>` (it's
-    // `None` if the decoded size would overflow usize). For our 22×22
-    // bundled icon this is always `Some(_)`; bail safely if it isn't.
-    let Some(buf_size) = reader.output_buffer_size() else {
-        return vec![];
-    };
-    let mut rgba = vec![0u8; buf_size];
-    if reader.next_frame(&mut rgba).is_err() {
-        return vec![];
-    }
-
-    // PNG decoder honors the file's color type — for our 22×22 RGBA
-    // PNG this is Rgba8 (4 bytes/pixel). If the input ever changes to
-    // RGB / palette / grayscale, we'd silently render wrong, so reject
-    // anything unexpected.
-    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
-        return vec![];
-    }
-
-    let pixel_count = (info.width * info.height) as usize;
-    let mut argb = vec![0u8; pixel_count * 4];
-    for (i, src) in rgba.chunks_exact(4).enumerate() {
+    let mut argb = vec![0u8; icon.rgba.len()];
+    for (i, src) in icon.rgba.chunks_exact(4).enumerate() {
         let r = u16::from(src[0]);
         let g = u16::from(src[1]);
         let b = u16::from(src[2]);
         let a = u16::from(src[3]);
-        // Premultiply with rounding (a * channel + 127) / 255 ≈
-        // a*channel/255 with half-up. Avoids the 0/255 edge banding
-        // that floor-division produces for fully-opaque pixels.
         let dst = i * 4;
         argb[dst] = src[3];
         argb[dst + 1] = ((r * a + 127) / 255) as u8;
         argb[dst + 2] = ((g * a + 127) / 255) as u8;
         argb[dst + 3] = ((b * a + 127) / 255) as u8;
     }
-
     vec![ksni::Icon {
-        width: info.width as i32,
-        height: info.height as i32,
+        width: icon.width as i32,
+        height: icon.height as i32,
         data: argb,
     }]
 }
@@ -549,7 +540,7 @@ impl Tray {
         #[cfg(target_os = "linux")]
         let inner = {
             use ksni::blocking::TrayMethods;
-            let tray_impl = NeonKsniTray {
+            let tray_impl = SilvervineKsniTray {
                 state: initial_state.clone(),
                 tx: tx.clone(),
             };
@@ -616,7 +607,7 @@ impl Tray {
             // that's a transient condition we don't need to log here
             // because the daemon's main loop already handles channel
             // disconnection on the receiver side.
-            let _ = inner.handle.update(|tray: &mut NeonKsniTray| {
+            let _ = inner.handle.update(|tray: &mut SilvervineKsniTray| {
                 tray.state = state;
             });
         }
@@ -713,16 +704,16 @@ fn route_item_into(
 fn menu_item_id(index: usize, item: &MenuItemSpec) -> String {
     match item {
         MenuItemSpec::BrowserStatus { browser_name, .. } => {
-            format!("neon-browser-{index}-{browser_name}")
+            format!("silvervine-browser-{index}-{browser_name}")
         }
-        MenuItemSpec::Action { label, .. } => format!("neon-action-{index}-{label}"),
-        MenuItemSpec::Toggle { label, .. } => format!("neon-toggle-{index}-{label}"),
-        MenuItemSpec::Separator => format!("neon-sep-{index}"),
+        MenuItemSpec::Action { label, .. } => format!("silvervine-action-{index}-{label}"),
+        MenuItemSpec::Toggle { label, .. } => format!("silvervine-toggle-{index}-{label}"),
+        MenuItemSpec::Separator => format!("silvervine-sep-{index}"),
     }
 }
 
 /// Construct the live tray icon (macOS only — Linux uses `ksni`
-/// directly via [`NeonKsniTray`]).
+/// directly via [`SilvervineKsniTray`]).
 ///
 /// This is the only function in this module that touches the macOS
 /// `tray-icon` GUI handle — guarded by a `Result` so callers can
@@ -771,10 +762,27 @@ fn build_tray_icon(
 
     let _ = tx; // reserved for future tray click handlers
 
-    let tray = TrayIconBuilder::new()
-        .with_tooltip("Neon — Widevine helper")
-        .with_menu(Box::new(menu))
-        .build()?;
+    let mut builder = TrayIconBuilder::new()
+        .with_tooltip("Silvervine — Widevine helper")
+        .with_menu(Box::new(menu));
+    if let Some(decoded) = decoded_tray_icon() {
+        match tray_icon::Icon::from_rgba(decoded.rgba.clone(), decoded.width, decoded.height) {
+            Ok(icon) => {
+                builder = builder.with_icon(icon).with_icon_as_template(true);
+            }
+            Err(error) => tracing::warn!(
+                target: "silvervine::daemon::tray",
+                error = %error,
+                "could not construct macOS tray icon; continuing without an icon"
+            ),
+        }
+    } else {
+        tracing::warn!(
+            target: "silvervine::daemon::tray",
+            "could not decode embedded tray icon; continuing without an icon"
+        );
+    }
+    let tray = builder.build()?;
     Ok(TrayInner {
         _tray: tray,
         _routes: routes.clone(),
@@ -788,6 +796,18 @@ mod tests {
 
     use crate::browsers::BrowserKind;
 
+    #[test]
+    fn embedded_tray_icon_is_rgba8_with_expected_dimensions() {
+        let icon = decode_tray_png(TRAY_PNG_BYTES).expect("embedded PNG must decode as RGBA8");
+        assert_eq!((icon.width, icon.height), (22, 22));
+        assert_eq!(icon.rgba.len(), 22 * 22 * 4);
+    }
+
+    #[test]
+    fn decoder_rejects_invalid_png() {
+        assert!(decode_tray_png(b"not a PNG").is_none());
+    }
+
     /// Embedded tray icon decodes to a non-empty 22×22 ARGB32 buffer.
     /// Catches silent decode failures (PNG format mismatch, premultiply
     /// math drift) that would otherwise only surface as a checkerboard
@@ -798,8 +818,8 @@ mod tests {
         clippy::cast_sign_loss,
         reason = "ksni::Icon width/height are i32 but always positive for our 22×22 icon"
     )]
-    fn neon_tray_icon_pixmap_decodes_to_nonempty_argb_buffer() {
-        let icons = neon_tray_icon_pixmap();
+    fn silvervine_tray_icon_pixmap_decodes_to_nonempty_argb_buffer() {
+        let icons = silvervine_tray_icon_pixmap();
         assert_eq!(icons.len(), 1, "expected exactly one icon size");
         let icon = &icons[0];
         assert_eq!(icon.width, 22);
@@ -809,15 +829,15 @@ mod tests {
             (icon.width * icon.height * 4) as usize,
             "buffer length must equal width * height * 4 (ARGB32)"
         );
-        // The reference PNG has 104 visible pixels (alpha > 0). After
+        // The Silver sprig PNG has 134 visible pixels (alpha > 0). After
         // ARGB conversion every visible pixel has a non-zero alpha
         // byte at position 0 mod 4. Asserting on the *count* of
         // non-zero alpha bytes locks the conversion math against
         // future regressions.
         let alpha_bytes_set = icon.data.iter().step_by(4).filter(|&&b| b > 0).count();
         assert_eq!(
-            alpha_bytes_set, 104,
-            "expected 104 visible pixels (matches reference PNG)"
+            alpha_bytes_set, 134,
+            "expected 134 visible pixels (matches Silver sprig PNG)"
         );
     }
 

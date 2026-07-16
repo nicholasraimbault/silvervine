@@ -32,7 +32,7 @@ use super::PlatformPaths;
 ///
 /// XDG-compliant: cache and config dirs come from `dirs::cache_dir()` /
 /// `dirs::config_dir()` (which honor `$XDG_CACHE_HOME` / `$XDG_CONFIG_HOME`
-/// when set) with a `neon` suffix appended. Applications dirs are the
+/// when set) with a `silvervine` suffix appended. Applications dirs are the
 /// canonical Linux Chromium-family install locations.
 pub struct LinuxPaths;
 
@@ -40,13 +40,13 @@ impl PlatformPaths for LinuxPaths {
     fn cache_dir() -> PathBuf {
         dirs::cache_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("neon")
+            .join("silvervine")
     }
 
     fn config_dir() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("neon")
+            .join("silvervine")
     }
 
     fn applications_dirs() -> Vec<PathBuf> {
@@ -67,38 +67,6 @@ pub(super) fn config_dir() -> PathBuf {
 }
 pub(super) fn applications_dirs() -> Vec<PathBuf> {
     LinuxPaths::applications_dirs()
-}
-
-/// Re-invoke the current Neon binary with elevated privileges via
-/// `pkexec` (preferred) or `sudo` (fallback) so that the elevated child
-/// can patch `target`.
-///
-/// The current executable is resolved via `std::env::current_exe()`; we
-/// pass `--as-root patch <target>` as arguments. The `--as-root` flag
-/// is reserved by the CLI team for "this is the elevated branch of a
-/// previous CLI invocation." The patch subcommand will inspect the flag
-/// and write to `target` directly.
-pub(super) fn escalate_for_patch(target: &Path) -> Result<()> {
-    let exe = std::env::current_exe()
-        .map_err(|e| Error::other("could not resolve current executable").with_source(e))?;
-    let exe_str = exe
-        .to_str()
-        .ok_or_else(|| Error::other("current executable path is not valid UTF-8"))?;
-    let target_str = target
-        .to_str()
-        .ok_or_else(|| Error::other("target path is not valid UTF-8"))?;
-    let cmd: &[&str] = &[exe_str, "--as-root", "patch", target_str];
-    let output = run_as_root(cmd)?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(Error::permission_denied(format!(
-            "elevated patch failed (exit {:?}): {}",
-            output.status.code(),
-            stderr.trim()
-        )))
-    }
 }
 
 /// Run `command` under `pkexec` (preferred) or `sudo` (fallback) and
@@ -260,11 +228,11 @@ fn io_invalid(e: std::ffi::NulError) -> std::io::Error {
 /// move `src` into place, then remove the saved `dst`.
 ///
 /// This is atomic in the common case (a `kill -9` between steps 2 and 3
-/// leaves `dst` correctly populated and `dst.neon-tmp` as orphan to
+/// leaves `dst` correctly populated and `dst.silvervine-tmp` as orphan to
 /// clean up). It's not crash-safe in the strict sense — a power loss
 /// between step 1 and step 2 leaves `dst` missing.
 fn fallback_two_step_rename(src: &Path, dst: &Path) -> Result<()> {
-    let backup = dst.with_extension("neon-tmp");
+    let backup = dst.with_extension("silvervine-tmp");
     std::fs::rename(dst, &backup).map_err(|e| {
         Error::from(e).message_or(format!(
             "fallback rename: could not move {} aside",
@@ -323,13 +291,13 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn cache_dir_ends_with_neon() {
-        assert!(LinuxPaths::cache_dir().ends_with("neon"));
+    fn cache_dir_ends_with_silvervine() {
+        assert!(LinuxPaths::cache_dir().ends_with("silvervine"));
     }
 
     #[test]
-    fn config_dir_ends_with_neon() {
-        assert!(LinuxPaths::config_dir().ends_with("neon"));
+    fn config_dir_ends_with_silvervine() {
+        assert!(LinuxPaths::config_dir().ends_with("silvervine"));
     }
 
     #[test]
@@ -508,19 +476,6 @@ mod tests {
         assert!(err.message.contains("atomic_rename"));
         assert!(err.message.contains("/x"));
         assert!(err.message.contains("/y"));
-    }
-
-    /// `escalate_for_patch` returns `Ok(())` when `NEON_TEST_ESCALATE_NOOP`
-    /// short-circuits. The public entry point in `mod.rs` already
-    /// covers this; we additionally exercise the inner path so coverage
-    /// includes the line where the platform-specific impl is reached.
-    #[test]
-    fn escalate_for_patch_returns_ok_under_noop() {
-        // SAFETY: env mutation in serial test; restored at end.
-        unsafe { std::env::set_var("NEON_TEST_ESCALATE_NOOP", "1") };
-        let r = crate::platform::escalate_for_patch(std::path::Path::new("/opt/whatever"));
-        assert!(r.is_ok());
-        unsafe { std::env::remove_var("NEON_TEST_ESCALATE_NOOP") };
     }
 
     /// `io_invalid` constructs an InvalidInput-kind io error from a

@@ -183,7 +183,7 @@ impl Watcher {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        target: "neon::watcher",
+                        target: "silvervine::watcher",
                         error = %e,
                         "fs watcher delivered error event"
                     );
@@ -201,7 +201,7 @@ impl Watcher {
         let event_tx_for_tick = event_tx.clone();
 
         let dispatch_thread = std::thread::Builder::new()
-            .name("neon-watcher".to_string())
+            .name("silvervine-watcher".to_string())
             .spawn(move || {
                 run_dispatch(
                     event_rx,
@@ -380,7 +380,7 @@ fn run_dispatch(
     // `event_rx.recv` without polling.
     let tick_stop = Arc::clone(&stop);
     let tick_handle = std::thread::Builder::new()
-        .name("neon-watcher-tick".to_string())
+        .name("silvervine-watcher-tick".to_string())
         .spawn(move || loop {
             if tick_stop.load(Ordering::SeqCst) {
                 return;
@@ -469,7 +469,7 @@ fn handle_tick(
             };
             if is_running(&browser) {
                 tracing::info!(
-                    target: "neon::watcher",
+                    target: "silvervine::watcher",
                     browser = %browser.name(),
                     "debounce window elapsed but browser is running; deferring until quit"
                 );
@@ -518,7 +518,7 @@ fn handle_tick(
                 // indefinitely-deferred state.
                 let entry = state.deferred.remove(&install);
                 tracing::warn!(
-                    target: "neon::watcher",
+                    target: "silvervine::watcher",
                     install = %install.display(),
                     deferred_for_s = ?entry.map(|e| e.first_seen.elapsed()),
                     "giving up on deferred state and firing anyway"

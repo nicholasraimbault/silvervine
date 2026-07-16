@@ -1,174 +1,108 @@
-# Migrating from Neon V1 to V2
+# Migrating from Neon to Silvervine
 
-V2 is a single-binary Rust rewrite of the V1 bash + Swift + Go implementation. The on-disk layout, daemon model, and CLI surface have all changed. `neon setup` (and its interactive sibling `neon init`) detects most legacy installs and cleans them up automatically; this document covers the per-install-path details and the manual steps that can't be automated.
+Silvervine 2.0 is the renamed Rust successor to Neon. It preserves migration support for both the original Neon V1 Bash/Swift/Go distributions and Neon V2 release candidates. New commands, paths, registrations, and package names use `silvervine`.
 
-If you've never installed V1, skip this doc — go straight to the [README install instructions](README.md#install).
+If you have never installed Neon, follow the [Silvervine install instructions](README.md#install).
 
-## What `neon setup` migrates automatically
+## Install Silvervine
 
-The migration logic lives in `src/migration.rs`. On first invocation, `neon setup` calls `migration::detect_legacy_install`, which scans for these legacy artifacts:
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/nicholasraimbault/silvervine/releases/latest/download/silvervine-installer.sh | sh
+silvervine setup
+```
 
-| Legacy artifact | Source install path | Action |
+## Neon V2 data migration
+
+Before logging initializes, every Silvervine invocation checks for Neon V2 user data. When the Silvervine destination is absent, the directory is atomically renamed:
+
+| Neon V2 source | Silvervine destination |
+|---|---|
+| `~/.config/neon/` | `~/.config/silvervine/` |
+| `~/.cache/neon/` | `~/.cache/silvervine/` |
+| `~/Library/Application Support/neon/` | `~/Library/Application Support/silvervine/` |
+| `~/Library/Caches/neon/` | `~/Library/Caches/silvervine/` |
+| `~/Library/Logs/neon/` | `~/Library/Logs/silvervine/` |
+
+The cache move includes tracing logs stored under `logs/`. If the source is absent, the check is an idempotent no-op. If both source and destination exist, Silvervine preserves both and reports the conflict; it never merges, deletes, or overwrites either directory.
+
+A hook path explicitly stored under the old Neon config root resolves to the corresponding migrated Silvervine config root when the old path no longer exists. An existing explicit Neon hook path remains authoritative.
+
+When a prior Neon V2 user daemon is registered, startup performs a locked transition: it records whether Neon is running, stops it, migrates the data, starts Silvervine, and only then retires the retained Neon registration. If retirement fails, Silvervine is stopped and unregistered before the data is moved back, and Neon is restarted only when it was running before the transition.
+
+- Linux: `silvervine.service` is enabled and started before the retained `neon.service` user unit is disabled and removed.
+- macOS: `com.nicholasraimbault.silvervine.tray` is bootstrapped before the retained `com.neon.tray` / `com.neon.tray.plist` registration is removed.
+
+These are distinct from the root-level Neon V1 registrations described below.
+
+## Neon V1 migration
+
+`silvervine setup` runs the existing V1 detector and cleanup. The following names are deliberately retained because they identify files installed by Neon V1:
+
+| Legacy Neon artifact | Source distribution | Action |
 |---|---|---|
-| `/Library/LaunchDaemons/com.neon.fix-drm.plist` | V1 macOS bash + V1 Homebrew | unload + remove (requires sudo — V2 prompts once) |
-| `~/Library/LaunchAgents/com.neon.app.plist` | V1 Mac DMG menu-bar app | unload + remove (no sudo) |
-| `/etc/systemd/system/neon-fix-drm.{path,service}` | V1 Linux raw `install.sh` | disable + remove (sudo) |
-| `/usr/lib/systemd/system/neon-fix-drm.{path,service}` | V1 Linux AUR / RPM package | skipped; advisory to run the host package manager's uninstall command (see below) |
-| `/lib/systemd/system/neon-fix-drm.{path,service}` | V1 Linux Debian (pre-merged-usr) | skipped; advisory to run `dpkg -r neon-drm` |
-| `~/.config/autostart/neon.desktop` | V1 Linux tray app | remove (no sudo) |
-| `~/.local/share/WidevineCdm/<version>/` | All Linux V1 paths | migrate to `~/.cache/neon/widevine/<version>/` (no sudo) |
-| `/usr/lib/neon/` | V1 Linux packaged install (AUR / .deb / .rpm) | skipped; advisory to use the host package manager (see below) |
+| `/Library/LaunchDaemons/com.neon.fix-drm.plist` | macOS Bash / Homebrew V1 | unload and remove with elevation |
+| `~/Library/LaunchAgents/com.neon.app.plist` | Neon V1 macOS app | unload and remove as the user |
+| `/etc/systemd/system/neon-fix-drm.{path,service}` | Linux `install.sh` | disable and remove with elevation |
+| `/usr/lib/systemd/system/neon-fix-drm.{path,service}` | AUR / RPM | preserve; show package-manager uninstall hint |
+| `/lib/systemd/system/neon-fix-drm.{path,service}` | Debian / pre-merged-usr | preserve; show package-manager uninstall hint |
+| `~/.config/autostart/neon.desktop` | Neon V1 Linux tray | remove as the user |
+| `~/.local/share/WidevineCdm/` | Neon V1 Linux cache | migrate to the Silvervine Widevine cache |
+| `/usr/lib/neon/` | Neon V1 package | preserve; show package-manager uninstall hint |
 
-Detection deduplicates paths by canonical inode, so merged-usr layouts (Arch, Fedora 27+, where `/lib → /usr/lib`) report each on-disk unit once, not twice.
+Package-managed paths are never deleted behind the package manager's back. Silvervine detects the distro and suggests the legacy Neon package command:
 
-For packaged installs (anything under `/usr/lib/` or `/lib/`), V2 **never** `rm`-s the files — touching package-managed paths behind the package manager's back desyncs its file database. Instead V2 sniffs `/etc/os-release` and surfaces the right uninstall hint:
+- Arch/AUR: `pacman -R neon-drm` (or `paru -R neon-drm` / `yay -R neon-drm`).
+- Debian/Ubuntu: `dpkg -r neon-drm` (or `apt remove neon-drm`).
+- Fedora/RHEL: `rpm -e neon-drm` (or `dnf remove neon-drm`).
 
-- **Arch** (`ID=arch` or `ID_LIKE` includes `arch`): `pacman -R neon-drm` (or `paru -R neon-drm` / `yay -R neon-drm` for AUR wrappers).
-- **Debian / Ubuntu / Mint / Pop!_OS** (`ID_LIKE` includes `debian`): `dpkg -r neon-drm` (or `apt remove neon-drm`).
-- **Fedora / RHEL / CentOS / Rocky / openSUSE**: `rpm -e neon-drm` (or `dnf remove neon-drm`).
-- **Unknown distro**: "use your system package manager to remove `neon-drm`".
+The legacy identifiers, package hints, and `v1.0.0` references are compatibility data and will remain supported throughout Silvervine 2.x.
 
-After migration completes, `neon setup` continues with:
+## Retired V1 distribution paths
 
-- Download Widevine CDM from Mozilla manifest (skipped if a freshly migrated `~/.cache/neon/widevine/<version>/` is recent enough).
-- Detect browsers and patch each (atomic patch with snapshot + rollback).
-- Register the V2 user-session daemon (LaunchAgent on macOS at `~/Library/LaunchAgents/com.neon.tray.plist`; systemd-user unit on Linux at `~/.config/systemd/user/neon.service`). No root required for the daemon — V2 runs entirely in user session.
+### Homebrew
 
-`neon setup` prints a summary like:
-
-```
-Removing 3 legacy artifact(s)…
-Migration: removed=0 migrated=0 skipped=3
-  → packaged install — run `pacman -R neon-drm` (or `paru -R neon-drm` / `yay -R neon-drm` for AUR) to remove cleanly
-Preparing Widevine CDM…
-…
-
-V2 setup complete. Run `neon doctor` to verify.
-```
-
-(On Debian, the `→` line would read `dpkg -r neon-drm`; on Fedora, `rpm -e neon-drm` / `dnf remove neon-drm`. Distro detection is per the section above.)
-
-## Per-install-path migration steps
-
-### 1. Manual bash install (V1 `install.sh`)
-
-This is the simplest case. The V1 bash install drops a LaunchDaemon (macOS) or systemd `.path` unit (Linux) plus the `~/.local/share/WidevineCdm/` directory.
+The old `nicholasraimbault/homebrew-neon` tap distributed Neon V1 and is retired. It is not being renamed or reused, and there is no Silvervine Homebrew tap.
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nicholasraimbault/neon/releases/download/v2.0.0-rc.1/neon-installer.sh | sh
-neon setup
-```
-
-`neon setup` detects the legacy LaunchDaemon / systemd unit, prompts for sudo once (to remove the root-owned daemon files), unloads + removes them, migrates the CDM cache, and installs the V2 daemon. **No manual steps.**
-
-If you previously ran `bash uninstall.sh` and installed V2 from scratch on the same machine, no migration is needed — `neon setup` finds nothing to clean up.
-
-### 2. Homebrew (`nicholasraimbault/neon` tap)
-
-The V1 Homebrew formula installed the same LaunchDaemon as the bash install plus a `neon-install` wrapper script. The tap is being archived 30 days after V2 ships; you'll want to remove it.
-
-```sh
-# Uninstall V1 from Homebrew (removes the wrapper scripts; LaunchDaemon left in place)
 brew uninstall nicholasraimbault/neon/neon
 brew untap nicholasraimbault/neon
-
-# Install V2
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nicholasraimbault/neon/releases/download/v2.0.0-rc.1/neon-installer.sh | sh
-neon setup
+silvervine setup
 ```
 
-`neon setup` then migrates the LaunchDaemon left behind by `brew uninstall`. **Three commands, fully automatic after that.**
+Silvervine still detects and removes the V1 `com.neon.fix-drm.plist` left by that installation.
 
-If you skip the `brew untap` step, Homebrew will remember the (now-archived) tap; `brew update` may print warnings. Cleanest to untap.
-
-### 3. Mac DMG / menu-bar app (V1 `Neon.app` from Releases)
-
-The V1 menu-bar app is a Swift `.app` bundle in `/Applications`. It registers itself via a `LaunchAgent` (not a LaunchDaemon — no root required), so the migration is fully user-session.
+### AUR
 
 ```sh
-# Install V2
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nicholasraimbault/neon/releases/download/v2.0.0-rc.1/neon-installer.sh | sh
-neon setup
+pacman -R neon-drm       # or: paru -R neon-drm / yay -R neon-drm
+silvervine setup
 ```
 
-`neon setup` detects `~/Library/LaunchAgents/com.neon.app.plist` and unloads + removes it.
-
-**Manual step:** drag `/Applications/Neon.app` to the Trash. V2 doesn't auto-delete user-installed apps — that crosses a privacy line we don't want to cross.
-
-### 4. Linux AUR (`neon-drm` package)
+### Debian package
 
 ```sh
-# Uninstall the AUR package (removes /usr/lib/neon/, /usr/bin/neon, the systemd units)
-pacman -R neon-drm
-# or: yay -R neon-drm
-
-# Install V2
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nicholasraimbault/neon/releases/download/v2.0.0-rc.1/neon-installer.sh | sh
-neon setup
-```
-
-The AUR package's own `pre-remove` hook handles `systemctl disable --now neon-fix-drm.path`. After that, `neon setup` finds nothing left to clean up and proceeds with V2 setup.
-
-V2.1 will publish a V2-bin AUR package (see [ROADMAP.md](ROADMAP.md)); until then, the `curl … | sh` installer above is the supported path on Arch.
-
-### 5. Linux .deb (`neon-drm.deb`)
-
-```sh
-# Uninstall the .deb (removes /usr/lib/neon/, /usr/bin/neon, the systemd units)
 sudo dpkg -r neon-drm
-
-# Install V2
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nicholasraimbault/neon/releases/download/v2.0.0-rc.1/neon-installer.sh | sh
-neon setup
+silvervine setup
 ```
 
-The .deb's `prerm` hook handles `systemctl disable --now neon-fix-drm.path`. After `dpkg -r`, the systemd units are gone and `neon setup` proceeds clean.
+### macOS Neon.app
 
-If you want to skip `dpkg -r` and let `neon setup` detect a partial install, it will: it sees `/usr/lib/neon/` and reports it with the `package_managed` flag and a pkg-manager-aware uninstall hint (here: `dpkg -r neon-drm`). It will **not** `rm` the files — V2 migration intentionally never touches system-managed package paths. You'd need to run `dpkg -r neon-drm` yourself anyway.
+After `silvervine setup` removes `~/Library/LaunchAgents/com.neon.app.plist`, manually move the old `/Applications/Neon.app` to the Trash. Silvervine does not delete application bundles.
 
-V2.1 will publish a V2 .deb package (see [ROADMAP.md](ROADMAP.md)).
+## Verification and troubleshooting
 
-## Cache migration: `~/.local/share/WidevineCdm/` → `~/.cache/neon/widevine/`
+Run:
 
-V1 stored the downloaded CDM at `~/.local/share/WidevineCdm/<version>/`. V2 stores it at `~/.cache/neon/widevine/<version>/` per the XDG Cache spec (CDMs are downloadable artifacts, not configuration).
+```sh
+silvervine doctor
+silvervine status
+```
 
-`migration::remove_legacy` invokes `migration::migrate_cdm_cache` to copy the V1 cache into place under the new path. The original V1 directory is left intact (we don't delete user data) — you can `rm -rf ~/.local/share/WidevineCdm` manually after verifying V2 works.
+If cleanup requiring elevation was cancelled, rerun `silvervine setup`. If a package-managed `/usr/lib/neon` or `neon-fix-drm.*` artifact is reported as skipped, remove the `neon-drm` package with the suggested host package manager and rerun setup.
 
-## Rolling back to V1
+Browser bundles remain patched only until the browser next updates. If playback stops after migration, close the browser and run `silvervine patch`.
 
-We strongly recommend not doing this — V1 has known issues (non-atomic patches that can destroy a browser bundle on a poorly-timed `kill -9`, no migration path forward, no way to file bugs). But if you need to:
+## Compatibility commitment
 
-1. `neon uninstall` — removes the V2 daemon, cache, and config. Browser bundles remain patched (V2 doesn't unpatch on uninstall).
-2. Reinstall V1 from your previous install path (Homebrew tap is archived; the `master` branch on GitHub still has the V1 `install.sh` until V2 ships, after which it'll be on a `v1` tag).
-
-If you uninstall V2 and don't reinstall anything, your browsers stay patched until they next update themselves — at which point they're un-patched and DRM stops working until you re-patch.
-
-## Migration troubleshooting
-
-**`neon setup` says "Failed to remove /Library/LaunchDaemons/com.neon.fix-drm.plist".**
-
-The LaunchDaemon file is owned by root. V2 prompts for sudo via `osascript` (macOS) — make sure you typed your password correctly and that your user is in the `admin` group. Re-run `neon setup` to retry.
-
-**`neon setup` says "Skipped /usr/lib/neon (system package)".**
-
-This is expected. V2 won't remove dpkg/pacman-managed files. Run `sudo dpkg -r neon-drm` (or `pacman -R neon-drm`) yourself, then re-run `neon setup`.
-
-**Migration succeeds but Netflix still doesn't work.**
-
-Run `neon doctor`. The output covers heartbeat status, current CDM version, per-browser patch state, and (if you pass an EME error code) translation. Common causes:
-
-- The browser was running during patch and we deferred — close it and run `neon patch` again.
-- Streaming service is geo-restricting your account — try a different title or service.
-- You're hitting the L3 ceiling for higher resolutions — see [README.md](README.md#the-l3-ceiling--please-read).
-
-If `neon doctor` doesn't surface the issue, run `neon doctor --share` to get a pre-filled GitHub issue URL.
-
-**I removed Neon, my browser updated, and now Netflix doesn't work.**
-
-Reinstall Neon. The browser update overwrote the patched framework with the unpatched original. `curl|sh` + `neon setup` will fix it.
-
-## Schedule
-
-- **V2.0.0 release day** — V2 ships; V1 install paths still work (we don't break V1 users).
-- **V2.0.0 + 30 days** — `homebrew-neon` tap archived (read-only). V1 Homebrew users continue to work but won't get updates. Migration to V2 is the supported upgrade.
-- **V2.x** — V1 install paths (manual bash, Homebrew, .deb, AUR, DMG) remain supported targets for `neon setup` migration logic indefinitely. We won't drop migration support; V1 users can take their time.
+Neon V1 migration detection and cleanup remains supported during Silvervine 2.x. Neon V2 data migration is non-destructive and safe to run repeatedly. Historical changelog entries retain the Neon name where that was the released product identity.

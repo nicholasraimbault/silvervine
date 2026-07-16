@@ -1,9 +1,9 @@
-//! Hardcoded list of browsers Neon is known to support.
+//! Hardcoded list of browsers Silvervine is known to support.
 //!
 //! The constants here are static — the `paths` slice gives every path
 //! we've ever seen a given browser install to. If a browser-of-interest
 //! ships at a new path, the user can either add it to `[[browsers]]` in
-//! their config, OR (preferred) we add a new path and roll out a Neon
+//! their config, OR (preferred) we add a new path and roll out a Silvervine
 //! release.
 //!
 //! Per the spec's "Browser support → Known browsers" section.

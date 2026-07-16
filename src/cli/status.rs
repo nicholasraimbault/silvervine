@@ -1,4 +1,4 @@
-//! `neon status` — show patch state for every detected browser.
+//! `silvervine status` — show patch state for every detected browser.
 //!
 //! Default: human-friendly table. `--json`: structured output.
 //! `--watch`: TUI-style refresh every 2 seconds; Ctrl-C exits.
@@ -22,7 +22,7 @@ use crate::browsers::{self, Browser};
 use crate::cli::OutputOptions;
 use crate::error::{Error, Result};
 
-/// Args for `neon status`.
+/// Args for `silvervine status`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Args {
     /// `--watch`: continuously refresh in a TUI-style loop.
@@ -47,7 +47,7 @@ pub struct BrowserStatus {
     pub last_patched_at: Option<u64>,
 }
 
-/// Top-level status report rendered by `neon status`.
+/// Top-level status report rendered by `silvervine status`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StatusReport {
     /// Per-browser entries, in detection order.
@@ -91,7 +91,7 @@ pub fn build_status(
 /// Read the daemon heartbeat file (Unix timestamp in seconds).
 ///
 /// Returns `None` if the file is missing or unreadable. Production
-/// `neon status` calls this; tests use [`build_status`] directly.
+/// `silvervine status` calls this; tests use [`build_status`] directly.
 #[must_use]
 pub fn read_heartbeat() -> Option<u64> {
     let path = crate::daemon::default_heartbeat_path()?;
@@ -146,7 +146,7 @@ fn render_text(report: &StatusReport, out: &mut dyn Write) -> std::io::Result<()
     } else {
         writeln!(
             out,
-            "Cached Widevine CDM: (none — run `neon update widevine`)"
+            "Cached Widevine CDM: (none — run `silvervine update widevine`)"
         )?;
     }
     match report.heartbeat_at {

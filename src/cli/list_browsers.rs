@@ -1,4 +1,4 @@
-//! `neon list-browsers` — enumerate detected + custom-config browsers.
+//! `silvervine list-browsers` — enumerate detected + custom-config browsers.
 //!
 //! Default mode prints a friendly table of "currently installed" browsers.
 //! `--all` includes auto-discovered + custom-config entries that aren't
@@ -12,7 +12,7 @@ use crate::browsers::{self, Browser, BrowserKind};
 use crate::cli::OutputOptions;
 use crate::error::Result;
 
-/// Args for `neon list-browsers`.
+/// Args for `silvervine list-browsers`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Args {
     /// `--all`: include known browsers from the static list that aren't

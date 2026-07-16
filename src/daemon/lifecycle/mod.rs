@@ -1,9 +1,9 @@
-//! Daemon registration: auto-start the Neon tray on user login.
+//! Daemon registration: auto-start the Silvervine tray on user login.
 //!
 //! On macOS this writes a `LaunchAgent` plist into
-//! `~/Library/LaunchAgents/com.neon.tray.plist` and bootstraps it via
+//! `~/Library/LaunchAgents/com.nicholasraimbault.silvervine.tray.plist` and bootstraps it via
 //! `launchctl bootstrap gui/<uid>`. On Linux it writes a `systemd --user`
-//! service unit into `~/.config/systemd/user/neon.service` and enables it
+//! service unit into `~/.config/systemd/user/silvervine.service` and enables it
 //! via `systemctl --user enable --now`.
 //!
 //! Both impls are user-domain only — no `sudo`/`pkexec` required. The
@@ -13,7 +13,7 @@
 //!
 //! # Test mode
 //!
-//! Tests gate on `NEON_TEST_LIFECYCLE_NOOP=1` so CI never:
+//! Tests gate on `SILVERVINE_TEST_LIFECYCLE_NOOP=1` so CI never:
 //!   * writes into the real `~/Library/LaunchAgents/` or `~/.config/systemd/`
 //!   * shells out to `launchctl` or `systemctl`
 //!
@@ -33,7 +33,7 @@
 //! ```
 //!
 //! `registration_path` returns where the plist / service file lives — used
-//! by `neon doctor` to surface "your daemon registration is at <path>".
+//! by `silvervine doctor` to surface "your daemon registration is at <path>".
 
 use std::path::PathBuf;
 
@@ -42,7 +42,7 @@ use crate::error::Result;
 /// Env-var name that, when set, short-circuits filesystem and shell-out
 /// operations in this module. Used by tests and by code paths that want
 /// to enumerate "what would happen" without actually mutating the host.
-pub const NOOP_ENV: &str = "NEON_TEST_LIFECYCLE_NOOP";
+pub const NOOP_ENV: &str = "SILVERVINE_TEST_LIFECYCLE_NOOP";
 
 /// Write the platform-specific daemon-launch unit into the user's
 /// auto-start directory and start it.
@@ -52,7 +52,7 @@ pub const NOOP_ENV: &str = "NEON_TEST_LIFECYCLE_NOOP";
 ///
 /// On Linux: writes the systemd-user service unit and runs
 /// `systemctl --user daemon-reload && systemctl --user enable --now
-/// neon.service`.
+/// silvervine.service`.
 ///
 /// Idempotent: re-registering an already-registered daemon overwrites
 /// the unit file and re-bootstraps the service.
@@ -66,7 +66,7 @@ pub const NOOP_ENV: &str = "NEON_TEST_LIFECYCLE_NOOP";
 ///
 /// # Test mode
 ///
-/// If `NEON_TEST_LIFECYCLE_NOOP=1` is set, returns `Ok(())` without
+/// If `SILVERVINE_TEST_LIFECYCLE_NOOP=1` is set, returns `Ok(())` without
 /// writing or shelling out.
 pub fn register() -> Result<()> {
     if noop_enabled() {
@@ -77,10 +77,10 @@ pub fn register() -> Result<()> {
 
 /// Reverse of [`register`]: stop the daemon and remove the unit file.
 ///
-/// On macOS: runs `launchctl bootout gui/<uid>/com.neon.tray` and removes
+/// On macOS: runs `launchctl bootout gui/<uid>/com.nicholasraimbault.silvervine.tray` and removes
 /// the plist.
 ///
-/// On Linux: runs `systemctl --user disable --now neon.service` and
+/// On Linux: runs `systemctl --user disable --now silvervine.service` and
 /// removes the unit file (followed by `daemon-reload`).
 ///
 /// Idempotent: unregistering when nothing is installed is `Ok(())`.
@@ -91,7 +91,7 @@ pub fn register() -> Result<()> {
 ///
 /// # Test mode
 ///
-/// If `NEON_TEST_LIFECYCLE_NOOP=1` is set, returns `Ok(())` without
+/// If `SILVERVINE_TEST_LIFECYCLE_NOOP=1` is set, returns `Ok(())` without
 /// shelling out.
 pub fn unregister() -> Result<()> {
     if noop_enabled() {
@@ -100,30 +100,94 @@ pub fn unregister() -> Result<()> {
     imp::unregister()
 }
 
+/// Stop and unregister Silvervine during migration rollback, including a
+/// loaded job whose registration artifact was already removed by a failed
+/// inner rollback.
+///
+/// # Errors
+/// Returns state-probe or lifecycle command failures.
+pub(crate) fn unregister_for_rollback() -> Result<()> {
+    if noop_enabled() {
+        return Ok(());
+    }
+    imp::unregister_for_rollback()
+}
+
+/// Whether a Neon V2 user auto-start artifact exists.
+///
+/// # Errors
+/// Returns path-resolution or platform probe failures.
+pub fn legacy_is_registered() -> Result<bool> {
+    if noop_enabled() {
+        return Ok(false);
+    }
+    imp::legacy_is_registered()
+}
+
+/// Stop Neon while retaining its registration for transactional rollback.
+/// Returns whether the daemon was running before it was stopped.
+///
+/// # Errors
+/// Returns an error when state cannot be probed or a running service cannot be stopped.
+pub fn stop_legacy() -> Result<bool> {
+    if noop_enabled() {
+        return Ok(false);
+    }
+    imp::stop_legacy()
+}
+
+/// Restore Neon to its pre-migration running state.
+///
+/// # Errors
+/// Returns an error when a previously running retained service cannot be restarted.
+pub fn restore_legacy(was_running: bool) -> Result<()> {
+    if noop_enabled() {
+        return Ok(());
+    }
+    imp::restore_legacy(was_running)
+}
+
+/// Remove the retained Neon registration only after Silvervine is active.
+///
+/// # Errors
+/// Returns an error when the artifact cannot be disabled or removed.
+pub fn remove_legacy_registration() -> Result<()> {
+    if noop_enabled() {
+        return Ok(());
+    }
+    imp::remove_legacy_registration()
+}
+
+/// Check whether the Silvervine unit file exists at the expected path while
+/// preserving path-resolution failures.
+///
+/// # Errors
+/// Returns an error when the platform registration path cannot be resolved.
+pub fn registration_exists() -> Result<bool> {
+    if noop_enabled() {
+        return Ok(false);
+    }
+    registration_path()?
+        .try_exists()
+        .map_err(crate::Error::from)
+}
+
 /// `true` if the unit file exists at the expected path.
 ///
-/// This does **not** verify the daemon is currently running — only that
-/// the registration artifact is on disk. Use the daemon team's heartbeat
-/// helpers to detect liveness.
-///
-/// In test mode (`NEON_TEST_LIFECYCLE_NOOP=1`) always returns `false`.
+/// This convenience probe intentionally maps path-resolution errors to
+/// `false`; transactional callers should use [`registration_exists`].
+/// In test mode (`SILVERVINE_TEST_LIFECYCLE_NOOP=1`) always returns `false`.
 #[must_use]
 pub fn is_registered() -> bool {
-    if noop_enabled() {
-        return false;
-    }
-    match registration_path() {
-        Ok(p) => p.is_file(),
-        Err(_) => false,
-    }
+    registration_exists().unwrap_or(false)
 }
 
 /// Filesystem path where the unit / plist lives.
 ///
-/// macOS: `~/Library/LaunchAgents/com.neon.tray.plist`
+/// macOS: `~/Library/LaunchAgents/com.nicholasraimbault.silvervine.tray.plist`
 ///
-/// Linux: `~/.config/systemd/user/neon.service` (or
-/// `$XDG_CONFIG_HOME/systemd/user/neon.service`).
+/// Linux: `~/.config/systemd/user/silvervine.service` (or
+/// `$XDG_CONFIG_HOME/systemd/user/silvervine.service`).
 ///
 /// # Errors
 ///
@@ -135,7 +199,7 @@ pub fn registration_path() -> Result<PathBuf> {
     imp::registration_path()
 }
 
-/// Returns `true` when `NEON_TEST_LIFECYCLE_NOOP=1` is in the
+/// Returns `true` when `SILVERVINE_TEST_LIFECYCLE_NOOP=1` is in the
 /// environment.
 fn noop_enabled() -> bool {
     std::env::var_os(NOOP_ENV).is_some()
@@ -167,6 +231,31 @@ mod imp {
         ))
     }
     pub(super) fn unregister() -> Result<()> {
+        Err(Error::unsupported_platform(
+            "daemon registration is only implemented on Linux and macOS",
+        ))
+    }
+    pub(super) fn unregister_for_rollback() -> Result<()> {
+        Err(Error::unsupported_platform(
+            "daemon registration is only implemented on Linux and macOS",
+        ))
+    }
+    pub(super) fn legacy_is_registered() -> Result<bool> {
+        Err(Error::unsupported_platform(
+            "daemon registration is only implemented on Linux and macOS",
+        ))
+    }
+    pub(super) fn stop_legacy() -> Result<bool> {
+        Err(Error::unsupported_platform(
+            "daemon registration is only implemented on Linux and macOS",
+        ))
+    }
+    pub(super) fn restore_legacy(_was_running: bool) -> Result<()> {
+        Err(Error::unsupported_platform(
+            "daemon registration is only implemented on Linux and macOS",
+        ))
+    }
+    pub(super) fn remove_legacy_registration() -> Result<()> {
         Err(Error::unsupported_platform(
             "daemon registration is only implemented on Linux and macOS",
         ))
@@ -214,7 +303,7 @@ mod tests {
         }
     }
 
-    /// `NEON_TEST_LIFECYCLE_NOOP=1` short-circuits register/unregister
+    /// `SILVERVINE_TEST_LIFECYCLE_NOOP=1` short-circuits register/unregister
     /// and forces `is_registered()` to `false`.
     #[test]
     fn noop_short_circuits_all_entry_points() {

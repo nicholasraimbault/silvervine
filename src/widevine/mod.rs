@@ -4,7 +4,7 @@
 //! and verify the CDM consumed by the patch flow.
 //!
 //! Public surface re-exports the most-used types so consumers can
-//! `use neon::widevine::{Manifest, fetch_manifest};` without reaching into
+//! `use silvervine::widevine::{Manifest, fetch_manifest};` without reaching into
 //! the submodule.
 
 pub mod cache;

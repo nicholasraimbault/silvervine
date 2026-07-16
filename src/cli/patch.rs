@@ -1,4 +1,4 @@
-//! `neon patch` — patch one or all browsers with the Widevine CDM.
+//! `silvervine patch` — patch one or all browsers with the Widevine CDM.
 //!
 //! Default behavior: detect installed browsers, fetch the manifest,
 //! ensure the CDM is cached, then call [`crate::patch::patch_browser`]
@@ -14,6 +14,7 @@
 //! `false` value.
 
 use std::io::Write;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -23,7 +24,7 @@ use crate::error::{Error, Result};
 use crate::patch::{self, PatchOptions, PatchOutcome, PlatformPatcher};
 use crate::widevine::{self, CachedCdm};
 
-/// Args for `neon patch`.
+/// Args for `silvervine patch`.
 #[derive(Debug, Clone, Default)]
 pub struct Args {
     /// `--force`: patch even when the browser is currently running.
@@ -32,13 +33,30 @@ pub struct Args {
     pub dry_run: bool,
     /// Optional positional arg: only patch the named browser.
     pub browser: Option<String>,
-    /// `--as-root`: this invocation is the privileged child of an earlier
-    /// `pkexec` / `sudo` / `osascript` escalation. Hidden CLI flag — end
-    /// users never set this. Wires the patch flow's same-filesystem
-    /// snapshot path and skips the writability/escalation check.
-    pub as_root: bool,
     /// Output flags.
     pub output: OutputOptions,
+}
+
+/// Internal privileged patch inputs selected by the locked parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivilegedArgs {
+    /// Exact absolute browser install selected by the locked parent.
+    pub install_path: PathBuf,
+    /// Exact framework selected by the parent on macOS.
+    pub framework_name: Option<String>,
+    /// Exact framework version selected by the parent on macOS.
+    pub framework_version: Option<String>,
+    /// Trusted same-filesystem directory selected by the unprivileged parent
+    /// for exclusive snapshot creation.
+    pub backup_parent: PathBuf,
+    /// Exact extracted CDM directory already verified by the parent.
+    pub cdm_dir: PathBuf,
+    /// Exact CDM version associated with `cdm_dir`.
+    pub cdm_version: String,
+    /// Browser display name used only for diagnostics and snapshots.
+    pub browser_name: String,
+    /// Inherit the parent's running-browser override.
+    pub force: bool,
 }
 
 /// JSON-friendly outcome record.
@@ -127,23 +145,42 @@ where
     let cdm = match cdm_resolver() {
         Ok(c) => c,
         Err(e) => {
-            return candidates
+            let reports: Vec<_> = candidates
                 .into_iter()
                 .map(|b| PatchReport::failure(b.name(), options.dry_run, &e))
                 .collect();
+            if should_emit_hooks(options) {
+                for report in &reports {
+                    crate::hooks::emit_post_patch(report);
+                }
+            }
+            return reports;
         }
     };
-    candidates
+    let reports: Vec<_> = candidates
         .into_iter()
         .map(|b| match patch::patch_browser(b, &cdm, patcher, options) {
             Ok(outcome) => PatchReport::success(&outcome),
             Err(e) => PatchReport::failure(b.name(), options.dry_run, &e),
         })
-        .collect()
+        .collect();
+    // The elevated child is intentionally filesystem-only: the normal parent
+    // owns user configuration and hook execution. Dry runs do not emit a
+    // post-patch event because no patch happened.
+    if should_emit_hooks(options) {
+        for report in &reports {
+            crate::hooks::emit_post_patch(report);
+        }
+    }
+    reports
+}
+
+fn should_emit_hooks(options: &PatchOptions) -> bool {
+    !options.as_root && !options.dry_run
 }
 
 /// Production CDM resolver: fetches the manifest and ensures the cache is
-/// current. Used by the `neon patch` runtime path.
+/// current. Used by the `silvervine patch` runtime path.
 ///
 /// # Errors
 ///
@@ -200,7 +237,6 @@ pub fn run(args: &Args) -> Result<()> {
     let options = PatchOptions {
         force_while_running: args.force,
         dry_run: args.dry_run,
-        as_root: args.as_root,
         ..Default::default()
     };
     let reports = run_patch_flow(
@@ -219,16 +255,95 @@ pub fn run(args: &Args) -> Result<()> {
         render_text(&reports, args.dry_run, &mut handle).map_err(Error::from)?;
     }
 
+    // A requested browser that did not match must never be reported as an
+    // empty success (especially because the privileged parent trusts exit 0).
+    if reports.is_empty() {
+        return Err(Error::other(match &args.browser {
+            Some(name) => format!("requested browser '{name}' was not found"),
+            None => "no browsers detected to patch".to_string(),
+        }));
+    }
+
     // Exit with a non-zero category if everything failed; otherwise
     // success even if some entries failed (parity with `apt-get`-style
     // "we did what we could").
-    if !reports.is_empty() && reports.iter().all(|r| !r.success) {
+    if reports.iter().all(|r| !r.success) {
         let first_err = reports
             .iter()
             .find_map(|r| r.error.as_deref())
             .unwrap_or("all patches failed");
         return Err(Error::other(first_err.to_string()));
     }
+    Ok(())
+}
+
+/// Execute the narrow privileged child operation. This function deliberately
+/// performs no discovery, manifest/network/cache work, configuration loading,
+/// logging, migration, or hooks. The parent still holds `patch.lock` while it
+/// waits, so `as_root` safely reuses that lock contract.
+///
+/// # Errors
+///
+/// Returns an error for non-absolute/missing inputs or any snapshot, patch,
+/// or verification failure.
+pub fn run_privileged(args: &PrivilegedArgs) -> Result<()> {
+    if !args.install_path.is_absolute()
+        || !args.backup_parent.is_absolute()
+        || !args.cdm_dir.is_absolute()
+    {
+        return Err(Error::other(
+            "privileged patch paths must be exact absolute paths",
+        ));
+    }
+    if !args.install_path.is_dir() {
+        return Err(Error::unknown_bundle_structure(format!(
+            "browser install path does not exist: {}",
+            args.install_path.display()
+        )));
+    }
+    if !args.cdm_dir.is_dir() {
+        return Err(Error::unknown_bundle_structure(format!(
+            "CachedCdm directory does not exist: {}",
+            args.cdm_dir.display()
+        )));
+    }
+    patch::validate_privileged_snapshot_parent(&args.install_path, &args.backup_parent)?;
+    #[cfg(target_os = "macos")]
+    {
+        let framework = args.framework_name.as_deref().ok_or_else(|| {
+            Error::unknown_bundle_structure(
+                "privileged macOS patch requires an exact parent-selected framework",
+            )
+        })?;
+        let version = args.framework_version.as_deref().ok_or_else(|| {
+            Error::unknown_bundle_structure(
+                "privileged macOS patch requires an exact parent-selected framework version",
+            )
+        })?;
+        crate::patch::macos::validate_privileged_layout(&args.install_path, framework, version)?;
+    }
+    let browser = Browser {
+        name: args.browser_name.clone(),
+        install_path: args.install_path.clone(),
+        kind: crate::browsers::BrowserKind::Detected,
+        framework_name: args.framework_name.clone(),
+    };
+    let cdm = CachedCdm::new(args.cdm_version.clone(), args.cdm_dir.clone());
+    let patcher = patch::host_patcher_for_layout(
+        args.framework_name.as_deref(),
+        args.framework_version.as_deref(),
+    )?;
+    patch::patch_browser(
+        &browser,
+        &cdm,
+        patcher.as_ref(),
+        &PatchOptions {
+            force_while_running: args.force,
+            backups_dir: Some(args.backup_parent.clone()),
+            as_root: true,
+            ..Default::default()
+        },
+    )?;
     Ok(())
 }
 
@@ -310,6 +425,15 @@ mod tests {
         .unwrap();
         fs::write(dir.join("manifest.json"), br#"{"version":"x"}"#).unwrap();
         CachedCdm::new(version.to_string(), dir)
+    }
+
+    #[test]
+    fn privileged_child_explicitly_skips_hooks() {
+        assert!(!should_emit_hooks(&PatchOptions {
+            as_root: true,
+            ..Default::default()
+        }));
+        assert!(should_emit_hooks(&PatchOptions::default()));
     }
 
     #[test]
@@ -525,6 +649,28 @@ mod tests {
         assert!(v.is_array());
         assert_eq!(v[0]["browser"], "Helium");
         assert_eq!(v[0]["success"], true);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn privileged_child_rejects_missing_parent_selected_framework() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let install = tmp.path().join("Custom.app");
+        let cdm = tmp.path().join("cdm");
+        fs::create_dir_all(&install).unwrap();
+        fs::create_dir_all(&cdm).unwrap();
+        let error = run_privileged(&PrivilegedArgs {
+            install_path: install,
+            framework_name: None,
+            framework_version: None,
+            backup_parent: tmp.path().to_path_buf(),
+            cdm_dir: cdm,
+            cdm_version: "1.0".into(),
+            browser_name: "Custom".into(),
+            force: true,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("parent-selected framework"));
     }
 
     #[test]

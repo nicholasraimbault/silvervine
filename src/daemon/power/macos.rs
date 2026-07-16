@@ -141,7 +141,7 @@ mod tests {
     /// macOS-specific tests run only on macOS hosts. The subscription
     /// path actually touches AppKit, which would attach to the user's
     /// running window server. We rely on the public-API NOOP gate
-    /// (`NEON_TEST_POWER_NOOP=1`) — see `power::tests` in `mod.rs` —
+    /// (`SILVERVINE_TEST_POWER_NOOP=1`) — see `power::tests` in `mod.rs` —
     /// rather than running a real subscription here.
     ///
     /// Anything we'd test in this file (e.g. the block-construction

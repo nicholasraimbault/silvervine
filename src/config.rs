@@ -1,4 +1,4 @@
-//! Global Neon config schema (`~/.config/neon/config.toml`).
+//! Global Silvervine config schema (`~/.config/silvervine/config.toml`).
 //!
 //! Per the spec's "Custom browser config" section, the schema is:
 //!
@@ -16,8 +16,8 @@
 //! # install_path = "/home/me/dev/my-build"
 //!
 //! [hooks]
-//! post_patch = "~/.config/neon/hooks/post-patch"
-//! post_update = "~/.config/neon/hooks/post-update"
+//! post_patch = "~/.config/silvervine/hooks/post-patch"
+//! post_update = "~/.config/silvervine/hooks/post-update"
 //! ```
 //!
 //! ## Loading rules
@@ -39,13 +39,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-/// Default location of the config file: `$XDG_CONFIG_HOME/neon/config.toml`.
+/// Default location of the config file: `$XDG_CONFIG_HOME/silvervine/config.toml`.
 ///
 /// Returns `None` if neither `$XDG_CONFIG_HOME` nor `$HOME` are set —
 /// callers should treat this as "no config file" (i.e. use defaults).
 #[must_use]
 pub fn default_config_path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("neon").join("config.toml"))
+    Some(dirs::config_dir()?.join("silvervine").join("config.toml"))
 }
 
 /// Top-level config schema.
@@ -129,7 +129,7 @@ impl Config {
     ///
     /// Top-level sections listed in [`DEPRECATED_TOP_LEVEL_SECTIONS`] are
     /// stripped before strict deserialization, so a config carried over
-    /// from an older Neon release doesn't crash the daemon. Unknown
+    /// from an older Silvervine release doesn't crash the daemon. Unknown
     /// *non-deprecated* keys still fail loudly to catch typos.
     ///
     /// # Errors
@@ -142,7 +142,7 @@ impl Config {
             for &section in DEPRECATED_TOP_LEVEL_SECTIONS {
                 if table.remove(section).is_some() {
                     tracing::warn!(
-                        target: "neon::config",
+                        target: "silvervine::config",
                         section,
                         "ignoring deprecated top-level config section"
                     );
@@ -153,7 +153,7 @@ impl Config {
     }
 
     /// Serialize back to a TOML string. Useful for round-trip tests and
-    /// for an eventual "neon config edit" command.
+    /// for an eventual "silvervine config edit" command.
     ///
     /// # Errors
     ///
@@ -169,17 +169,17 @@ impl Config {
     /// Returns `None` if no `[hooks].post_patch` entry is set.
     #[must_use]
     pub fn post_patch_hook(&self) -> Option<PathBuf> {
-        self.hooks.post_patch.as_deref().map(expand_tilde)
+        self.hooks.post_patch.as_deref().map(resolve_hook_path)
     }
 
     /// Resolve the post-update hook script path (with `~` expansion).
     #[must_use]
     pub fn post_update_hook(&self) -> Option<PathBuf> {
-        self.hooks.post_update.as_deref().map(expand_tilde)
+        self.hooks.post_update.as_deref().map(resolve_hook_path)
     }
 }
 
-/// Load the config from the default path (`~/.config/neon/config.toml`).
+/// Load the config from the default path (`~/.config/silvervine/config.toml`).
 ///
 /// If the file is absent, returns [`Config::default`]. If the file is
 /// malformed, returns [`crate::ErrorCategory::StateCorrupted`].
@@ -224,6 +224,31 @@ fn expand_tilde(s: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+fn resolve_hook_path(value: &str) -> PathBuf {
+    let path = expand_tilde(value);
+    let current_root = crate::platform::config_dir();
+    let legacy_root = current_root
+        .parent()
+        .map_or_else(|| PathBuf::from("neon"), |parent| parent.join("neon"));
+    remap_legacy_hook_path(&path, &legacy_root, &current_root)
+}
+
+/// Remap an absent explicit hook under the Neon config root to its migrated
+/// Silvervine location. Existing legacy paths remain authoritative.
+fn remap_legacy_hook_path(
+    path: &std::path::Path,
+    legacy_root: &std::path::Path,
+    current_root: &std::path::Path,
+) -> PathBuf {
+    if path.exists() || !path.starts_with(legacy_root) {
+        return path.to_path_buf();
+    }
+    path.strip_prefix(legacy_root).map_or_else(
+        |_| path.to_path_buf(),
+        |relative| current_root.join(relative),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,8 +279,8 @@ name = "LinuxBrowser"
 install_path = "/home/me/dev/my-build"
 
 [hooks]
-post_patch = "~/.config/neon/hooks/post-patch"
-post_update = "~/.config/neon/hooks/post-update"
+post_patch = "~/.config/silvervine/hooks/post-patch"
+post_update = "~/.config/silvervine/hooks/post-update"
 "#;
         let cfg = Config::from_toml_str(toml).expect("spec example must parse");
         assert!(cfg.notifications.on_success);
@@ -270,7 +295,7 @@ post_update = "~/.config/neon/hooks/post-update"
         assert!(cfg.browsers[1].install_path.is_some());
         assert_eq!(
             cfg.hooks.post_patch.as_deref(),
-            Some("~/.config/neon/hooks/post-patch")
+            Some("~/.config/silvervine/hooks/post-patch")
         );
     }
 
@@ -439,21 +464,47 @@ on_failure = true
     }
 
     #[test]
-    fn default_config_path_ends_with_neon_config() {
+    fn default_config_path_ends_with_silvervine_config() {
         if let Some(path) = default_config_path() {
-            let suffix = std::path::Path::new("neon").join("config.toml");
+            let suffix = std::path::Path::new("silvervine").join("config.toml");
             assert!(path.ends_with(&suffix), "got {}", path.display());
         }
     }
 
     /// Production `load_config` entrypoint must not panic. It reads from
-    /// `~/.config/neon/config.toml`, which on a fresh machine is absent
+    /// `~/.config/silvervine/config.toml`, which on a fresh machine is absent
     /// (so it returns the default). On the dev machine it may either be
     /// absent or contain user-edited content; either way the function
     /// must succeed (or return a categorized error).
     #[test]
     fn load_config_does_not_panic() {
         let _ = load_config();
+    }
+
+    #[test]
+    fn absent_explicit_neon_hook_path_maps_to_silvervine_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let legacy = tmp.path().join("neon");
+        let current = tmp.path().join("silvervine");
+        let old_hook = legacy.join("hooks/post-patch");
+        assert_eq!(
+            remap_legacy_hook_path(&old_hook, &legacy, &current),
+            current.join("hooks/post-patch")
+        );
+    }
+
+    #[test]
+    fn existing_explicit_neon_hook_path_is_preserved() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let legacy = tmp.path().join("neon");
+        let current = tmp.path().join("silvervine");
+        let old_hook = legacy.join("hooks/post-patch");
+        std::fs::create_dir_all(old_hook.parent().unwrap()).unwrap();
+        std::fs::write(&old_hook, b"#!/bin/sh").unwrap();
+        assert_eq!(
+            remap_legacy_hook_path(&old_hook, &legacy, &current),
+            old_hook
+        );
     }
 
     #[test]

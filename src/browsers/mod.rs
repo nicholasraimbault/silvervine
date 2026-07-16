@@ -11,7 +11,7 @@
 //! 3. **Process-based discovery** ([`discovery::discover_processes`])
 //!    — Phase 2 wires `sysinfo`. Phase 1 ships only the entry-point stub.
 //! 4. **Custom config entries** ([`crate::config::CustomBrowserConfig`])
-//!    — read from `~/.config/neon/config.toml`.
+//!    — read from `~/.config/silvervine/config.toml`.
 //!
 //! All four sources are unioned with same-`install_path` deduplication
 //! (keeping the first occurrence wins).
@@ -62,7 +62,7 @@ impl Os {
     }
 }
 
-/// What kind of source surfaced this browser. Useful for `neon list-browsers`
+/// What kind of source surfaced this browser. Useful for `silvervine list-browsers`
 /// to display "(known)" / "(detected)" / "(custom)" tags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserKind {
@@ -71,7 +71,7 @@ pub enum BrowserKind {
     Known,
     /// Found by filesystem walking (e.g. `/opt/some-fork-of-chromium`).
     Detected,
-    /// Listed in `~/.config/neon/config.toml`'s `[[browsers]]` array.
+    /// Listed in `~/.config/silvervine/config.toml`'s `[[browsers]]` array.
     Custom,
 }
 
@@ -182,7 +182,7 @@ impl Browser {
 ///
 /// # Behavior
 ///
-/// * Loads the user config from `~/.config/neon/config.toml` (silent
+/// * Loads the user config from `~/.config/silvervine/config.toml` (silent
 ///   default if missing).
 /// * Resolves the host OS — non-V1 hosts get an empty list (no error).
 /// * Walks the known list, the auto-discovery sources, and the custom

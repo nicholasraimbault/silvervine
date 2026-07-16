@@ -8,10 +8,6 @@
 //! ## What lives here
 //!
 //! * [`PlatformPaths`] — XDG / Apple-conventional cache + config + apps roots.
-//! * [`escalate_for_patch`] — runs an `osascript` (macOS) or `pkexec` /
-//!   `sudo` (Linux) wrapper that re-invokes the current `neon` binary with
-//!   elevated privileges. The same binary handles the privileged
-//!   sub-operation when it sees `--as-root` (resolved by the CLI team).
 //! * [`run_as_root`] — execute an arbitrary command with elevated privileges.
 //!   Returns the captured [`Output`] regardless of exit status; callers
 //!   inspect `status.success()` and the stderr text for diagnostics.
@@ -32,9 +28,9 @@
 //!
 //! Every public function here either takes injectable arguments (so tests
 //! pass `tempfile`-synthesized paths) or returns information that does
-//! not require real privilege. The two functions that genuinely shell out
-//! ([`escalate_for_patch`] and [`run_as_root`]) are gated by an env var
-//! (`NEON_TEST_ESCALATE_NOOP=1`) so CI never actually prompts for a
+//! not require real privilege. The function that genuinely shells out
+//! ([`run_as_root`]) is gated by an env var
+//! (`SILVERVINE_TEST_ESCALATE_NOOP=1`) so CI never actually prompts for a
 //! password.
 
 use std::path::PathBuf;
@@ -61,12 +57,12 @@ use unsupported as imp;
 /// Tests that need to assert against the trait without a real `$HOME` use
 /// the per-platform impl directly, since the methods are pure (no I/O).
 pub trait PlatformPaths {
-    /// Cache directory — Neon's CDM cache + backups + lockfiles live here.
-    /// Equivalent to `~/.cache/neon/` on Linux, `~/Library/Caches/neon/` on macOS.
+    /// Cache directory — Silvervine's CDM cache + backups + lockfiles live here.
+    /// Equivalent to `~/.cache/silvervine/` on Linux, `~/Library/Caches/silvervine/` on macOS.
     fn cache_dir() -> PathBuf;
 
-    /// Config directory — `~/.config/neon/` (Linux) or
-    /// `~/Library/Application Support/neon/` (macOS). State files and
+    /// Config directory — `~/.config/silvervine/` (Linux) or
+    /// `~/Library/Application Support/silvervine/` (macOS). State files and
     /// the user-edited `config.toml` live here.
     fn config_dir() -> PathBuf;
 
@@ -118,41 +114,6 @@ pub fn applications_dirs() -> Vec<PathBuf> {
     <ActivePlatform as PlatformPaths>::applications_dirs()
 }
 
-/// Re-invoke the current Neon binary with elevated privileges to patch
-/// `target`.
-///
-/// On macOS the command runs through `osascript -e "do shell script ...
-/// with administrator privileges"`, which surfaces a system-wide GUI
-/// password prompt. On Linux the command tries `pkexec` first (preferred,
-/// GUI prompt) and falls back to `sudo` (terminal prompt) if `pkexec` is
-/// not on `$PATH`.
-///
-/// The caller is responsible for telling the elevated child what to do
-/// — typically by passing CLI flags like `--as-root patch <target>`. This
-/// function takes the target path so the underlying script can echo
-/// "Neon needs administrator access to patch <target>" in the prompt
-/// dialog.
-///
-/// # Errors
-///
-/// * [`crate::ErrorCategory::PermissionDenied`] if the user cancels the
-///   prompt or the elevation tool fails to authenticate.
-/// * [`crate::ErrorCategory::UnsupportedPlatform`] on platforms with no
-///   known elevation path.
-/// * [`crate::ErrorCategory::Other`] for any other spawn failure.
-///
-/// # Test mode
-///
-/// If `NEON_TEST_ESCALATE_NOOP=1` is set, this function returns `Ok(())`
-/// without spawning a subprocess. CI uses this to verify call sites
-/// without prompting for a password.
-pub fn escalate_for_patch(target: &std::path::Path) -> Result<()> {
-    if std::env::var_os("NEON_TEST_ESCALATE_NOOP").is_some() {
-        return Ok(());
-    }
-    imp::escalate_for_patch(target)
-}
-
 /// Execute `command` with elevated privileges and capture its output.
 ///
 /// `command` is the full argv of the program to run (`command[0]` is
@@ -174,7 +135,7 @@ pub fn escalate_for_patch(target: &std::path::Path) -> Result<()> {
 ///
 /// # Test mode
 ///
-/// If `NEON_TEST_ESCALATE_NOOP=1` is set, this function returns a fake
+/// If `SILVERVINE_TEST_ESCALATE_NOOP=1` is set, this function returns a fake
 /// "successful" [`Output`] with empty stdout/stderr without spawning a
 /// subprocess.
 pub fn run_as_root(command: &[&str]) -> Result<Output> {
@@ -183,7 +144,7 @@ pub fn run_as_root(command: &[&str]) -> Result<Output> {
     if command.is_empty() {
         return Err(Error::other("run_as_root called with empty command"));
     }
-    if std::env::var_os("NEON_TEST_ESCALATE_NOOP").is_some() {
+    if std::env::var_os("SILVERVINE_TEST_ESCALATE_NOOP").is_some() {
         return Ok(noop_output());
     }
     imp::run_as_root(command)
@@ -201,7 +162,7 @@ pub fn run_as_root(command: &[&str]) -> Result<Output> {
 /// (macOS), so it must be POSIX-shell-safe. Caller is responsible for
 /// quoting paths that may contain whitespace or shell metacharacters.
 ///
-/// Honors `NEON_TEST_ESCALATE_NOOP=1` like [`run_as_root`].
+/// Honors `SILVERVINE_TEST_ESCALATE_NOOP=1` like [`run_as_root`].
 ///
 /// # Errors
 ///
@@ -214,7 +175,7 @@ pub fn run_as_root_script(script: &str) -> Result<Output> {
     if script.trim().is_empty() {
         return Err(Error::other("run_as_root_script called with empty script"));
     }
-    if std::env::var_os("NEON_TEST_ESCALATE_NOOP").is_some() {
+    if std::env::var_os("SILVERVINE_TEST_ESCALATE_NOOP").is_some() {
         return Ok(noop_output());
     }
     imp::run_as_root(&["sh", "-c", script])
@@ -294,7 +255,7 @@ pub fn format_exit_status(status: std::process::ExitStatus) -> String {
     "terminated".to_string()
 }
 
-/// Construct a no-op [`Output`] used when `NEON_TEST_ESCALATE_NOOP=1`.
+/// Construct a no-op [`Output`] used when `SILVERVINE_TEST_ESCALATE_NOOP=1`.
 fn noop_output() -> Output {
     use std::os::unix::process::ExitStatusExt;
     Output {
@@ -335,11 +296,6 @@ mod unsupported {
     pub(super) fn applications_dirs() -> Vec<PathBuf> {
         Vec::new()
     }
-    pub(super) fn escalate_for_patch(_target: &Path) -> Result<()> {
-        Err(Error::unsupported_platform(
-            "privilege escalation is only implemented on Linux and macOS",
-        ))
-    }
     pub(super) fn run_as_root(_command: &[&str]) -> Result<Output> {
         Err(Error::unsupported_platform(
             "run_as_root is only implemented on Linux and macOS",
@@ -356,7 +312,7 @@ mod unsupported {
 mod tests {
     use super::*;
 
-    /// `NEON_TEST_ESCALATE_NOOP=1` short-circuits both elevation entry
+    /// `SILVERVINE_TEST_ESCALATE_NOOP=1` short-circuits both elevation entry
     /// points so CI never prompts for a password.
     #[test]
     fn noop_short_circuit_in_test_mode() {
@@ -366,14 +322,12 @@ mod tests {
         // own thread with no other escalate calls.
         // SAFETY: env mutations are permitted in a single-threaded test
         // section; we restore the previous value below.
-        unsafe { std::env::set_var("NEON_TEST_ESCALATE_NOOP", "1") };
-        let r = escalate_for_patch(std::path::Path::new("/opt/whatever"));
-        assert!(r.is_ok());
+        unsafe { std::env::set_var("SILVERVINE_TEST_ESCALATE_NOOP", "1") };
         let out = run_as_root(&["echo", "hi"]).expect("noop ok");
         assert!(out.status.success());
         // SAFETY: restore the env to its prior unset state so other tests
         // (or future test runs in the same process) aren't affected.
-        unsafe { std::env::remove_var("NEON_TEST_ESCALATE_NOOP") };
+        unsafe { std::env::remove_var("SILVERVINE_TEST_ESCALATE_NOOP") };
     }
 
     /// `run_as_root` rejects an empty command without elevating.
@@ -413,12 +367,16 @@ mod tests {
     fn path_accessors_return_non_empty_paths_on_supported_oses() {
         if cfg!(any(target_os = "linux", target_os = "macos")) {
             // The result depends on $HOME being set, which it is in
-            // CI and dev. The cache/config dirs end with `neon`.
+            // CI and dev. The cache/config dirs end with `silvervine`.
             let cache = cache_dir();
             let config = config_dir();
-            assert!(cache.ends_with("neon"), "cache_dir = {}", cache.display());
             assert!(
-                config.ends_with("neon"),
+                cache.ends_with("silvervine"),
+                "cache_dir = {}",
+                cache.display()
+            );
+            assert!(
+                config.ends_with("silvervine"),
                 "config_dir = {}",
                 config.display()
             );

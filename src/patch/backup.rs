@@ -13,12 +13,13 @@
 //!
 //! ## Storage layout
 //!
-//! Per spec ("Snapshot original bundle → `~/.cache/neon/backups/<browser>-<version>-<timestamp>/`"):
+//! Snapshots use collision-resistant, exclusively-created names under the
+//! configured backup directory:
 //!
 //! ```text
-//! ~/.cache/neon/backups/
-//! ├── Helium-128.0.6613.119-1715000000/
-//! ├── Thorium-129.0.0.0-1715800000/
+//! ~/.cache/silvervine/backups/
+//! ├── .silvervine-Helium-128.0.6613.119-aB3kP9xQ2mN7/
+//! ├── .silvervine-Thorium-129.0.0.0-rT6vW1yZ8cD4/
 //! └── ...
 //! ```
 //!
@@ -57,12 +58,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::browsers::Browser;
 use crate::error::{Error, Result};
 
-/// Default backup directory: `~/.cache/neon/backups/`.
+/// Default backup directory: `~/.cache/silvervine/backups/`.
 ///
 /// Returns `None` if `dirs::cache_dir()` is unresolvable.
 #[must_use]
 pub fn default_backups_dir() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("neon").join("backups"))
+    dirs::cache_dir().map(|d| d.join("silvervine").join("backups"))
 }
 
 /// Maximum age of backups before [`prune_backups`] deletes them.
@@ -177,7 +178,7 @@ impl BackupHandle {
 
 impl Drop for BackupHandle {
     /// On accidental drop without commit/restore, leave the snapshot in
-    /// place. The user can recover manually from `~/.cache/neon/backups/`
+    /// place. The user can recover manually from `~/.cache/silvervine/backups/`
     /// if anything has gone wrong.
     fn drop(&mut self) {
         // No-op (intentional). The `must_use` attribute on the struct
@@ -186,7 +187,7 @@ impl Drop for BackupHandle {
     }
 }
 
-/// Take a snapshot of `source` into `~/.cache/neon/backups/<source-basename>-<timestamp>/`.
+/// Take a snapshot of `source` into `~/.cache/silvervine/backups/<source-basename>-<timestamp>/`.
 ///
 /// # Errors
 ///
@@ -197,7 +198,9 @@ pub fn snapshot(source: &Path) -> Result<BackupHandle> {
         .and_then(|s| s.to_str())
         .unwrap_or("snapshot");
     let backups = default_backups_dir().ok_or_else(|| {
-        Error::state_corrupted("cannot resolve ~/.cache/neon/backups (no \\$HOME / cache dir)")
+        Error::state_corrupted(
+            "cannot resolve ~/.cache/silvervine/backups (no \\$HOME / cache dir)",
+        )
     })?;
     snapshot_into(source, &backups, basename, None)
 }
@@ -206,14 +209,16 @@ pub fn snapshot(source: &Path) -> Result<BackupHandle> {
 ///
 /// Used by the patch orchestrator. The snapshot directory is named
 /// `<browser>-<version>-<timestamp>/` so users browsing
-/// `~/.cache/neon/backups/` can tell at a glance which patch left it.
+/// `~/.cache/silvervine/backups/` can tell at a glance which patch left it.
 ///
 /// # Errors
 ///
 /// See [`snapshot`].
 pub fn snapshot_for_browser(browser: &Browser, version: Option<&str>) -> Result<BackupHandle> {
     let backups = default_backups_dir().ok_or_else(|| {
-        Error::state_corrupted("cannot resolve ~/.cache/neon/backups (no \\$HOME / cache dir)")
+        Error::state_corrupted(
+            "cannot resolve ~/.cache/silvervine/backups (no \\$HOME / cache dir)",
+        )
     })?;
     snapshot_into(browser.install_path(), &backups, browser.name(), version)
 }
@@ -223,9 +228,11 @@ pub fn snapshot_for_browser(browser: &Browser, version: Option<&str>) -> Result<
 /// `renameat2(RENAME_EXCHANGE)` rollback to work.
 ///
 /// Concretely, given an install at `/opt/helium-browser-bin`, the snapshot
-/// goes under `/opt/.neon-backups/Helium-<version>-<ts>/`. Used by the
-/// privileged code path (when `neon patch` is running as root after a
-/// `pkexec` escalation): root-owned, same-filesystem, atomic-swap-ready.
+/// is an exclusively created `/opt/.silvervine-Helium-<version>-<random>/`
+/// directory. It does not traverse a shared, attacker-precreatable backup
+/// root. Used by the privileged code path (when `silvervine patch` is running
+/// as root after a `pkexec` escalation): root-owned, same-filesystem,
+/// atomic-swap-ready.
 ///
 /// The orchestrator picks this over [`snapshot_for_browser`] when the
 /// target install path is not writable by the current process — i.e. we're
@@ -248,8 +255,7 @@ pub fn snapshot_into_sibling(
             install_path.display()
         ))
     })?;
-    let backups_root = parent.join(".neon-backups");
-    snapshot_into(install_path, &backups_root, label, version)
+    snapshot_into_unique_parent(install_path, parent, label, version)
 }
 
 /// Test- and injection-friendly snapshot. Public to the crate so the
@@ -270,18 +276,60 @@ pub(crate) fn snapshot_into(
         Error::from(e).with_context(format!("create backups root {}", backups_root.display()))
     })?;
 
-    let stamp = unix_timestamp_secs();
-    let dir_name = match version {
-        Some(v) => format!("{label}-{v}-{stamp}"),
-        None => format!("{label}-{stamp}"),
+    snapshot_into_unique_parent(source, backups_root, label, version)
+}
+
+fn snapshot_into_unique_parent(
+    source: &Path,
+    parent: &Path,
+    label: &str,
+    version: Option<&str>,
+) -> Result<BackupHandle> {
+    let label = snapshot_path_component(label);
+    let version = version.map(snapshot_path_component);
+    let prefix = match version {
+        Some(version) => format!(".silvervine-{label}-{version}-"),
+        None => format!(".silvervine-{label}-"),
     };
-    let snapshot = backups_root.join(dir_name);
+    let snapshot = tempfile::Builder::new()
+        .prefix(&prefix)
+        .rand_bytes(12)
+        .tempdir_in(parent)
+        .map_err(|error| {
+            Error::from(error).with_context(format!(
+                "exclusively create snapshot under {}",
+                parent.display()
+            ))
+        })?
+        .keep();
+
+    // Keep partial snapshots as recovery artifacts if copying fails. The
+    // destination was created atomically with a random name, so no existing
+    // file or symlink is ever reused or followed as the snapshot root.
     copy_dir_recursive(source, &snapshot)?;
     Ok(BackupHandle {
         original: source.to_path_buf(),
         snapshot,
         finalized: false,
     })
+}
+
+fn snapshot_path_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "snapshot".to_string()
+    } else {
+        sanitized
+    }
 }
 
 /// Recursively copy `src` into `dst`, mirroring `cp -R`.
@@ -372,12 +420,6 @@ fn copy_permissions(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn copy_permissions(_src: &Path, _dst: &Path) -> Result<()> {
     Ok(())
-}
-
-fn unix_timestamp_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
 }
 
 /// Delete backups in `backups_root` older than [`BACKUP_RETENTION`].
@@ -490,7 +532,7 @@ mod tests {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("")
-            .starts_with("Test-1.0-"));
+            .starts_with(".silvervine-Test-1.0-"));
     }
 
     #[test]
@@ -542,8 +584,8 @@ mod tests {
         // Original content is back.
         let restored = fs::read(bundle.join("hello.txt")).expect("read");
         assert_eq!(restored, b"hello");
-        // Restore cleans up after itself: no leftover backup or .neon-restore.
-        let stale = bundle.with_file_name("install.neon-restore");
+        // Restore cleans up after itself: no leftover backup or .silvervine-restore.
+        let stale = bundle.with_file_name("install.silvervine-restore");
         assert!(!stale.exists());
     }
 
@@ -607,22 +649,16 @@ mod tests {
         let snap = handle.snapshot_path();
         let name = snap.file_name().and_then(|s| s.to_str()).unwrap_or("");
         assert!(
-            name.starts_with("MyBrowser-v1-"),
-            "expected MyBrowser-v1-<ts>, got {name}"
+            name.starts_with(".silvervine-MyBrowser-v1-"),
+            "expected a random .silvervine-MyBrowser-v1-* name, got {name}"
         );
         handle.commit().expect("commit");
     }
 
     #[test]
-    fn unix_timestamp_is_nonzero() {
-        // Sanity: not exactly the epoch.
-        assert!(unix_timestamp_secs() > 1_700_000_000);
-    }
-
-    #[test]
-    fn default_backups_dir_resolves_under_neon_subdir() {
+    fn default_backups_dir_resolves_under_silvervine_subdir() {
         if let Some(p) = default_backups_dir() {
-            let suffix = std::path::Path::new("neon").join("backups");
+            let suffix = std::path::Path::new("silvervine").join("backups");
             assert!(p.ends_with(&suffix), "got {}", p.display());
         }
     }
@@ -680,7 +716,7 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let bundle = tmp.path().join("install");
         build_fake_bundle(&bundle);
-        // This will write to `~/.cache/neon/backups/<name>-<ts>/` on a
+        // This will write to `~/.cache/silvervine/backups/<name>-<ts>/` on a
         // dev machine, which is fine for a test (we clean up immediately).
         // If `dirs::cache_dir()` is None, snapshot returns a state-corrupted
         // error — also fine.
@@ -696,7 +732,14 @@ mod tests {
         }
     }
 
-    /// `snapshot_into_sibling` places the backup under `<install-parent>/.neon-backups/`.
+    #[test]
+    fn snapshot_components_cannot_escape_backup_root() {
+        assert_eq!(snapshot_path_component("../../Browser"), ".._.._Browser");
+        assert_eq!(snapshot_path_component("4/10/1"), "4_10_1");
+        assert_eq!(snapshot_path_component(""), "snapshot");
+    }
+
+    /// `snapshot_into_sibling` exclusively creates a random direct sibling.
     #[test]
     fn snapshot_into_sibling_places_backup_in_install_parent() {
         let tmp = TempDir::new().expect("tempdir");
@@ -705,21 +748,31 @@ mod tests {
         build_fake_bundle(&install);
         let handle = snapshot_into_sibling(&install, "Helium", Some("1.0")).expect("snapshot");
         let snap = handle.snapshot_path();
-        let backups_root = parent.join(".neon-backups");
-        assert!(
-            snap.starts_with(&backups_root),
-            "snapshot {} should be under {}",
-            snap.display(),
-            backups_root.display()
-        );
-        // Same-filesystem invariant: the backup root and the install
-        // share a parent directory, so atomic_rename can swap between
-        // them without EXDEV.
-        assert_eq!(
-            snap.parent().and_then(|p| p.parent()),
-            Some(parent.as_path())
-        );
+        assert_eq!(snap.parent(), Some(parent.as_path()));
+        assert!(snap.file_name().is_some_and(|name| name
+            .to_string_lossy()
+            .starts_with(".silvervine-Helium-1.0-")));
         let _ = handle.commit();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sibling_snapshot_ignores_preplaced_backup_symlink() {
+        let tmp = TempDir::new().expect("tempdir");
+        let parent = tmp.path().join("opt");
+        let install = parent.join("helium-browser-bin");
+        let victim = tmp.path().join("victim");
+        build_fake_bundle(&install);
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("hello.txt"), b"victim").unwrap();
+        std::os::unix::fs::symlink(&victim, parent.join(".silvervine-backups")).unwrap();
+
+        let handle = snapshot_into_sibling(&install, "Helium", Some("1.0")).expect("snapshot");
+        assert_eq!(handle.snapshot_path().parent(), Some(parent.as_path()));
+        assert_ne!(handle.snapshot_path(), parent.join(".silvervine-backups"));
+        assert_eq!(fs::read(victim.join("hello.txt")).unwrap(), b"victim");
+        assert!(parent.join(".silvervine-backups").is_symlink());
+        handle.commit().unwrap();
     }
 
     /// `snapshot_into_sibling` produces a same-filesystem backup that
@@ -773,8 +826,8 @@ mod tests {
                     .and_then(|s| s.to_str())
                     .unwrap_or("");
                 assert!(
-                    name.starts_with("TestyBrowser-v1.2.3-"),
-                    "expected TestyBrowser-v1.2.3-<ts>, got {name}"
+                    name.starts_with(".silvervine-TestyBrowser-v1.2.3-"),
+                    "expected a random .silvervine-TestyBrowser-v1.2.3-* name, got {name}"
                 );
                 handle.commit().expect("clean up");
             }

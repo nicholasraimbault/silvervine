@@ -1,9 +1,9 @@
 //! macOS daemon registration via `LaunchAgent` plist.
 //!
-//! Writes `~/Library/LaunchAgents/com.neon.tray.plist` and runs:
+//! Writes `~/Library/LaunchAgents/com.nicholasraimbault.silvervine.tray.plist` and runs:
 //!
 //! ```sh
-//! launchctl bootstrap gui/<uid> ~/Library/LaunchAgents/com.neon.tray.plist
+//! launchctl bootstrap gui/<uid> ~/Library/LaunchAgents/com.nicholasraimbault.silvervine.tray.plist
 //! ```
 //!
 //! `launchctl bootstrap gui/<uid>` is **user-domain** — it doesn't need
@@ -21,7 +21,7 @@
 //! <plist version="1.0">
 //! <dict>
 //!     <key>Label</key>
-//!     <string>com.neon.tray</string>
+//!     <string>com.nicholasraimbault.silvervine.tray</string>
 //!     <key>ProgramArguments</key>
 //!     <array>
 //!         <string><current_exe></string>
@@ -34,9 +34,9 @@
 //!         <false/>
 //!     </dict>
 //!     <key>StandardOutPath</key>
-//!     <string>~/Library/Logs/neon/tray.log</string>
+//!     <string>~/Library/Logs/silvervine/tray.log</string>
 //!     <key>StandardErrorPath</key>
-//!     <string>~/Library/Logs/neon/tray.log</string>
+//!     <string>~/Library/Logs/silvervine/tray.log</string>
 //!     <key>ProcessType</key>
 //!     <string>Interactive</string>
 //! </dict>
@@ -45,7 +45,7 @@
 //!
 //! `ProcessType=Interactive` is the right choice for tray UI on Apple
 //! Silicon (lets the agent get window-server attention without being
-//! throttled). `KeepAlive.SuccessfulExit=false` means: if Neon exits
+//! throttled). `KeepAlive.SuccessfulExit=false` means: if Silvervine exits
 //! cleanly, don't auto-restart it; if it crashes, do.
 //!
 //! ## Path resolution
@@ -59,12 +59,16 @@ use std::process::Command;
 use crate::error::{Error, Result};
 
 /// `Label=` value embedded in the plist; also used by `launchctl bootout`.
-const LABEL: &str = "com.neon.tray";
+const LABEL: &str = "com.nicholasraimbault.silvervine.tray";
 
 /// Plist file name (under `~/Library/LaunchAgents/`).
-const PLIST_NAME: &str = "com.neon.tray.plist";
+const PLIST_NAME: &str = "com.nicholasraimbault.silvervine.tray.plist";
 
-/// Resolve `~/Library/LaunchAgents/com.neon.tray.plist`.
+/// Neon V2 registration retired when Silvervine is registered.
+const LEGACY_LABEL: &str = "com.neon.tray";
+const LEGACY_PLIST_NAME: &str = "com.neon.tray.plist";
+
+/// Resolve `~/Library/LaunchAgents/com.nicholasraimbault.silvervine.tray.plist`.
 pub(super) fn registration_path() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .ok_or_else(|| Error::other("cannot resolve LaunchAgents path: $HOME unset"))?;
@@ -74,14 +78,14 @@ pub(super) fn registration_path() -> Result<PathBuf> {
         .join(PLIST_NAME))
 }
 
-/// Resolve `~/Library/Logs/neon/tray.log` for stdout/stderr redirect.
+/// Resolve `~/Library/Logs/silvervine/tray.log` for stdout/stderr redirect.
 fn log_path() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .ok_or_else(|| Error::other("cannot resolve log path: $HOME unset"))?;
     Ok(PathBuf::from(home)
         .join("Library")
         .join("Logs")
-        .join("neon")
+        .join("silvervine")
         .join("tray.log"))
 }
 
@@ -127,75 +131,293 @@ pub(super) fn plist_body(exec_path: &Path, log: &Path) -> String {
 }
 
 pub(super) fn register() -> Result<()> {
+    register_with(&mut launchctl_required, &mut launchctl_loaded)
+}
+
+fn register_with(
+    run: &mut dyn FnMut(&[&str]) -> Result<()>,
+    probe: &mut dyn FnMut(&str) -> Result<bool>,
+) -> Result<()> {
     let exe = std::env::current_exe()
         .map_err(|e| Error::other("could not resolve current executable").with_source(e))?;
     let plist_path = registration_path()?;
     let log = log_path()?;
-    write_register_artifacts(&plist_path, &exe, &log)?;
-    let uid = current_uid();
-    // bootout is best-effort: if we never bootstrapped before, this
-    // returns "service not found", which is fine.
-    let _ = launchctl(&["bootout", &gui_target(uid)]);
-    launchctl_required(&[
-        "bootstrap",
-        &gui_domain(uid),
-        plist_path.to_string_lossy().as_ref(),
-    ])?;
-    tracing::info!(
-        path = %plist_path.display(),
-        "registered Neon LaunchAgent"
-    );
-    Ok(())
-}
-
-pub(super) fn unregister() -> Result<()> {
-    let plist_path = registration_path()?;
-    let uid = current_uid();
-    // Best-effort bootout: even if the agent isn't loaded, the rm step
-    // below is what actually un-registers.
-    let _ = launchctl(&["bootout", &gui_target(uid)]);
-    remove_plist_if_present(&plist_path)?;
-    tracing::info!(
-        path = %plist_path.display(),
-        "unregistered Neon LaunchAgent"
-    );
-    Ok(())
-}
-
-/// File-system half of `register()`: ensure the log directory exists
-/// then write the plist. Pulled into a helper so tests can exercise it
-/// without invoking `launchctl`.
-fn write_register_artifacts(plist_path: &Path, exe: &Path, log: &Path) -> Result<()> {
     if let Some(parent) = log.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             Error::from(e).with_source_message(format!("could not create {}", parent.display()))
         })?;
     }
-    write_plist(plist_path, &plist_body(exe, log))
+    register_transaction(
+        &plist_path,
+        plist_body(&exe, &log).as_bytes(),
+        current_uid(),
+        run,
+        probe,
+        &mut atomic_write,
+    )
 }
 
-/// File-system half of `unregister()`: remove the plist if present.
-/// Idempotent — missing-file is `Ok(())`.
-fn remove_plist_if_present(plist_path: &Path) -> Result<()> {
-    if plist_path.exists() {
-        std::fs::remove_file(plist_path).map_err(|e| {
-            Error::from(e).with_source_message(format!("could not remove {}", plist_path.display()))
-        })?;
+fn register_transaction(
+    plist_path: &Path,
+    new_body: &[u8],
+    uid: u32,
+    run: &mut dyn FnMut(&[&str]) -> Result<()>,
+    probe: &mut dyn FnMut(&str) -> Result<bool>,
+    write: &mut dyn FnMut(&Path, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let previous = match std::fs::read(plist_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(Error::from(error)),
+    };
+    let target = gui_target(uid);
+    let was_loaded = previous.is_some() && probe(&target)?;
+    if was_loaded {
+        run(&["bootout", &target])?;
+    }
+    let attempt = (|| {
+        write(plist_path, new_body)?;
+        run(&[
+            "bootstrap",
+            &gui_domain(uid),
+            plist_path.to_string_lossy().as_ref(),
+        ])
+    })();
+    if let Err(error) = attempt {
+        let mut failures = Vec::new();
+        // A failed bootstrap can still have partially loaded the job. Probe
+        // instead of treating a normal "not loaded" bootout failure as a
+        // rollback failure.
+        match probe(&target) {
+            Ok(true) => record_failure(
+                &mut failures,
+                "boot out the attempted LaunchAgent",
+                run(&["bootout", &target]),
+            ),
+            Ok(false) => {}
+            Err(probe_error) => {
+                failures.push(("probe attempted LaunchAgent during rollback", probe_error))
+            }
+        }
+        record_failure(
+            &mut failures,
+            "restore the previous plist",
+            restore_plist(plist_path, previous.as_deref(), write),
+        );
+        if was_loaded {
+            record_failure(
+                &mut failures,
+                "reload the previous LaunchAgent",
+                run(&[
+                    "bootstrap",
+                    &gui_domain(uid),
+                    plist_path.to_string_lossy().as_ref(),
+                ]),
+            );
+        }
+        return Err(with_rollback_failures(error, &failures));
+    }
+    tracing::info!(path = %plist_path.display(), "registered Silvervine LaunchAgent");
+    Ok(())
+}
+
+fn restore_plist(
+    path: &Path,
+    previous: Option<&[u8]>,
+    write: &mut dyn FnMut(&Path, &[u8]) -> Result<()>,
+) -> Result<()> {
+    match previous {
+        Some(bytes) => write(path, bytes),
+        None => remove_plist_if_present(path),
+    }
+}
+
+fn record_failure(
+    failures: &mut Vec<(&'static str, Error)>,
+    action: &'static str,
+    result: Result<()>,
+) {
+    if let Err(error) = result {
+        failures.push((action, error));
+    }
+}
+
+fn with_rollback_failures(primary: Error, failures: &[(&'static str, Error)]) -> Error {
+    if failures.is_empty() {
+        return primary;
+    }
+    let category = primary.category;
+    let details = failures
+        .iter()
+        .map(|(action, error)| format!("{action}: {error}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Error::new(category, format!("{primary}; rollback failed: {details}")).with_source(primary)
+}
+
+pub(super) fn legacy_is_registered() -> Result<bool> {
+    registration_file_exists(&registration_path()?.with_file_name(LEGACY_PLIST_NAME))
+}
+
+pub(super) fn stop_legacy() -> Result<bool> {
+    let path = registration_path()?.with_file_name(LEGACY_PLIST_NAME);
+    let target = gui_target_for(current_uid(), LEGACY_LABEL);
+    stop_legacy_with(
+        &path,
+        &target,
+        &mut launchctl_required,
+        &mut launchctl_loaded,
+    )
+}
+
+fn stop_legacy_with(
+    path: &Path,
+    target: &str,
+    run: &mut dyn FnMut(&[&str]) -> Result<()>,
+    probe: &mut dyn FnMut(&str) -> Result<bool>,
+) -> Result<bool> {
+    if !registration_file_exists(path)? {
+        return Ok(false);
+    }
+    let was_loaded = probe(target)?;
+    if was_loaded {
+        run(&["bootout", target])?;
+    }
+    Ok(was_loaded)
+}
+
+pub(super) fn restore_legacy(was_running: bool) -> Result<()> {
+    if !was_running {
+        return Ok(());
+    }
+    let path = registration_path()?.with_file_name(LEGACY_PLIST_NAME);
+    if !registration_file_exists(&path)? {
+        return Err(Error::other(
+            "cannot restore the previously loaded Neon LaunchAgent: registration is missing",
+        ));
+    }
+    launchctl_required(&[
+        "bootstrap",
+        &gui_domain(current_uid()),
+        path.to_string_lossy().as_ref(),
+    ])
+}
+
+pub(super) fn remove_legacy_registration() -> Result<()> {
+    remove_plist_if_present(&registration_path()?.with_file_name(LEGACY_PLIST_NAME))
+}
+
+pub(super) fn unregister() -> Result<()> {
+    let plist_path = registration_path()?;
+    if !plist_path.try_exists().map_err(Error::from)? {
+        return Ok(());
+    }
+    unregister_with(&mut launchctl_required, &mut launchctl_loaded)
+}
+
+pub(super) fn unregister_for_rollback() -> Result<()> {
+    unregister_with(&mut launchctl_required, &mut launchctl_loaded)
+}
+
+fn unregister_with(
+    run: &mut dyn FnMut(&[&str]) -> Result<()>,
+    probe: &mut dyn FnMut(&str) -> Result<bool>,
+) -> Result<()> {
+    let plist_path = registration_path()?;
+    let target = gui_target(current_uid());
+    unregister_transaction(&plist_path, &target, current_uid(), run, probe)?;
+    tracing::info!(
+        path = %plist_path.display(),
+        "unregistered Silvervine LaunchAgent"
+    );
+    Ok(())
+}
+
+fn unregister_transaction(
+    plist_path: &Path,
+    target: &str,
+    uid: u32,
+    run: &mut dyn FnMut(&[&str]) -> Result<()>,
+    probe: &mut dyn FnMut(&str) -> Result<bool>,
+) -> Result<()> {
+    if !registration_file_exists(plist_path)? {
+        // A failed earlier rollback can leave a loaded job after its plist was
+        // removed. Boot it out before callers move data back; a genuinely
+        // absent job remains a no-op.
+        if probe(target)? {
+            run(&["bootout", target])?;
+        }
+        return Ok(());
+    }
+    let was_loaded = probe(target)?;
+    if was_loaded {
+        run(&["bootout", target])?;
+    }
+    if let Err(error) = remove_plist_if_present(plist_path) {
+        if was_loaded {
+            let rollback = run(&[
+                "bootstrap",
+                &gui_domain(uid),
+                plist_path.to_string_lossy().as_ref(),
+            ]);
+            if let Err(rollback) = rollback {
+                return Err(with_rollback_failures(
+                    error,
+                    &[("reload LaunchAgent after plist removal failure", rollback)],
+                ));
+            }
+        }
+        return Err(error);
     }
     Ok(())
 }
 
+/// File-system half of `unregister()`: remove the plist if present.
+/// Idempotent — missing-file is `Ok(())`.
+fn registration_file_exists(path: &Path) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(Error::other(format!(
+            "daemon registration path is not a file: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(Error::from(error).with_source_message(format!(
+            "could not inspect daemon registration {}",
+            path.display()
+        ))),
+    }
+}
+
+fn remove_plist_if_present(plist_path: &Path) -> Result<()> {
+    match std::fs::remove_file(plist_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::from(error)
+            .with_source_message(format!("could not remove {}", plist_path.display()))),
+    }
+}
+
 /// Write `body` to `path`, creating parent directories.
+#[cfg(test)]
 fn write_plist(path: &Path, body: &str) -> Result<()> {
+    atomic_write(path, body.as_bytes())
+}
+
+fn atomic_write(path: &Path, body: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             Error::from(e).with_source_message(format!("could not create {}", parent.display()))
         })?;
     }
-    std::fs::write(path, body).map_err(|e| {
-        Error::from(e).with_source_message(format!("could not write {}", path.display()))
+    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temp, body).map_err(|e| {
+        Error::from(e).with_source_message(format!("could not write {}", temp.display()))
     })?;
-    Ok(())
+    std::fs::rename(&temp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        Error::from(e).with_source_message(format!("could not replace {}", path.display()))
+    })
 }
 
 /// Current user's effective UID. We use `libc::geteuid()` which is
@@ -213,7 +435,11 @@ fn gui_domain(uid: u32) -> String {
 
 /// `gui/<uid>/<label>` — the per-service target string for `bootout`.
 fn gui_target(uid: u32) -> String {
-    format!("gui/{uid}/{LABEL}")
+    gui_target_for(uid, LABEL)
+}
+
+fn gui_target_for(uid: u32, label: &str) -> String {
+    format!("gui/{uid}/{label}")
 }
 
 /// Best-effort launchctl: returns the captured output regardless of
@@ -229,6 +455,26 @@ fn launchctl(args: &[&str]) -> Result<std::process::Output> {
 
 /// `launchctl` that surfaces a non-zero exit as an error. Used for
 /// `bootstrap` where failure means the LaunchAgent isn't registered.
+fn launchctl_loaded(target: &str) -> Result<bool> {
+    let output = launchctl(&["print", target])?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let normalized = stderr.to_ascii_lowercase();
+    if normalized.contains("could not find service")
+        || normalized.contains("service not found")
+        || normalized.contains("no such process")
+    {
+        return Ok(false);
+    }
+    Err(Error::other(format!(
+        "launchctl print {target} failed (exit {:?}): {}",
+        output.status.code(),
+        stderr.trim()
+    )))
+}
+
 fn launchctl_required(args: &[&str]) -> Result<()> {
     let output = launchctl(args)?;
     if !output.status.success() {
@@ -300,7 +546,7 @@ mod tests {
             tmp.path()
                 .join("Library")
                 .join("LaunchAgents")
-                .join("com.neon.tray.plist")
+                .join("com.nicholasraimbault.silvervine.tray.plist")
         );
     }
 
@@ -323,7 +569,7 @@ mod tests {
             tmp.path()
                 .join("Library")
                 .join("Logs")
-                .join("neon")
+                .join("silvervine")
                 .join("tray.log")
         );
     }
@@ -331,13 +577,13 @@ mod tests {
     #[test]
     fn plist_body_contains_required_keys() {
         let body = plist_body(
-            Path::new("/usr/local/bin/neon"),
-            Path::new("/var/log/neon.log"),
+            Path::new("/usr/local/bin/silvervine"),
+            Path::new("/var/log/silvervine.log"),
         );
         assert!(body.contains("<key>Label</key>"));
-        assert!(body.contains("<string>com.neon.tray</string>"));
+        assert!(body.contains("<string>com.nicholasraimbault.silvervine.tray</string>"));
         assert!(body.contains("<key>ProgramArguments</key>"));
-        assert!(body.contains("<string>/usr/local/bin/neon</string>"));
+        assert!(body.contains("<string>/usr/local/bin/silvervine</string>"));
         assert!(body.contains("<key>RunAtLoad</key>"));
         assert!(body.contains("<true/>"));
         assert!(body.contains("<key>KeepAlive</key>"));
@@ -345,7 +591,7 @@ mod tests {
         assert!(body.contains("<false/>"));
         assert!(body.contains("<key>StandardOutPath</key>"));
         assert!(body.contains("<key>StandardErrorPath</key>"));
-        assert!(body.contains("<string>/var/log/neon.log</string>"));
+        assert!(body.contains("<string>/var/log/silvervine.log</string>"));
         assert!(body.contains("<key>ProcessType</key>"));
         assert!(body.contains("<string>Interactive</string>"));
     }
@@ -390,7 +636,10 @@ mod tests {
 
     #[test]
     fn gui_target_format() {
-        assert_eq!(gui_target(501), "gui/501/com.neon.tray");
+        assert_eq!(
+            gui_target(501),
+            "gui/501/com.nicholasraimbault.silvervine.tray"
+        );
     }
 
     #[test]
@@ -435,25 +684,122 @@ mod tests {
     }
 
     #[test]
-    fn write_register_artifacts_creates_log_dir_and_writes_plist() {
+    fn register_with_absent_legacy_does_not_bootout_legacy() {
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
-        let plist = tmp.path().join("Library/LaunchAgents/com.neon.tray.plist");
-        let log = tmp.path().join("Library/Logs/neon/tray.log");
-        let exe = Path::new("/usr/local/bin/neon");
-        write_register_artifacts(&plist, exe, &log).expect("ok");
-        // Plist exists with the right exe path.
-        assert!(plist.exists(), "plist must be written");
-        let body = std::fs::read_to_string(&plist).unwrap();
-        assert!(body.contains("<string>/usr/local/bin/neon</string>"));
-        // Log directory was created (the file itself doesn't exist
-        // yet — that's the daemon's job at runtime).
-        assert!(log.parent().unwrap().is_dir(), "log dir must be created");
+        let _home = ScopedEnv::set("HOME", tmp.path());
+        let mut calls = Vec::new();
+        register_with(
+            &mut |args| {
+                calls.push(args.join(" "));
+                Ok(())
+            },
+            &mut |_| Ok(false),
+        )
+        .unwrap();
+        assert!(!calls.iter().any(|call| call.contains(LEGACY_LABEL)));
+    }
+
+    #[test]
+    fn legacy_stop_failure_preserves_plist() {
+        let _guard = crate::test_support::env_lock();
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedEnv::set("HOME", tmp.path());
+        let legacy = registration_path()
+            .unwrap()
+            .with_file_name(LEGACY_PLIST_NAME);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "legacy").unwrap();
+        let result = stop_legacy_with(
+            &legacy,
+            "gui/1/legacy",
+            &mut |_| Err(Error::other("stop failed")),
+            &mut |_| Ok(true),
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(legacy).unwrap(), "legacy");
+    }
+
+    #[test]
+    fn current_stop_failure_preserves_plist() {
+        let _guard = crate::test_support::env_lock();
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedEnv::set("HOME", tmp.path());
+        let plist = registration_path().unwrap();
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, "current").unwrap();
+        let result = unregister_with(&mut |_| Err(Error::other("stop failed")), &mut |_| Ok(true));
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(plist).unwrap(), "current");
+    }
+
+    #[test]
+    fn unregister_success_stops_before_removing_plist() {
+        let _guard = crate::test_support::env_lock();
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedEnv::set("HOME", tmp.path());
+        let plist = registration_path().unwrap();
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, "current").unwrap();
+        let mut saw_plist_during_stop = false;
+        unregister_with(
+            &mut |_| {
+                saw_plist_during_stop = plist.is_file();
+                Ok(())
+            },
+            &mut |_| Ok(true),
+        )
+        .unwrap();
+        assert!(saw_plist_during_stop);
+        assert!(!plist.exists());
+    }
+
+    #[test]
+    fn unregister_boots_out_loaded_job_even_when_plist_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let plist = tmp.path().join(PLIST_NAME);
+        let mut calls = Vec::new();
+        unregister_transaction(
+            &plist,
+            "gui/501/com.example.silvervine",
+            501,
+            &mut |args| {
+                calls.push(args.join(" "));
+                Ok(())
+            },
+            &mut |_| Ok(true),
+        )
+        .unwrap();
+        assert_eq!(calls, ["bootout gui/501/com.example.silvervine"]);
+    }
+
+    #[test]
+    fn unregister_removes_stale_unloaded_plist_without_bootout() {
+        let tmp = TempDir::new().unwrap();
+        let plist = tmp.path().join(PLIST_NAME);
+        std::fs::write(&plist, "stale").unwrap();
+        let mut calls = Vec::new();
+        unregister_transaction(
+            &plist,
+            "gui/501/com.example.silvervine",
+            501,
+            &mut |args| {
+                calls.push(args.join(" "));
+                Ok(())
+            },
+            &mut |_| Ok(false),
+        )
+        .unwrap();
+        assert!(calls.is_empty());
+        assert!(!plist.exists());
     }
 
     #[test]
     fn remove_plist_if_present_removes_existing() {
         let tmp = TempDir::new().unwrap();
-        let plist = tmp.path().join("com.neon.tray.plist");
+        let plist = tmp
+            .path()
+            .join("com.nicholasraimbault.silvervine.tray.plist");
         std::fs::write(&plist, "body").unwrap();
         remove_plist_if_present(&plist).expect("ok");
         assert!(!plist.exists());
@@ -472,5 +818,140 @@ mod tests {
         let _guard = crate::test_support::env_lock();
         let _noop = ScopedEnv::set(super::super::NOOP_ENV, Path::new("1"));
         assert!(super::super::register().is_ok());
+    }
+
+    #[test]
+    fn stale_unloaded_legacy_plist_does_not_bootout() {
+        let tmp = TempDir::new().unwrap();
+        let plist = tmp.path().join(LEGACY_PLIST_NAME);
+        std::fs::write(&plist, b"legacy").unwrap();
+        let mut calls = Vec::new();
+        stop_legacy_with(
+            &plist,
+            "gui/501/com.neon.tray",
+            &mut |args| {
+                calls.push(args.join(" "));
+                Ok(())
+            },
+            &mut |_| Ok(false),
+        )
+        .unwrap();
+        assert!(calls.is_empty());
+        assert!(plist.is_file());
+    }
+
+    #[test]
+    fn transactional_register_success_replaces_loaded_plist() {
+        let tmp = TempDir::new().unwrap();
+        let plist = tmp.path().join(PLIST_NAME);
+        std::fs::write(&plist, b"old plist").unwrap();
+        let mut calls = Vec::new();
+        register_transaction(
+            &plist,
+            b"new plist",
+            501,
+            &mut |args| {
+                calls.push(args.join(" "));
+                Ok(())
+            },
+            &mut |_| Ok(true),
+            &mut atomic_write,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&plist).unwrap(), b"new plist");
+        assert!(calls[0].starts_with("bootout "));
+        assert!(calls[1].starts_with("bootstrap "));
+    }
+
+    #[test]
+    fn transactional_register_stop_failure_preserves_old_plist() {
+        let tmp = TempDir::new().unwrap();
+        let plist = tmp.path().join(PLIST_NAME);
+        std::fs::write(&plist, b"old plist").unwrap();
+        let result = register_transaction(
+            &plist,
+            b"new plist",
+            501,
+            &mut |_| Err(Error::other("stop failed")),
+            &mut |_| Ok(true),
+            &mut atomic_write,
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&plist).unwrap(), b"old plist");
+    }
+
+    #[test]
+    fn transactional_register_surfaces_rollback_failure() {
+        let tmp = TempDir::new().unwrap();
+        let plist = tmp.path().join(PLIST_NAME);
+        std::fs::write(&plist, b"old plist").unwrap();
+        let mut bootouts = 0;
+        let mut bootstraps = 0;
+        let error = register_transaction(
+            &plist,
+            b"new plist",
+            501,
+            &mut |args| match args.first().copied() {
+                Some("bootout") => {
+                    bootouts += 1;
+                    if bootouts == 2 {
+                        Err(Error::other("rollback bootout failed"))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Some("bootstrap") => {
+                    bootstraps += 1;
+                    if bootstraps == 1 {
+                        Err(Error::other("initial bootstrap failed"))
+                    } else {
+                        Ok(())
+                    }
+                }
+                _ => Ok(()),
+            },
+            &mut |_| Ok(true),
+            &mut atomic_write,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("initial bootstrap failed"));
+        assert!(error.to_string().contains("rollback bootout failed"));
+    }
+
+    #[test]
+    fn transactional_register_write_and_bootstrap_failures_restore() {
+        for fail_write in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let plist = tmp.path().join(PLIST_NAME);
+            std::fs::write(&plist, b"old plist").unwrap();
+            let mut writes = 0;
+            let mut bootstraps = 0;
+            let result = register_transaction(
+                &plist,
+                b"new plist",
+                501,
+                &mut |args| {
+                    if args.first() == Some(&"bootstrap") {
+                        bootstraps += 1;
+                        if !fail_write && bootstraps == 1 {
+                            return Err(Error::other("bootstrap failed"));
+                        }
+                    }
+                    Ok(())
+                },
+                &mut |_| Ok(true),
+                &mut |path, bytes| {
+                    writes += 1;
+                    if fail_write && writes == 1 {
+                        Err(Error::other("write failed"))
+                    } else {
+                        atomic_write(path, bytes)
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(&plist).unwrap(), b"old plist");
+            assert!(bootstraps >= 1, "old loaded service must be restarted");
+        }
     }
 }

@@ -1,4 +1,4 @@
-//! `neon launch <browser>` — verify-and-launch flow.
+//! `silvervine launch <browser>` — verify-and-launch flow.
 //!
 //! 1. Detect the named browser.
 //! 2. If not patched at the current CDM version, run `patch_browser`.
@@ -6,7 +6,7 @@
 //!
 //! ## Test guardrail
 //!
-//! Step 3 is gated behind `NEON_TEST_LAUNCH_NOOP=1`. Tests cover the
+//! Step 3 is gated behind `SILVERVINE_TEST_LAUNCH_NOOP=1`. Tests cover the
 //! verify-and-decide logic; the actual `Command::spawn` is never
 //! invoked from `cargo test`.
 
@@ -20,9 +20,9 @@ use crate::error::{Error, Result};
 
 /// Env var that, when set, makes [`spawn_detached`] return `Ok(())`
 /// without actually calling `Command::spawn`. Used by tests.
-pub const NOOP_ENV: &str = "NEON_TEST_LAUNCH_NOOP";
+pub const NOOP_ENV: &str = "SILVERVINE_TEST_LAUNCH_NOOP";
 
-/// Args for `neon launch`.
+/// Args for `silvervine launch`.
 #[derive(Debug, Clone, Default)]
 pub struct Args {
     /// Required positional: name of the browser to launch.

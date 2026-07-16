@@ -4,18 +4,21 @@
 //! daemon shells out to user-supplied scripts in the platform config directory,
 //! passing context as environment variables. The contract with the user is:
 //!
-//! * Hook scripts live at the path configured via `[hooks]` in the Neon config,
-//!   defaulting to `~/.config/neon/hooks/` on Linux and
-//!   `~/Library/Application Support/neon/hooks/` on macOS when no explicit
+//! * Hook scripts live at the path configured via `[hooks]` in the Silvervine config,
+//!   defaulting to `~/.config/silvervine/hooks/` on Linux and
+//!   `~/Library/Application Support/silvervine/hooks/` on macOS when no explicit
 //!   path is set.
 //! * Scripts must be **executable files** (`chmod +x`). Non-executable or
 //!   missing files are not an error — they're [`HookOutcome::NotConfigured`]
 //!   so a user who never wired up hooks doesn't get spurious daemon errors.
 //! * Scripts receive the event context via environment variables:
-//!   * `NEON_BROWSER` — display name of the affected browser, when relevant
-//!   * `NEON_VERSION` — browser version, when known
-//!   * `NEON_CDM_VERSION` — Widevine CDM version, when relevant
-//!   * `NEON_OUTCOME` — `"success"` or `"failure"`
+//!   * `SILVERVINE_BROWSER` — display name of the affected browser, when relevant
+//!   * `SILVERVINE_VERSION` — browser version, when known
+//!   * `SILVERVINE_CDM_VERSION` — Widevine CDM version, when relevant
+//!   * `SILVERVINE_OUTCOME` — `"success"` or `"failure"`
+//!
+//!   During 2.x, matching deprecated `NEON_*` aliases are exported as well.
+//!   If callers explicitly provide both names, neither value is overwritten.
 //!
 //!   Callers populate the [`HashMap`](std::collections::HashMap) passed to
 //!   [`run_hook`] with whichever keys apply to the event; missing keys are
@@ -42,13 +45,14 @@
 //! ```
 //!
 //! The first form resolves `name` against the platform config directory's
-//! `neon/hooks/<name>` path (honoring the `[hooks]` config block); the second
+//! `silvervine/hooks/<name>` path (honoring the `[hooks]` config block); the second
 //! form takes an explicit path.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::cli::patch::PatchReport;
 use crate::config::{load_config, Config};
 use crate::error::{Error, Result};
 
@@ -73,6 +77,63 @@ pub enum HookOutcome {
     },
 }
 
+/// Build the documented post-patch environment from a patch report.
+#[must_use]
+pub fn post_patch_context(report: &PatchReport) -> HashMap<String, String> {
+    let mut env = HashMap::from([
+        ("SILVERVINE_BROWSER".into(), report.browser.clone()),
+        (
+            "SILVERVINE_OUTCOME".into(),
+            if report.success { "success" } else { "failure" }.into(),
+        ),
+    ]);
+    if let Some(version) = report
+        .version_after
+        .as_ref()
+        .or(report.version_before.as_ref())
+    {
+        env.insert("SILVERVINE_VERSION".into(), version.clone());
+    }
+    if let Some(version) = &report.cdm_version {
+        env.insert("SILVERVINE_CDM_VERSION".into(), version.clone());
+    }
+    env
+}
+
+/// Build the documented post-update environment.
+#[must_use]
+pub fn post_update_context(cdm_version: Option<&str>, success: bool) -> HashMap<String, String> {
+    let mut env = HashMap::from([(
+        "SILVERVINE_OUTCOME".into(),
+        if success { "success" } else { "failure" }.into(),
+    )]);
+    if let Some(version) = cdm_version {
+        env.insert("SILVERVINE_CDM_VERSION".into(), version.into());
+    }
+    env
+}
+
+/// Emit a post-patch hook without changing the patch result on hook failure.
+pub fn emit_post_patch(report: &PatchReport) {
+    emit("post-patch", &post_patch_context(report));
+}
+
+/// Emit a post-update hook without changing the update result on hook failure.
+pub fn emit_post_update(cdm_version: Option<&str>, success: bool) {
+    emit("post-update", &post_update_context(cdm_version, success));
+}
+
+fn emit(name: &str, env: &HashMap<String, String>) {
+    if let Err(error) = run_hook(name, env) {
+        tracing::warn!(
+            target: "silvervine::hooks",
+            hook = name,
+            error = %error,
+            "hook configuration or spawn failed; completed operation is unchanged"
+        );
+    }
+}
+
 impl HookOutcome {
     /// `true` if no hook script was found / configured. Useful in tracing
     /// output: `if outcome.is_not_configured() { skip; }`.
@@ -92,10 +153,10 @@ impl HookOutcome {
 ///
 /// The hook path is resolved against the user's config:
 ///
-/// 1. If `[hooks]` in the Neon config sets `post_patch =` or
+/// 1. If `[hooks]` in the Silvervine config sets `post_patch =` or
 ///    `post_update =` for the named event, that path is used (with `~`
 ///    expansion).
-/// 2. Otherwise `neon/hooks/<name>` under the platform config directory is
+/// 2. Otherwise `silvervine/hooks/<name>` under the platform config directory is
 ///    tried.
 /// 3. If neither resolves to an executable file, returns
 ///    [`HookOutcome::NotConfigured`] without an error.
@@ -113,10 +174,10 @@ impl HookOutcome {
 /// ```no_run
 /// use std::collections::HashMap;
 /// let mut env = HashMap::new();
-/// env.insert("NEON_BROWSER".to_string(), "Helium".to_string());
-/// env.insert("NEON_VERSION".to_string(), "128.0.6613.119".to_string());
-/// env.insert("NEON_OUTCOME".to_string(), "success".to_string());
-/// let _ = neon::hooks::run_hook("post-patch", &env);
+/// env.insert("SILVERVINE_BROWSER".to_string(), "Helium".to_string());
+/// env.insert("SILVERVINE_VERSION".to_string(), "128.0.6613.119".to_string());
+/// env.insert("SILVERVINE_OUTCOME".to_string(), "success".to_string());
+/// let _ = silvervine::hooks::run_hook("post-patch", &env);
 /// ```
 pub fn run_hook<S: std::hash::BuildHasher>(
     name: &str,
@@ -145,23 +206,24 @@ pub fn run_hook_at<S: std::hash::BuildHasher>(
 ) -> Result<HookOutcome> {
     if !is_executable_file(path) {
         tracing::debug!(
-            target: "neon::hooks",
+            target: "silvervine::hooks",
             hook_path = %path.display(),
             "hook not configured (missing or non-executable)"
         );
         return Ok(HookOutcome::NotConfigured);
     }
 
+    let hook_env = with_compat_aliases(env);
     tracing::info!(
-        target: "neon::hooks",
+        target: "silvervine::hooks",
         hook_path = %path.display(),
-        env_count = env.len(),
+        env_count = hook_env.len(),
         "running hook"
     );
 
     let mut cmd = Command::new(path);
-    for (k, v) in env {
-        cmd.env(k, v);
+    for (key, value) in hook_env {
+        cmd.env(key, value);
     }
     let output = cmd.output().map_err(|e| {
         Error::other(format!("failed to spawn hook at {}: {e}", path.display())).with_source(e)
@@ -173,7 +235,7 @@ pub fn run_hook_at<S: std::hash::BuildHasher>(
 
     if !output.status.success() {
         tracing::warn!(
-            target: "neon::hooks",
+            target: "silvervine::hooks",
             hook_path = %path.display(),
             exit_status = ?exit_status,
             stderr_len = stderr.len(),
@@ -186,6 +248,32 @@ pub fn run_hook_at<S: std::hash::BuildHasher>(
         stdout,
         stderr,
     })
+}
+
+fn with_compat_aliases<S: std::hash::BuildHasher>(
+    env: &HashMap<String, String, S>,
+) -> HashMap<String, String> {
+    let mut expanded: HashMap<String, String> = env
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    for suffix in ["BROWSER", "VERSION", "CDM_VERSION", "OUTCOME"] {
+        let current = format!("SILVERVINE_{suffix}");
+        let legacy = format!("NEON_{suffix}");
+        match (
+            expanded.get(&current).cloned(),
+            expanded.get(&legacy).cloned(),
+        ) {
+            (Some(value), None) => {
+                expanded.insert(legacy, value);
+            }
+            (None, Some(value)) => {
+                expanded.insert(current, value);
+            }
+            _ => {}
+        }
+    }
+    expanded
 }
 
 /// Look up the script path for a named hook in the user's config, falling
@@ -203,9 +291,9 @@ fn resolve_hook_path(name: &str, config: &Config) -> Option<PathBuf> {
     if let Some(p) = configured {
         return Some(p);
     }
-    // 2. Default: <platform-config-dir>/neon/hooks/<name>
+    // 2. Default: <platform-config-dir>/silvervine/hooks/<name>
     let cfg = dirs::config_dir()?;
-    Some(cfg.join("neon").join("hooks").join(name))
+    Some(cfg.join("silvervine").join("hooks").join(name))
 }
 
 /// Returns `true` if `path` is a regular file with at least one execute bit
@@ -271,6 +359,47 @@ mod tests {
         std::fs::set_permissions(path, perms).unwrap();
     }
 
+    #[test]
+    fn post_patch_context_covers_success_and_failure() {
+        let success = PatchReport {
+            browser: "Helium".into(),
+            success: true,
+            cdm_version: Some("4.10".into()),
+            version_before: Some("127".into()),
+            version_after: Some("128".into()),
+            dry_run: false,
+            error: None,
+        };
+        let context = post_patch_context(&success);
+        assert_eq!(context["SILVERVINE_BROWSER"], "Helium");
+        assert_eq!(context["SILVERVINE_VERSION"], "128");
+        assert_eq!(context["SILVERVINE_CDM_VERSION"], "4.10");
+        assert_eq!(context["SILVERVINE_OUTCOME"], "success");
+
+        let failure = PatchReport {
+            browser: "Thorium".into(),
+            success: false,
+            cdm_version: None,
+            version_before: None,
+            version_after: None,
+            dry_run: false,
+            error: Some("failed".into()),
+        };
+        let context = post_patch_context(&failure);
+        assert_eq!(context["SILVERVINE_OUTCOME"], "failure");
+        assert!(!context.contains_key("SILVERVINE_CDM_VERSION"));
+    }
+
+    #[test]
+    fn post_update_context_covers_success_and_failure() {
+        let success = post_update_context(Some("4.10"), true);
+        assert_eq!(success["SILVERVINE_CDM_VERSION"], "4.10");
+        assert_eq!(success["SILVERVINE_OUTCOME"], "success");
+        let failure = post_update_context(None, false);
+        assert_eq!(failure["SILVERVINE_OUTCOME"], "failure");
+        assert!(!failure.contains_key("SILVERVINE_CDM_VERSION"));
+    }
+
     /// Missing path → `NotConfigured`.
     #[test]
     fn run_hook_at_missing_returns_not_configured() {
@@ -302,10 +431,15 @@ mod tests {
             &hook,
             &format!(
                 r#"#!/bin/sh
-echo "browser=${{NEON_BROWSER:-unset}}" > {log}
-echo "version=${{NEON_VERSION:-unset}}" >> {log}
-echo "outcome=${{NEON_OUTCOME:-unset}}" >> {log}
-echo "extra=${{NEON_EXTRA:-unset}}" >> {log}
+echo "browser=${{SILVERVINE_BROWSER:-unset}}" > {log}
+echo "version=${{SILVERVINE_VERSION:-unset}}" >> {log}
+echo "outcome=${{SILVERVINE_OUTCOME:-unset}}" >> {log}
+echo "cdm=${{SILVERVINE_CDM_VERSION:-unset}}" >> {log}
+echo "legacy_browser=${{NEON_BROWSER:-unset}}" >> {log}
+echo "legacy_version=${{NEON_VERSION:-unset}}" >> {log}
+echo "legacy_cdm=${{NEON_CDM_VERSION:-unset}}" >> {log}
+echo "legacy_outcome=${{NEON_OUTCOME:-unset}}" >> {log}
+echo "extra=${{SILVERVINE_EXTRA:-unset}}" >> {log}
 echo "ran"
 exit 0
 "#,
@@ -314,9 +448,10 @@ exit 0
         );
 
         let mut env = HashMap::new();
-        env.insert("NEON_BROWSER".into(), "Helium".into());
-        env.insert("NEON_VERSION".into(), "128.0.6613.119".into());
-        env.insert("NEON_OUTCOME".into(), "success".into());
+        env.insert("SILVERVINE_BROWSER".into(), "Helium".into());
+        env.insert("SILVERVINE_VERSION".into(), "128.0.6613.119".into());
+        env.insert("SILVERVINE_CDM_VERSION".into(), "4.10.0.0".into());
+        env.insert("SILVERVINE_OUTCOME".into(), "success".into());
 
         let outcome = run_hook_at(&hook, &env).unwrap();
         assert!(outcome.is_ran());
@@ -339,8 +474,39 @@ exit 0
             "{log_contents}"
         );
         assert!(log_contents.contains("outcome=success"), "{log_contents}");
+        assert!(log_contents.contains("cdm=4.10.0.0"), "{log_contents}");
+        assert!(
+            log_contents.contains("legacy_browser=Helium"),
+            "{log_contents}"
+        );
+        assert!(
+            log_contents.contains("legacy_version=128.0.6613.119"),
+            "{log_contents}"
+        );
+        assert!(
+            log_contents.contains("legacy_cdm=4.10.0.0"),
+            "{log_contents}"
+        );
+        assert!(
+            log_contents.contains("legacy_outcome=success"),
+            "{log_contents}"
+        );
         // Variable not in env should be the script's default.
         assert!(log_contents.contains("extra=unset"), "{log_contents}");
+    }
+
+    #[test]
+    fn compatibility_aliases_do_not_overwrite_explicit_values() {
+        let env = HashMap::from([
+            ("SILVERVINE_BROWSER".into(), "current".into()),
+            ("NEON_BROWSER".into(), "legacy".into()),
+            ("NEON_OUTCOME".into(), "old-only".into()),
+        ]);
+        let expanded = with_compat_aliases(&env);
+        assert_eq!(expanded["SILVERVINE_BROWSER"], "current");
+        assert_eq!(expanded["NEON_BROWSER"], "legacy");
+        assert_eq!(expanded["SILVERVINE_OUTCOME"], "old-only");
+        assert_eq!(expanded["NEON_OUTCOME"], "old-only");
     }
 
     /// A hook that exits non-zero is reported with its exit code, not as
@@ -418,7 +584,7 @@ exit 0
     /// Default fallback path when no config entry is set: under the user's
     /// config dir.
     #[test]
-    fn resolve_hook_path_default_falls_back_to_neon_hooks_dir() {
+    fn resolve_hook_path_default_falls_back_to_silvervine_hooks_dir() {
         let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         // Override $XDG_CONFIG_HOME (Linux) / $HOME (anything dirs uses).
@@ -430,7 +596,7 @@ exit 0
         let path = resolve_hook_path("post-patch", &config).expect("default path resolves");
         let expected = dirs::config_dir()
             .expect("config dir")
-            .join("neon")
+            .join("silvervine")
             .join("hooks")
             .join("post-patch");
         assert_eq!(path, expected);
@@ -460,7 +626,7 @@ exit 0
 
         let hook_path = dirs::config_dir()
             .expect("config dir")
-            .join("neon")
+            .join("silvervine")
             .join("hooks")
             .join("post-patch");
         write_executable_script(&hook_path, "#!/bin/sh\necho yo\nexit 0\n");
@@ -501,7 +667,7 @@ exit 0
         let _home = ScopedEnv::set("HOME", tmp.path());
         let path = resolve_hook_path("custom-hook-name", &Config::default()).unwrap();
         assert!(path.ends_with(
-            std::path::Path::new("neon")
+            std::path::Path::new("silvervine")
                 .join("hooks")
                 .join("custom-hook-name")
         ));

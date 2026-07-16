@@ -9,14 +9,14 @@
 //! * Spotify "Error code 4" / general DRM playback-failure reports.
 //!
 //! Each entry maps a stable code → service + likely cause + suggested
-//! `neon` command. Codes are normalized to upper-case at lookup time,
+//! `silvervine` command. Codes are normalized to upper-case at lookup time,
 //! so the table itself stores upper-case keys.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// Diagnosis of an EME error code: the service that emitted it, the
-/// likely root cause, and the `neon` subcommand the user should run
+/// likely root cause, and the `silvervine` subcommand the user should run
 /// to fix it (when applicable).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmeDiagnosis {
@@ -27,8 +27,8 @@ pub struct EmeDiagnosis {
     /// Plain-language explanation of what the code means and why it
     /// happens.
     pub likely_cause: &'static str,
-    /// Suggested `neon` command to run to fix the underlying issue.
-    /// `None` for codes that aren't fixable from neon (e.g. a region
+    /// Suggested `silvervine` command to run to fix the underlying issue.
+    /// `None` for codes that aren't fixable from silvervine (e.g. a region
     /// licensing block, or an account-level entitlement issue).
     pub suggested_command: Option<&'static str>,
 }
@@ -37,7 +37,7 @@ pub struct EmeDiagnosis {
 ///
 /// Lookup is case-insensitive: `n8156-6024` and `N8156-6024` resolve
 /// to the same diagnosis. Unrecognized codes return `None` — the
-/// caller (typically `neon doctor`) should fall back to a generic
+/// caller (typically `silvervine doctor`) should fall back to a generic
 /// "code not recognized" message.
 #[must_use]
 pub fn translate_error_code(code: &str) -> Option<EmeDiagnosis> {
@@ -54,7 +54,7 @@ pub fn translate_error_code(code: &str) -> Option<EmeDiagnosis> {
     })
 }
 
-/// Return the keys of the static map. Useful for tests + for `neon
+/// Return the keys of the static map. Useful for tests + for `silvervine
 /// doctor --list-codes` (a possible future flag).
 #[must_use]
 #[cfg(test)]
@@ -85,7 +85,7 @@ fn build_map() -> HashMap<&'static str, RawDiagnosis> {
                 likely_cause: "The Widevine CDM is missing or out of date for your browser. \
                     Linux + Chromium-family browsers commonly hit this when the bundled CDM \
                     was never installed or has been wiped by an update.",
-                suggested_command: Some("neon update widevine && neon patch"),
+                suggested_command: Some("silvervine update widevine && silvervine patch"),
             },
         ),
         (
@@ -95,7 +95,7 @@ fn build_map() -> HashMap<&'static str, RawDiagnosis> {
                 likely_cause: "Widevine is installed but Netflix's license server rejected the \
                     request. Most often the system clock is wrong, or the CDM is at an \
                     incompatible version. Verify your time, then reinstall the CDM.",
-                suggested_command: Some("neon doctor && neon update widevine"),
+                suggested_command: Some("silvervine doctor && silvervine update widevine"),
             },
         ),
         (
@@ -105,7 +105,7 @@ fn build_map() -> HashMap<&'static str, RawDiagnosis> {
                 likely_cause: "Browser is in an unsupported state — typically caused by an \
                     outdated CDM or a non-Widevine build of Chromium. Re-patching with the \
                     latest CDM resolves most cases.",
-                suggested_command: Some("neon update widevine && neon patch"),
+                suggested_command: Some("silvervine update widevine && silvervine patch"),
             },
         ),
         (
@@ -115,14 +115,14 @@ fn build_map() -> HashMap<&'static str, RawDiagnosis> {
                 likely_cause: "Network connectivity issue between the browser and Netflix's \
                     license server. Not a Widevine issue per se, but if the browser was just \
                     patched, a stale CDM cache may also be involved.",
-                suggested_command: Some("neon doctor"),
+                suggested_command: Some("silvervine doctor"),
             },
         ),
         (
             "M7111-1331-2206",
             RawDiagnosis {
                 service: "Netflix",
-                likely_cause: "VPN or geo-restriction issue. This isn't fixable from neon — \
+                likely_cause: "VPN or geo-restriction issue. This isn't fixable from silvervine — \
                     Netflix has detected a proxy and blocked playback. Disable the VPN.",
                 suggested_command: None,
             },
@@ -133,7 +133,7 @@ fn build_map() -> HashMap<&'static str, RawDiagnosis> {
                 service: "Netflix",
                 likely_cause: "Browser is missing the Widevine CDM, or the CDM is at a version \
                     Netflix no longer accepts. Update + re-patch resolves both.",
-                suggested_command: Some("neon update widevine && neon patch"),
+                suggested_command: Some("silvervine update widevine && silvervine patch"),
             },
         ),
         (
@@ -142,8 +142,8 @@ fn build_map() -> HashMap<&'static str, RawDiagnosis> {
                 service: "Netflix",
                 likely_cause: "Browser cache or cookies are corrupt. Clear browser cookies for \
                     netflix.com and reload. If the issue persists after a clean cookie state, \
-                    re-run neon's patch flow.",
-                suggested_command: Some("neon doctor"),
+                    re-run silvervine's patch flow.",
+                suggested_command: Some("silvervine doctor"),
             },
         ),
         // ---- Disney+ ----
@@ -163,7 +163,7 @@ fn build_map() -> HashMap<&'static str, RawDiagnosis> {
                 likely_cause: "Device compatibility issue — most often a missing or outdated \
                     Widevine CDM, or HDCP-protected output running over a non-HDCP cable. \
                     Update the CDM and re-patch the browser.",
-                suggested_command: Some("neon update widevine && neon patch"),
+                suggested_command: Some("silvervine update widevine && silvervine patch"),
             },
         ),
         (
@@ -171,8 +171,8 @@ fn build_map() -> HashMap<&'static str, RawDiagnosis> {
             RawDiagnosis {
                 service: "Disney+",
                 likely_cause: "DRM-related playback issue. The Widevine CDM may be missing or \
-                    at an incompatible version. Reinstall the CDM with neon.",
-                suggested_command: Some("neon update widevine && neon patch"),
+                    at an incompatible version. Reinstall the CDM with silvervine.",
+                suggested_command: Some("silvervine update widevine && silvervine patch"),
             },
         ),
         // ---- Spotify ----
@@ -193,7 +193,7 @@ fn build_map() -> HashMap<&'static str, RawDiagnosis> {
                 likely_cause: "Generic playback failure. For DRM-protected tracks (some \
                     podcasts, regional catalogs), a missing or outdated Widevine CDM is the \
                     most common cause on Linux + Chromium-family browsers.",
-                suggested_command: Some("neon doctor"),
+                suggested_command: Some("silvervine doctor"),
             },
         ),
         // ---- HBO Max / Max ----
@@ -203,7 +203,7 @@ fn build_map() -> HashMap<&'static str, RawDiagnosis> {
                 service: "Max (HBO Max)",
                 likely_cause: "Playback engine error. Most often a missing or outdated Widevine \
                     CDM, especially on Linux. Re-patching the browser usually resolves it.",
-                suggested_command: Some("neon update widevine && neon patch"),
+                suggested_command: Some("silvervine update widevine && silvervine patch"),
             },
         ),
         (
@@ -211,7 +211,7 @@ fn build_map() -> HashMap<&'static str, RawDiagnosis> {
             RawDiagnosis {
                 service: "Max (HBO Max)",
                 likely_cause: "DRM license could not be acquired. Update the CDM and re-patch.",
-                suggested_command: Some("neon update widevine && neon patch"),
+                suggested_command: Some("silvervine update widevine && silvervine patch"),
             },
         ),
         // ---- Generic Widevine errors users will paste in ----
@@ -220,8 +220,8 @@ fn build_map() -> HashMap<&'static str, RawDiagnosis> {
             RawDiagnosis {
                 service: "Generic",
                 likely_cause: "The browser couldn't locate the Widevine CDM at startup. This is \
-                    the canonical neon-fixable error — run patch to install the CDM.",
-                suggested_command: Some("neon patch"),
+                    the canonical silvervine-fixable error — run patch to install the CDM.",
+                suggested_command: Some("silvervine patch"),
             },
         ),
     ];
@@ -270,7 +270,7 @@ mod tests {
     #[test]
     fn netflix_n_codes_have_widevine_advice() {
         // The N-codes most commonly seen on Linux are about the CDM —
-        // verify they all suggest a neon command.
+        // verify they all suggest a silvervine command.
         for code in ["N8156-6024", "N8156-6013", "M7121-1331"] {
             let d = translate_error_code(code).expect(code);
             assert_eq!(d.service, "Netflix");
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn vpn_code_has_no_command() {
-        // Netflix's M7111-1331-2206 is a VPN block — neon can't fix it.
+        // Netflix's M7111-1331-2206 is a VPN block — silvervine can't fix it.
         let d = translate_error_code("M7111-1331-2206").expect("vpn");
         assert!(d.suggested_command.is_none());
     }

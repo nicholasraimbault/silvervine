@@ -1,4 +1,4 @@
-//! `neon init` — interactive first-run wizard.
+//! `silvervine init` — interactive first-run wizard.
 //!
 //! Steps (per the V2 spec's "First-run wizard" section):
 //!
@@ -29,7 +29,7 @@ use crate::migration;
 use crate::patch::{self, PatchOptions, PlatformPatcher};
 use crate::widevine::{self, CachedCdm};
 
-/// Args for `neon init`.
+/// Args for `silvervine init`.
 #[derive(Debug, Clone, Default)]
 pub struct Args {
     /// Output flags.
@@ -160,8 +160,10 @@ pub fn build_plan_from_input(
     };
 
     // Step 3: daemon registration.
-    plan.install_daemon =
-        prompts.confirm("Register Neon to auto-start on login (recommended)?", true)?;
+    plan.install_daemon = prompts.confirm(
+        "Register Silvervine to auto-start on login (recommended)?",
+        true,
+    )?;
 
     // Step 4: EME test.
     plan.run_eme_test = prompts.confirm(
@@ -195,7 +197,7 @@ pub fn execute_plan<F>(
 where
     F: FnOnce() -> Result<CachedCdm>,
 {
-    writeln!(out, "Neon: starting first-run setup.").map_err(Error::from)?;
+    writeln!(out, "Silvervine: starting first-run setup.").map_err(Error::from)?;
 
     // Step 1: legacy migration.
     if plan.run_migration {
@@ -229,7 +231,7 @@ where
         if let Some(cdm) = &cdm {
             // Idempotency: if the browser is already patched at the
             // cached CDM version, skip cleanly. This matters for
-            // re-runs of `neon setup` after upgrading Neon — the user
+            // re-runs of `silvervine setup` after upgrading Silvervine — the user
             // may have the browser open, and a forced re-patch would
             // fail with `BrowserRunning` even though the system is
             // already in the desired state.
@@ -264,12 +266,8 @@ where
 
     // Step 4: install daemon.
     if plan.install_daemon {
-        match crate::daemon::lifecycle::register() {
-            Ok(()) => {
-                writeln!(out, "Daemon registered for auto-start on login.").map_err(Error::from)?;
-            }
-            Err(e) => writeln!(out, "Daemon registration failed: {e}").map_err(Error::from)?,
-        }
+        crate::daemon::lifecycle::register()?;
+        writeln!(out, "Daemon registered for auto-start on login.").map_err(Error::from)?;
     }
 
     // Step 5: EME health check (skippable).
@@ -277,7 +275,7 @@ where
         writeln!(
             out,
             "EME health check is a network/display-dependent operation; \
-             see `neon test --help` to run it later."
+             see `silvervine test --help` to run it later."
         )
         .map_err(Error::from)?;
     }
@@ -286,7 +284,7 @@ where
         writeln!(
             out,
             "Setup completed with {patch_failures} patch failure(s). \
-             Run `neon doctor` for diagnostics."
+             Run `silvervine doctor` for diagnostics."
         )
         .map_err(Error::from)?;
     } else {
@@ -393,6 +391,11 @@ mod tests {
         fn set(key: &'static str, value: &Path) -> Self {
             let prev = std::env::var_os(key);
             unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
             Self { key, prev }
         }
     }
@@ -648,6 +651,34 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("FAILED"));
         assert!(s.contains("1 patch failure"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn execute_plan_propagates_daemon_registration_failure() {
+        let _g = crate::test_support::env_lock();
+        let tmp = TempDir::new().unwrap();
+        let _life = ScopedEnv::unset(crate::daemon::lifecycle::NOOP_ENV);
+        let _xdg = ScopedEnv::set("XDG_CONFIG_HOME", tmp.path());
+        let empty_path = tmp.path().join("empty-bin");
+        fs::create_dir_all(&empty_path).unwrap();
+        let _path = ScopedEnv::set("PATH", &empty_path);
+        let plan = Plan {
+            install_daemon: true,
+            ..Plan::empty()
+        };
+        let mut output = Vec::new();
+        let result = execute_plan(
+            &plan,
+            || Err(Error::other("CDM resolver must not run")),
+            &MockPatcher::default(),
+            &mut output,
+            PatchOptions::default(),
+        );
+        assert!(result.is_err());
+        assert!(!String::from_utf8(output)
+            .unwrap()
+            .contains("Setup complete"));
     }
 
     #[test]

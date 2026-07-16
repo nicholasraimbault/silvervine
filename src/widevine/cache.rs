@@ -3,7 +3,7 @@
 //! ## On-disk layout
 //!
 //! ```text
-//! ~/.cache/neon/widevine/
+//! ~/.cache/silvervine/widevine/
 //! ├── 4.10.2899.0/        ← versioned extracted CDM
 //! ├── 4.10.2934.0/        ← versioned extracted CDM
 //! ├── current → 4.10.2934.0/   (symlink)
@@ -37,19 +37,19 @@ use crate::widevine::{download, extract};
 /// How many CDM versions to keep around by default ([`prune`] honors this).
 pub const DEFAULT_RETENTION: usize = 3;
 
-/// Default cache root: `~/.cache/neon/widevine/`.
+/// Default cache root: `~/.cache/silvervine/widevine/`.
 ///
 /// Returns `None` if `dirs::cache_dir()` is unresolvable.
 #[must_use]
 pub fn default_cache_root() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("neon").join("widevine"))
+    dirs::cache_dir().map(|d| d.join("silvervine").join("widevine"))
 }
 
 /// Snapshot of an extracted CDM at a particular version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedCdm {
     version: String,
-    /// Root of the extracted CDM (e.g. `~/.cache/neon/widevine/4.10.2934.0/`).
+    /// Root of the extracted CDM (e.g. `~/.cache/silvervine/widevine/4.10.2934.0/`).
     /// Contains `manifest.json` + `_platform_specific/<platform>/`.
     cdm_dir: PathBuf,
 }
@@ -80,7 +80,7 @@ impl CachedCdm {
 /// Ensure the CDM described by `manifest` is present in the cache, then
 /// flip the `current` symlink to point at it.
 ///
-/// This is the primary entry-point for `neon update widevine` (Phase 4)
+/// This is the primary entry-point for `silvervine update widevine` (Phase 4)
 /// and for the patch flow when the CDM is missing.
 ///
 /// # Behavior
@@ -101,7 +101,9 @@ impl CachedCdm {
 /// * `Other` — disk I/O failures.
 pub fn ensure_cdm_for(manifest: &Manifest) -> Result<CachedCdm> {
     let root = default_cache_root().ok_or_else(|| {
-        Error::state_corrupted("cannot resolve ~/.cache/neon/widevine (no \\$HOME / cache dir)")
+        Error::state_corrupted(
+            "cannot resolve ~/.cache/silvervine/widevine (no \\$HOME / cache dir)",
+        )
     })?;
     let platform = crate::widevine::manifest::current_platform_key()?;
     ensure_cdm_for_with(manifest, platform, &root)
@@ -131,7 +133,7 @@ pub fn ensure_cdm_for_with(
     }
 
     // Slow path: a download (or re-download) is needed. Serialize across
-    // processes with a download-scoped lockfile. Two concurrent neon
+    // processes with a download-scoped lockfile. Two concurrent silvervine
     // invocations (CLI + daemon, double-click, etc.) used to race the
     // staging rename — the loser corrupted the winner's cache. The lock
     // is *separate* from `patch.lock` so a long-running patch doesn't
@@ -243,7 +245,7 @@ pub fn current_in(cache_root: &Path) -> Result<Option<CachedCdm>> {
 /// * `StateCorrupted` if there is no `previous` link to roll back to.
 pub fn rollback() -> Result<CachedCdm> {
     let root = default_cache_root().ok_or_else(|| {
-        Error::state_corrupted("cannot resolve ~/.cache/neon/widevine cache root")
+        Error::state_corrupted("cannot resolve ~/.cache/silvervine/widevine cache root")
     })?;
     rollback_in(&root)
 }
@@ -357,7 +359,7 @@ pub fn prune_in(cache_root: &Path, keep: usize) -> Result<usize> {
             }
         }
     }
-    // Sweep stale CRX3 archives left behind by earlier neon versions
+    // Sweep stale CRX3 archives left behind by earlier silvervine versions
     // (pre-cleanup-on-success) under <cache_root>/downloads/. Each is
     // ~5–7 MB and they accumulate per CDM upgrade.
     let downloads_dir = cache_root.join("downloads");
@@ -376,7 +378,7 @@ pub fn prune_in(cache_root: &Path, keep: usize) -> Result<usize> {
 /// platform key in `against` and confirm they match.
 ///
 /// Used by the daemon's weekly integrity tick (Phase 3) and by the
-/// `neon doctor` command (Phase 4). On detection of a mismatch the
+/// `silvervine doctor` command (Phase 4). On detection of a mismatch the
 /// caller is expected to redownload — this function only reports.
 ///
 /// # Errors
@@ -701,7 +703,7 @@ mod tests {
     }
 
     /// `prune_in` sweeps stale `.crx3` archives from `downloads/`. They
-    /// pile up because old neon versions didn't remove the downloaded
+    /// pile up because old silvervine versions didn't remove the downloaded
     /// CRX3 after extracting it. Each is ~5–7 MB and `list_versions`
     /// explicitly skips the `downloads/` subdir, so without this sweep
     /// the disk usage grows unbounded.
@@ -821,9 +823,9 @@ mod tests {
     }
 
     #[test]
-    fn default_cache_root_resolves_under_neon_subdir() {
+    fn default_cache_root_resolves_under_silvervine_subdir() {
         if let Some(p) = default_cache_root() {
-            let suffix = std::path::Path::new("neon").join("widevine");
+            let suffix = std::path::Path::new("silvervine").join("widevine");
             assert!(p.ends_with(&suffix));
         }
     }
@@ -915,7 +917,7 @@ mod tests {
     }
 
     /// The download-scoped lockfile must be created the first time
-    /// `ensure_cdm_for_with` takes its slow path. Two concurrent neon
+    /// `ensure_cdm_for_with` takes its slow path. Two concurrent silvervine
     /// processes (CLI + daemon, double-click installer) used to race
     /// the staging→target rename and corrupt the cache; the lock
     /// serializes them. Verify the lockfile is materialized as

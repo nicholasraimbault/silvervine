@@ -1,4 +1,4 @@
-//! `neon` CLI subcommand implementations.
+//! `silvervine` CLI subcommand implementations.
 //!
 //! Each subcommand lives in its own module under this directory and
 //! exposes a `run(args)` entry point. The binary entry point in
@@ -10,31 +10,31 @@
 //!
 //! | Module | Subcommand |
 //! |---|---|
-//! | [`init`] | `neon init` (interactive wizard) |
-//! | [`setup`] | `neon setup` (non-interactive equivalent) |
-//! | [`patch`] | `neon patch` |
-//! | [`status`] | `neon status` |
-//! | [`list_browsers`] | `neon list-browsers` |
-//! | [`doctor`] | `neon doctor` |
-//! | [`test`] | `neon test` (EME health check) |
-//! | [`update`] | `neon update {widevine,self}` |
-//! | [`repair`] | `neon repair` |
-//! | [`launch`] | `neon launch <browser>` |
-//! | [`uninstall`] | `neon uninstall` |
-//! | [`completion`] | `neon completion <shell>` |
-//! | [`manpage`] | `neon manpage` |
+//! | [`init`] | `silvervine init` (interactive wizard) |
+//! | [`setup`] | `silvervine setup` (non-interactive equivalent) |
+//! | [`patch`] | `silvervine patch` |
+//! | [`status`] | `silvervine status` |
+//! | [`list_browsers`] | `silvervine list-browsers` |
+//! | [`doctor`] | `silvervine doctor` |
+//! | [`test`] | `silvervine test` (EME health check) |
+//! | [`update`] | `silvervine update {widevine,self}` |
+//! | [`repair`] | `silvervine repair` |
+//! | [`launch`] | `silvervine launch <browser>` |
+//! | [`uninstall`] | `silvervine uninstall` |
+//! | [`completion`] | `silvervine completion <shell>` |
+//! | [`manpage`] | `silvervine manpage` |
 //!
 //! ## Test-mode env-vars
 //!
-//! Tests honor a small set of `NEON_TEST_*` environment variables to
+//! Tests honor a small set of `SILVERVINE_TEST_*` environment variables to
 //! prevent the CLI from invoking long-running, graphical, or
 //! privileged operations during `cargo test`:
 //!
-//! * `NEON_TEST_LAUNCH_NOOP=1` — `neon launch <browser>` records the
+//! * `SILVERVINE_TEST_LAUNCH_NOOP=1` — `silvervine launch <browser>` records the
 //!   browser it would spawn but does not actually call `Command::spawn`.
-//! * `NEON_TEST_BROWSER_TEST_NOOP=1` — `neon test` builds the launch
+//! * `SILVERVINE_TEST_BROWSER_TEST_NOOP=1` — `silvervine test` builds the launch
 //!   plan but does not actually drive a real browser.
-//! * `NEON_TEST_ESCALATE_NOOP=1` — already honored at the platform
+//! * `SILVERVINE_TEST_ESCALATE_NOOP=1` — already honored at the platform
 //!   layer; CLI subcommands inherit the gate.
 
 pub mod completion;

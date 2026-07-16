@@ -1,4 +1,4 @@
-//! Neon — single-binary cross-platform DRM (Widevine) helper for Chromium-family browsers.
+//! Silvervine — single-binary cross-platform DRM (Widevine) helper for Chromium-family browsers.
 //!
 //! This is the library crate. The binary entrypoint lives in [`main.rs`](../src/main.rs).
 //!
@@ -7,13 +7,13 @@
 //! * [`error`] — categorized [`Error`] / [`Result`] used everywhere.
 //! * [`browsers`] — known-list constants, auto-discovery, custom-config TOML.
 //! * [`widevine`] — Mozilla manifest fetch + (in Phase 2) CRX3 download/extract.
-//! * [`config`] — global `~/.config/neon/config.toml` schema.
+//! * [`config`] — global `~/.config/silvervine/config.toml` schema.
 //! * [`lockfile`] — `flock`-based exclusive lock helper.
 //! * [`platform`] — XDG/Apple paths, privilege escalation, atomic-rename.
-//! * [`migration`] — detect + remove legacy (V1) Neon installs.
+//! * [`migration`] — migrate Neon V2 data and detect/remove legacy Neon V1 installs.
 //!
 //! The library exposes browser discovery, Widevine retrieval, atomic patching,
-//! platform integration, and daemon support used by the `neon` binary.
+//! platform integration, and daemon support used by the `silvervine` binary.
 //!
 //! # Public API contracts
 //!

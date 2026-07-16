@@ -29,7 +29,7 @@
 //!
 //! # Test mode
 //!
-//! `NEON_TEST_POWER_NOOP=1` short-circuits the platform connection. In
+//! `SILVERVINE_TEST_POWER_NOOP=1` short-circuits the platform connection. In
 //! test mode the returned subscription does nothing — `Drop` is a no-op
 //! and the callback never fires. Tests assert on the no-op behavior;
 //! actual system-bus / `NSWorkspace` integration is exercised manually
@@ -46,7 +46,7 @@ use crate::error::Result;
 
 /// Env-var name that, when set, short-circuits all platform integration.
 /// Subscriptions return a no-op handle and the callback never fires.
-pub const NOOP_ENV: &str = "NEON_TEST_POWER_NOOP";
+pub const NOOP_ENV: &str = "SILVERVINE_TEST_POWER_NOOP";
 
 /// Type alias for the user-provided wake callback.
 ///
@@ -62,7 +62,7 @@ pub type WakeCallback = Box<dyn Fn() + Send + 'static>;
 /// most one owner per subscription. Use [`subscribe_wake_events`] again
 /// for a second subscription.
 ///
-/// In test mode (`NEON_TEST_POWER_NOOP=1`) the handle is a stub that
+/// In test mode (`SILVERVINE_TEST_POWER_NOOP=1`) the handle is a stub that
 /// drops cleanly without any platform activity.
 #[must_use = "WakeSubscription is unsubscribed on drop; bind it to a \
               variable that lives as long as you want the callback to fire"]
@@ -127,7 +127,7 @@ impl Drop for WakeSubscription {
 ///
 /// # Test mode
 ///
-/// If `NEON_TEST_POWER_NOOP=1` is set, returns a no-op subscription
+/// If `SILVERVINE_TEST_POWER_NOOP=1` is set, returns a no-op subscription
 /// without touching the platform bus.
 pub fn subscribe_wake_events(callback: WakeCallback) -> Result<WakeSubscription> {
     if noop_enabled() {
@@ -139,7 +139,7 @@ pub fn subscribe_wake_events(callback: WakeCallback) -> Result<WakeSubscription>
     Ok(WakeSubscription::real(handle))
 }
 
-/// Returns `true` when `NEON_TEST_POWER_NOOP=1` is in the environment.
+/// Returns `true` when `SILVERVINE_TEST_POWER_NOOP=1` is in the environment.
 fn noop_enabled() -> bool {
     std::env::var_os(NOOP_ENV).is_some()
 }

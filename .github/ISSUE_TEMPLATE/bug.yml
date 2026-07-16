@@ -1,18 +1,18 @@
 name: Bug report
-description: Report a problem with Neon
+description: Report a problem with Silvervine
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for filing a bug. Please run `neon doctor --share` and paste the output below — that link pre-fills this form with your diagnostic info.
+        Thanks for filing a bug. Please run `silvervine doctor --share` and paste the output below — that link pre-fills this form with your diagnostic info.
 
   - type: input
-    id: neon_version
+    id: silvervine_version
     attributes:
-      label: Neon version
-      description: Output of `neon --version`
-      placeholder: "neon 0.1.0"
+      label: Silvervine version
+      description: Output of `silvervine --version`
+      placeholder: "silvervine 0.1.0"
     validations:
       required: true
 
@@ -35,7 +35,7 @@ body:
   - type: textarea
     id: doctor_output
     attributes:
-      label: "`neon doctor --json` output"
+      label: "`silvervine doctor --json` output"
       description: Paste the full JSON. Sensitive paths can be redacted.
       render: json
     validations:
@@ -53,5 +53,5 @@ body:
     id: logs
     attributes:
       label: Relevant log excerpt (optional)
-      description: From `~/.cache/neon/logs/neon.log`. Trim to the relevant section.
+      description: From `~/.cache/silvervine/logs/silvervine.log`. Trim to the relevant section.
       render: text

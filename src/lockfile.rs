@@ -2,11 +2,11 @@
 //!
 //! Per the spec's data flow:
 //!
-//! > 1. Acquire lockfile  `~/.cache/neon/patch.lock`  (flock exclusive)
+//! > 1. Acquire lockfile  `~/.cache/silvervine/patch.lock`  (flock exclusive)
 //!
 //! and:
 //!
-//! > `flock` exclusive lock on `~/.cache/neon/patch.lock`. Second invocation
+//! > `flock` exclusive lock on `~/.cache/silvervine/patch.lock`. Second invocation
 //! > blocks (CLI) or skips with notification (daemon, to avoid blocking UI thread).
 //!
 //! This module exposes one helper, [`with_lock`], that:
@@ -23,15 +23,15 @@
 //! # Example
 //!
 //! ```no_run
-//! use neon::lockfile::with_lock;
+//! use silvervine::lockfile::with_lock;
 //! use std::path::Path;
 //!
 //! let result = with_lock(Path::new("/tmp/example.lock"), || {
 //!     // Do exclusive work here.
-//!     Ok::<_, neon::Error>(42)
+//!     Ok::<_, silvervine::Error>(42)
 //! })?;
 //! assert_eq!(result, 42);
-//! # Ok::<_, neon::Error>(())
+//! # Ok::<_, silvervine::Error>(())
 //! ```
 
 use std::fs::{File, OpenOptions};

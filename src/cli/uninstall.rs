@@ -1,8 +1,8 @@
-//! `neon uninstall` — remove the daemon registration + CDM cache.
+//! `silvervine uninstall` — remove the daemon registration + CDM cache.
 //!
 //! Browsers stay patched until they auto-update — we don't unpatch
 //! them (per spec V2 design — too invasive). The user keeps their
-//! `~/.config/neon/config.toml` unless `--purge` is passed.
+//! `~/.config/silvervine/config.toml` unless `--purge` is passed.
 
 use std::io::Write;
 use std::path::Path;
@@ -10,7 +10,7 @@ use std::path::Path;
 use crate::cli::OutputOptions;
 use crate::error::{Error, Result};
 
-/// Args for `neon uninstall`.
+/// Args for `silvervine uninstall`.
 #[derive(Debug, Clone, Default)]
 pub struct Args {
     /// `--purge`: also remove the user's config + state files.
@@ -45,20 +45,36 @@ pub fn run_with(
     config_path: &Path,
     out: &mut dyn Write,
 ) -> Result<UninstallOutcome> {
+    run_with_unregistrar(
+        args,
+        cache_root,
+        config_path,
+        out,
+        crate::daemon::lifecycle::unregister,
+    )
+}
+
+fn run_with_unregistrar<F>(
+    args: &Args,
+    cache_root: &Path,
+    config_path: &Path,
+    out: &mut dyn Write,
+    unregister: F,
+) -> Result<UninstallOutcome>
+where
+    F: FnOnce() -> Result<()>,
+{
     let mut outcome = UninstallOutcome {
         daemon_unregistered: false,
         cache_removed: false,
         config_purged: false,
     };
 
-    // 1. Unregister the daemon.
-    match crate::daemon::lifecycle::unregister() {
-        Ok(()) => {
-            writeln!(out, "Daemon: unregistered (or not installed).").map_err(Error::from)?;
-            outcome.daemon_unregistered = true;
-        }
-        Err(e) => writeln!(out, "Daemon: unregister warning — {e}").map_err(Error::from)?,
-    }
+    // 1. Unregister the daemon. Never delete cache/config while a daemon
+    // may still be running and using those paths.
+    unregister()?;
+    writeln!(out, "Daemon: unregistered (or not installed).").map_err(Error::from)?;
+    outcome.daemon_unregistered = true;
 
     // 2. Remove the CDM + state cache.
     if cache_root.exists() {
@@ -109,7 +125,7 @@ pub fn run_with(
 
     writeln!(
         out,
-        "Browsers stay patched until their next auto-update; neon does not unpatch them.",
+        "Browsers stay patched until their next auto-update; silvervine does not unpatch them.",
     )
     .map_err(Error::from)?;
 
@@ -124,9 +140,9 @@ pub fn run_with(
 pub fn run(args: &Args) -> Result<()> {
     let cache_root = dirs::cache_dir()
         .ok_or_else(|| Error::other("cannot resolve ~/.cache directory"))?
-        .join("neon");
+        .join("silvervine");
     let config_path = crate::config::default_config_path()
-        .ok_or_else(|| Error::other("cannot resolve ~/.config/neon/config.toml path"))?;
+        .ok_or_else(|| Error::other("cannot resolve ~/.config/silvervine/config.toml path"))?;
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
     let _ = run_with(args, &cache_root, &config_path, &mut handle)?;
@@ -158,6 +174,30 @@ mod tests {
                 None => unsafe { std::env::remove_var(self.key) },
             }
         }
+    }
+
+    #[test]
+    fn unregister_failure_aborts_before_cache_or_config_deletion() {
+        let tmp = TempDir::new().unwrap();
+        let cache = tmp.path().join("cache");
+        let config = tmp.path().join("config.toml");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("marker"), "cache").unwrap();
+        fs::write(&config, "config").unwrap();
+        let mut out = Vec::new();
+        let result = run_with_unregistrar(
+            &Args {
+                purge: true,
+                ..Default::default()
+            },
+            &cache,
+            &config,
+            &mut out,
+            || Err(Error::other("stop failed")),
+        );
+        assert!(result.is_err());
+        assert!(cache.join("marker").is_file());
+        assert!(config.is_file());
     }
 
     #[test]

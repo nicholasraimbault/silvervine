@@ -1,6 +1,6 @@
-# Contributing to Neon
+# Contributing to Silvervine
 
-Thanks for your interest. Neon is a small, focused project — a DRM helper for de-Googled Chromium browsers — and contributions of every size are welcome, from typo fixes to entire new browser support.
+Thanks for your interest. Silvervine is a small, focused project — a DRM helper for de-Googled Chromium browsers — and contributions of every size are welcome, from typo fixes to entire new browser support.
 
 ## Development setup
 
@@ -12,8 +12,8 @@ Thanks for your interest. Neon is a small, focused project — a DRM helper for 
 ### Clone + build
 
 ```sh
-git clone https://github.com/nicholasraimbault/neon.git
-cd neon
+git clone https://github.com/nicholasraimbault/silvervine.git
+cd silvervine
 git switch master
 cargo build
 ```
@@ -23,7 +23,7 @@ cargo build
 ```sh
 cargo run -- --help            # full subcommand listing
 cargo run -- doctor            # diagnostics
-cargo run -- list-browsers     # what Neon detects on your machine
+cargo run -- list-browsers     # what Silvervine detects on your machine
 ```
 
 Use `cargo run -- <subcommand>` rather than installing locally — that way you're always running the version in the working tree.
@@ -56,7 +56,7 @@ cargo clippy --all-targets --jobs 2 -- -D warnings    # linter
 
 ## Testing patterns
 
-Neon tests heavily on Linux + macOS in CI (matrix: `ubuntu-latest`, `macos-latest`). Tests must:
+Silvervine tests heavily on Linux + macOS in CI (matrix: `ubuntu-latest`, `macos-latest`). Tests must:
 
 1. **Never invoke the user's running compositor or D-Bus session.** No `notify-send`, no `dbus-send`, no `niri msg`, no `playerctl`, no `gsettings`. Tests that interact with these surfaces are env-var-gated to no-op by default.
 
@@ -64,14 +64,15 @@ Neon tests heavily on Linux + macOS in CI (matrix: `ubuntu-latest`, `macos-lates
 
 | Env var | What it short-circuits |
 |---|---|
-| `NEON_TEST_ESCALATE_NOOP=1` | `platform::escalate_for_patch` and `platform::run_as_root` |
-| `NEON_TEST_PATCH_NOOP=1` | `xattr -cr` and `codesign --force --deep -s -` (macOS) |
-| `NEON_TEST_LIFECYCLE_NOOP=1` | `daemon::lifecycle::register/unregister` (LaunchAgent / systemd-user) |
-| `NEON_TEST_POWER_NOOP=1` | `daemon::power::subscribe_wake_events` (NSWorkspace / logind D-Bus) |
-| `NEON_TEST_NOTIFY_NOOP=1` | `notify::notify_*` (libnotify / NSUserNotificationCenter) |
-| `NEON_TEST_DAEMON_PATCH_NOOP=1` | `daemon::drive_patch_flow` (the patch dispatcher) |
-| `NEON_TEST_BROWSER_TEST_NOOP=1` | `cli::test::Plan::execute_real_browser` (headless browser spawn) |
-| `NEON_TEST_LAUNCH_NOOP=1` | `cli::launch::spawn_detached` (browser launch) |
+| `SILVERVINE_TEST_DATA_MIGRATION_NOOP=1` | startup Neon V2 data-directory migration |
+| `SILVERVINE_TEST_ESCALATE_NOOP=1` | `platform::escalate_for_patch` and `platform::run_as_root` |
+| `SILVERVINE_TEST_PATCH_NOOP=1` | `xattr -cr` and `codesign --force --deep -s -` (macOS) |
+| `SILVERVINE_TEST_LIFECYCLE_NOOP=1` | `daemon::lifecycle::register/unregister` (LaunchAgent / systemd-user) |
+| `SILVERVINE_TEST_POWER_NOOP=1` | `daemon::power::subscribe_wake_events` (NSWorkspace / logind D-Bus) |
+| `SILVERVINE_TEST_NOTIFY_NOOP=1` | `notify::notify_*` (libnotify / NSUserNotificationCenter) |
+| `SILVERVINE_TEST_DAEMON_PATCH_NOOP=1` | `daemon::drive_patch_flow` (the patch dispatcher) |
+| `SILVERVINE_TEST_BROWSER_TEST_NOOP=1` | `cli::test::Plan::execute_real_browser` (headless browser spawn) |
+| `SILVERVINE_TEST_LAUNCH_NOOP=1` | `cli::launch::spawn_detached` (browser launch) |
 
 Tests set these via the `ScopedEnv` RAII guard pattern — see existing tests in `src/migration.rs` and `src/daemon/mod.rs` for the pattern. Env-mutating tests guard with a process-wide `Mutex` to avoid clobbering each other across `cargo test`'s default thread-per-test execution model.
 
@@ -83,7 +84,7 @@ Tests set these via the `ScopedEnv` RAII guard pattern — see existing tests in
 
 ## Conventional commits
 
-Neon uses [Conventional Commits](https://www.conventionalcommits.org/) for the auto-generated CHANGELOG. Commit messages must follow:
+Silvervine uses [Conventional Commits](https://www.conventionalcommits.org/) for the auto-generated CHANGELOG. Commit messages must follow:
 
 ```
 <type>(<scope>): <subject>
@@ -115,7 +116,7 @@ Neon uses [Conventional Commits](https://www.conventionalcommits.org/) for the a
 **Examples:**
 
 ```
-feat(cli): neon doctor --share produces pre-filled GitHub issue URL
+feat(cli): silvervine doctor --share produces pre-filled GitHub issue URL
 fix(patch): restore snapshot atomically when codesign step fails
 docs(roadmap): document a future platform goal
 test(widevine): boost manifest-parser fixture coverage
@@ -147,17 +148,17 @@ The CHANGELOG bot uses these to auto-bump SemVer and produce the next CHANGELOG 
 
 GitHub Issues is the bug tracker. We use templates:
 
-- **Bug report** — `.github/ISSUE_TEMPLATE/bug.yml`. The fastest path is `neon doctor --share`, which opens a pre-filled bug template URL for you.
+- **Bug report** — `.github/ISSUE_TEMPLATE/bug.yml`. The fastest path is `silvervine doctor --share`, which opens a pre-filled bug template URL for you.
 - **Feature request** — `.github/ISSUE_TEMPLATE/feature.yml`. Describe the use case, not the proposed solution.
 
 Security disclosures go to the email listed in [SECURITY.md](SECURITY.md), not GitHub Issues.
 
 ## Architecture overview
 
-Neon is a single Rust binary with two operational modes:
+Silvervine is a single Rust binary with two operational modes:
 
-- **CLI mode** — `neon <subcommand>` runs one-shot operations. Each subcommand calls into the appropriate library module.
-- **Daemon mode** — `neon` (no args) runs the long-lived tray daemon. Same binary, different entry point.
+- **CLI mode** — `silvervine <subcommand>` runs one-shot operations. Each subcommand calls into the appropriate library module.
+- **Daemon mode** — `silvervine` (no args) runs the long-lived tray daemon. Same binary, different entry point.
 
 The codebase is split into module-level slices of `src/`:
 
@@ -190,7 +191,7 @@ their work there rather than adding its dependencies or CLI surface back to mast
 
 ## Code of Conduct
 
-Neon follows the [Contributor Covenant 2.1](CODE_OF_CONDUCT.md). Be excellent to each other.
+Silvervine follows the [Contributor Covenant 2.1](CODE_OF_CONDUCT.md). Be excellent to each other.
 
 ## License
 

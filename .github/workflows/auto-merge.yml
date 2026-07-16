@@ -30,4 +30,5 @@ jobs:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
-        run: gh pr comment "$PR_URL" --body "Dependabot update-type: \`$UPDATE_TYPE\`. Auto-merge is currently disabled; merge manually after reviewing CI."
+        run: >-
+          gh pr comment "$PR_URL" --body "Dependabot update-type: \`$UPDATE_TYPE\`. Auto-merge is currently disabled; merge manually after reviewing CI."

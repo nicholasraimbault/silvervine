@@ -46,7 +46,7 @@
 //!
 //! 1. `https://hg.mozilla.org/...`
 //! 2. `https://raw.githubusercontent.com/...`
-//! 3. `~/.cache/neon/last-manifest.json` (TTL 24h)
+//! 3. `~/.cache/silvervine/last-manifest.json` (TTL 24h)
 //!
 //! [`fetch_manifest`] walks the chain in order. On any successful network
 //! fetch it writes the parsed JSON back to the cache so step 3 stays warm.
@@ -67,7 +67,7 @@ use url::Url;
 use crate::error::{Error, ErrorCategory, Result};
 
 /// TTL for the cached `last-manifest.json` file. Matches the spec
-/// (`~/.cache/neon/last-manifest.json (TTL 24h)`).
+/// (`~/.cache/silvervine/last-manifest.json (TTL 24h)`).
 pub const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// HTTP request timeout per fallback URL. The chain has three steps; we
@@ -92,7 +92,7 @@ pub struct Manifest {
     pub name: Option<String>,
 }
 
-/// One vendor in the manifest. For Neon, the only vendor of interest is
+/// One vendor in the manifest. For Silvervine, the only vendor of interest is
 /// `gmp-widevinecdm`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GmpVendor {
@@ -135,7 +135,7 @@ pub enum PlatformEntry {
     },
 }
 
-/// Platforms Neon supports in V1.
+/// Platforms Silvervine supports in V1.
 ///
 /// V1 explicitly excludes Windows (planned V2) and ARM64 Linux (cut for
 /// V1 — see spec non-goals).
@@ -285,7 +285,7 @@ fn default_urls() -> Vec<Url> {
 #[must_use]
 pub fn cached_manifest_path() -> Option<PathBuf> {
     let cache = dirs::cache_dir()?;
-    Some(cache.join("neon").join("last-manifest.json"))
+    Some(cache.join("silvervine").join("last-manifest.json"))
 }
 
 /// Fetch the manifest using the full default URL chain plus the on-disk
@@ -569,8 +569,8 @@ mod tests {
     #[test]
     fn cached_manifest_path_is_under_xdg_cache() {
         if let Some(path) = cached_manifest_path() {
-            // Always ends in `neon/last-manifest.json`.
-            let suffix = std::path::Path::new("neon").join("last-manifest.json");
+            // Always ends in `silvervine/last-manifest.json`.
+            let suffix = std::path::Path::new("silvervine").join("last-manifest.json");
             assert!(
                 path.ends_with(&suffix),
                 "expected cached manifest path to end with {} (got {})",

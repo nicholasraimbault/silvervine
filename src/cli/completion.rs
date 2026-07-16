@@ -1,13 +1,13 @@
-//! `neon completion <shell>` — emit shell completion scripts.
+//! `silvervine completion <shell>` — emit shell completion scripts.
 //!
 //! Uses `clap_complete` to generate completion definitions for the
 //! shells we care about. Output goes to stdout — the user redirects
 //! into the appropriate location for their shell:
 //!
 //! ```sh
-//! neon completion bash > /etc/bash_completion.d/neon
-//! neon completion zsh  > ~/.zfunc/_neon
-//! neon completion fish > ~/.config/fish/completions/neon.fish
+//! silvervine completion bash > /etc/bash_completion.d/silvervine
+//! silvervine completion zsh  > ~/.zfunc/_silvervine
+//! silvervine completion fish > ~/.config/fish/completions/silvervine.fish
 //! ```
 //!
 //! ## Test strategy
@@ -64,7 +64,7 @@ mod tests {
     /// Tiny clap derive type used to drive the generator without depending
     /// on the binary's full subcommand tree.
     #[derive(Debug, clap::Parser)]
-    #[command(name = "neon-test", version)]
+    #[command(name = "silvervine-test", version)]
     struct TestCli {
         #[command(subcommand)]
         cmd: TestCommand,
@@ -86,7 +86,7 @@ mod tests {
         generate(Shell::Bash, test_command(), &mut buf).expect("ok");
         let s = String::from_utf8(buf).unwrap();
         assert!(!s.is_empty());
-        assert!(s.contains("neon-test"));
+        assert!(s.contains("silvervine-test"));
     }
 
     #[test]

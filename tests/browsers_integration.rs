@@ -8,8 +8,8 @@
 use std::fs;
 use std::path::PathBuf;
 
-use neon::browsers::{detect_browsers_with, BrowserKind, FilesystemRoots, Os};
-use neon::config::{Config, CustomBrowserConfig};
+use silvervine::browsers::{detect_browsers_with, BrowserKind, FilesystemRoots, Os};
+use silvervine::config::{Config, CustomBrowserConfig};
 use tempfile::TempDir;
 
 fn make_chrome_sandbox_dir(parent: &std::path::Path, name: &str) -> PathBuf {

@@ -1,9 +1,9 @@
-//! Categorized error type for Neon.
+//! Categorized error type for Silvervine.
 //!
 //! Every public API in the crate returns [`Result<T>`] where the inner
 //! [`Error`] carries an [`ErrorCategory`]. The category is the routing key for:
 //!
-//! * `neon doctor` — surfacing actionable advice per category.
+//! * `silvervine doctor` — surfacing actionable advice per category.
 //! * Notifications — categorized error → notification body.
 //!
 //! Design principles:
@@ -20,7 +20,7 @@ use std::fmt;
 
 use serde::Serialize;
 
-/// High-level category of a Neon error.
+/// High-level category of a Silvervine error.
 ///
 /// Categories drive UX (notification copy, doctor advice) and analytics
 /// (opt-in reporter payload). The string form of each variant is committed
@@ -43,11 +43,11 @@ pub enum ErrorCategory {
     DiskFull,
     /// We expected a Chromium-family bundle layout and didn't find one.
     UnknownBundleStructure,
-    /// `neon doctor` and similar commands reached out to the daemon and
+    /// `silvervine doctor` and similar commands reached out to the daemon and
     /// found no liveness file (or a stale one).
     DaemonNotRunning,
-    /// State file (`~/.config/neon/state.json` etc.) is unparseable; user
-    /// action (or `neon repair`) required.
+    /// State file (`~/.config/silvervine/state.json` etc.) is unparseable; user
+    /// action (or `silvervine repair`) required.
     StateCorrupted,
     /// Running on a platform we don't (yet) support — e.g. ARM64 Linux in V1.
     UnsupportedPlatform,
@@ -59,7 +59,7 @@ impl ErrorCategory {
     /// Stable string form of the variant.
     ///
     /// This is what the opt-in reporter payload sends to the Cloudflare
-    /// Worker, and what `neon doctor --json` emits. **Do not rename without
+    /// Worker, and what `silvervine doctor --json` emits. **Do not rename without
     /// coordinating with the Worker schema.**
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -85,7 +85,7 @@ impl fmt::Display for ErrorCategory {
     }
 }
 
-/// Categorized error type used everywhere in Neon.
+/// Categorized error type used everywhere in Silvervine.
 ///
 /// Construct via [`Error::new`] or one of the variant-specific helpers
 /// (e.g. [`Error::network`], [`Error::permission_denied`]). The `source`

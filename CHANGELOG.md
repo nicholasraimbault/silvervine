@@ -4,11 +4,33 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Once V1.0 ships, future entries will be auto-generated from
+Future entries are generated from
 [Conventional Commits](https://www.conventionalcommits.org/) via
 [release-please](https://github.com/googleapis/release-please).
 
 ## [Unreleased]
+
+## [2.0.0] - 2026-07-16
+
+### Added
+
+- Added automatic, non-destructive Neon V2 → Silvervine migration for user
+  config, cache, and log directories before logging starts.
+- Added 2.x hook compatibility aliases: hooks receive both `SILVERVINE_*` and
+  deprecated matching `NEON_*` context variables without overwriting explicit
+  values.
+
+### Changed
+
+- Renamed the product, repository, crate, library, binary, paths, user daemon,
+  and current documentation from Neon to Silvervine for `v2.0.0`.
+- Silvervine daemon migration starts the replacement registration before
+  retiring the retained Neon V2 registration (`neon.service` or
+  `com.neon.tray`), with rollback to the prior data and running state if
+  retirement fails.
+- Retired the Neon V1 Homebrew/AUR/deb sources. Their legacy migration paths
+  and package-manager guidance remain supported; no Silvervine Homebrew tap is
+  created.
 
 ### Fixed
 
@@ -38,10 +60,10 @@ rc.1 has a hard deadlock on the patch path.
 ### Fixed
 
 - **macOS `sudo neon patch` deadlocks on the lockfile after a
-  redundant osascript re-prompt** ([#30](https://github.com/nicholasraimbault/neon/issues/30),
+  redundant osascript re-prompt** ([#30](https://github.com/nicholasraimbault/silvervine/issues/30),
   reported by [@yzaimoglu](https://github.com/yzaimoglu)). The patch
   flow no longer re-escalates when `geteuid() == 0`, and the
-  `--as-root` child skips the lockfile the parent already holds.
+  privileged child skips the lockfile the parent already holds.
 - **`neon doctor` reported "patched" for browsers whose on-disk CDM
   was stale.** Doctor now reads each bundle's
   `WidevineCdm/manifest.json` version, compares it to the cache, and
@@ -203,5 +225,7 @@ rc.1 has a hard deadlock on the patch path.
   scripts. Both bugs are obsoleted by the rewrite, but the reports
   were on the money.
 
-[Unreleased]: https://github.com/nicholasraimbault/neon/compare/v2.0.0-rc.1...HEAD
-[2.0.0-rc.1]: https://github.com/nicholasraimbault/neon/compare/v1.0.0...v2.0.0-rc.1
+[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.0-rc.2...v2.0.0
+[2.0.0-rc.2]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.0-rc.1...v2.0.0-rc.2
+[2.0.0-rc.1]: https://github.com/nicholasraimbault/silvervine/compare/v1.0.0...v2.0.0-rc.1

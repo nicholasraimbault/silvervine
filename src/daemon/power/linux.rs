@@ -74,7 +74,7 @@ pub(super) fn subscribe(callback: WakeCallback) -> Result<Handle> {
     match build_signal_iter() {
         Ok(iter) => {
             let thread = std::thread::Builder::new()
-                .name("neon-power-listener".into())
+                .name("silvervine-power-listener".into())
                 .spawn(move || {
                     listener_loop(iter, &callback, &stop_for_thread);
                 })
@@ -171,7 +171,7 @@ impl BlockingSignalIter {
     /// thread will be joined when the next signal fires or at process
     /// exit. For an early shutdown that doesn't wait for a sleep
     /// cycle, the daemon team can short-circuit the listener via the
-    /// `NEON_TEST_POWER_NOOP=1` env var.
+    /// `SILVERVINE_TEST_POWER_NOOP=1` env var.
     fn next_step(&mut self) -> IterStep {
         match self.iter.next() {
             Some(Ok(msg)) => step_from_message(&msg),
@@ -203,7 +203,7 @@ fn step_from_message(msg: &zbus::Message) -> IterStep {
 /// up so [`subscribe`] can fall back to the no-op handle.
 ///
 /// **This function makes a real D-Bus connection.** It must not be
-/// called when `NEON_TEST_POWER_NOOP=1` — the public `subscribe_wake_events`
+/// called when `SILVERVINE_TEST_POWER_NOOP=1` — the public `subscribe_wake_events`
 /// is responsible for the env-var gating.
 fn build_signal_iter() -> Result<BlockingSignalIter> {
     let conn = zbus::blocking::Connection::system()
@@ -252,7 +252,7 @@ mod tests {
 
     /// Subscribe / drop loop under NOOP doesn't touch the bus.
     ///
-    /// Note: we don't mutate `NEON_TEST_POWER_NOOP` here — the public
+    /// Note: we don't mutate `SILVERVINE_TEST_POWER_NOOP` here — the public
     /// `subscribe_wake_events` test in `power::tests` (`mod.rs`) already
     /// covers that path and runs serially within the test binary. This
     /// test instead exercises the internal `subscribe()` directly using

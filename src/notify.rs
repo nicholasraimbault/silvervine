@@ -9,7 +9,7 @@
 //! * Feature-gate action buttons to Linux only — macOS's notification stack
 //!   does **not** support action buttons through this crate (verified
 //!   upstream; spec calls this out).
-//! * Honor a single env var, `NEON_TEST_NOTIFY_NOOP=1`, which short-circuits
+//! * Honor a single env var, `SILVERVINE_TEST_NOTIFY_NOOP=1`, which short-circuits
 //!   any actual D-Bus / `mac-notification-sys` dispatch. Tests rely on this
 //!   to verify body composition without disturbing the user's notification
 //!   center.
@@ -36,10 +36,10 @@ use crate::error::ErrorCategory;
 
 /// Env-var name that, when set, short-circuits the actual notification
 /// dispatch. Used by tests + by callers that want "compose only" semantics.
-pub const NOOP_ENV: &str = "NEON_TEST_NOTIFY_NOOP";
+pub const NOOP_ENV: &str = "SILVERVINE_TEST_NOTIFY_NOOP";
 
 /// Application name shown as the source of the notification.
-const APP_NAME: &str = "Neon";
+const APP_NAME: &str = "Silvervine";
 
 /// Conservative body length cap. macOS Notification Center starts to clip
 /// long bodies; this gives every platform a bounded payload regardless of
@@ -50,7 +50,7 @@ const BODY_MAX_LEN: usize = 240;
 ///
 /// Example body: `"Helium patched (Widevine 4.10.2934.0)."`
 ///
-/// Honors `NEON_TEST_NOTIFY_NOOP=1` — under that env the function returns
+/// Honors `SILVERVINE_TEST_NOTIFY_NOOP=1` — under that env the function returns
 /// without dispatching.
 pub fn notify_success(browser: &str, version: &str) {
     let summary = format!("Patched {browser}");
@@ -62,9 +62,9 @@ pub fn notify_success(browser: &str, version: &str) {
 ///
 /// Example body: `"PermissionDenied: failed to write into /opt/helium-browser-bin"`
 ///
-/// Honors `NEON_TEST_NOTIFY_NOOP=1`.
+/// Honors `SILVERVINE_TEST_NOTIFY_NOOP=1`.
 pub fn notify_failure(category: ErrorCategory, message: &str) {
-    let summary = format!("Neon: {category} error");
+    let summary = format!("Silvervine: {category} error");
     let body = compose_failure_body(category, message);
     dispatch(&summary, &body, NotificationKind::Failure);
 }
@@ -72,9 +72,9 @@ pub fn notify_failure(category: ErrorCategory, message: &str) {
 /// Notify the user of a one-off informational event (e.g. "Widevine update
 /// available").
 ///
-/// Honors `NEON_TEST_NOTIFY_NOOP=1`.
+/// Honors `SILVERVINE_TEST_NOTIFY_NOOP=1`.
 pub fn notify_info(text: &str) {
-    let summary = "Neon".to_string();
+    let summary = "Silvervine".to_string();
     let body = truncate_body(text);
     dispatch(&summary, &body, NotificationKind::Info);
 }
@@ -115,11 +115,11 @@ enum NotificationKind {
     Info,
 }
 
-/// Dispatch a composed notification, honoring `NEON_TEST_NOTIFY_NOOP=1`.
+/// Dispatch a composed notification, honoring `SILVERVINE_TEST_NOTIFY_NOOP=1`.
 fn dispatch(summary: &str, body: &str, kind: NotificationKind) {
     if std::env::var_os(NOOP_ENV).is_some() {
         tracing::debug!(
-            target: "neon::notify",
+            target: "silvervine::notify",
             summary,
             body,
             ?kind,
@@ -129,7 +129,7 @@ fn dispatch(summary: &str, body: &str, kind: NotificationKind) {
     }
     if let Err(e) = send_native(summary, body, kind) {
         tracing::warn!(
-            target: "neon::notify",
+            target: "silvervine::notify",
             summary,
             body,
             error = %e,
@@ -163,7 +163,7 @@ fn send_native(
         // notification daemon level until the IPC client adds a handler).
         // Action buttons are NOT supported on macOS per the spec.
         if matches!(kind, NotificationKind::Failure) {
-            n.action("doctor", "Run neon doctor");
+            n.action("doctor", "Run silvervine doctor");
         }
     }
 
@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(out.chars().count(), BODY_MAX_LEN);
     }
 
-    /// `NEON_TEST_NOTIFY_NOOP=1` short-circuits dispatch — the function
+    /// `SILVERVINE_TEST_NOTIFY_NOOP=1` short-circuits dispatch — the function
     /// returns without hitting D-Bus / mac-notification-sys.
     #[test]
     fn notify_noop_short_circuits_dispatch() {

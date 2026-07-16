@@ -1,4 +1,4 @@
-//! `neon setup` — non-interactive equivalent of `init`.
+//! `silvervine setup` — non-interactive equivalent of `init`.
 //!
 //! Runs the same flow as [`crate::cli::init`] without prompting:
 //! detect → migrate → CDM → patch → daemon. Designed for scripts and CI.
@@ -16,7 +16,7 @@ use crate::error::Result;
 use crate::patch::{self, PatchOptions};
 use crate::{browsers, migration, widevine};
 
-/// Args for `neon setup`.
+/// Args for `silvervine setup`.
 #[derive(Debug, Clone, Default)]
 pub struct Args {
     /// Skip the daemon registration step.
@@ -49,7 +49,7 @@ pub fn build_plan(
     }
 }
 
-/// CLI entry point for `neon setup`.
+/// CLI entry point for `silvervine setup`.
 ///
 /// # Errors
 ///
@@ -81,7 +81,7 @@ fn production_cdm_resolver() -> Result<widevine::CachedCdm> {
 fn write_args_summary(args: &Args, out: &mut dyn Write) -> std::io::Result<()> {
     writeln!(
         out,
-        "neon setup — daemon: {} | eme-test: {}",
+        "silvervine setup — daemon: {} | eme-test: {}",
         if args.no_daemon { "no" } else { "yes" },
         if args.no_eme_test {
             "no"

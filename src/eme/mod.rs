@@ -4,7 +4,7 @@
 //! error codes when CDM playback fails. Most users see the code and have
 //! no idea what to do. This module ships a hand-curated map from common
 //! codes to actionable advice the user can act on locally — including
-//! the suggested `neon` subcommand to run.
+//! the suggested `silvervine` subcommand to run.
 //!
 //! ## Public API
 //!
@@ -12,9 +12,9 @@
 //! pub fn translate_error_code(code: &str) -> Option<EmeDiagnosis>;
 //! ```
 //!
-//! The CLI's `neon doctor <code>` subcommand surfaces the diagnosis to
+//! The CLI's `silvervine doctor <code>` subcommand surfaces the diagnosis to
 //! the user. Unknown codes return `None` — callers should fall back to
-//! a generic message ("error code unrecognized; try `neon doctor` to
+//! a generic message ("error code unrecognized; try `silvervine doctor` to
 //! check Widevine state").
 //!
 //! ## What this module does NOT do
@@ -24,7 +24,7 @@
 //! * No exhaustive coverage. We ship the codes that point at fixable
 //!   *Widevine / DRM* problems. Codes that mean "your subscription
 //!   lapsed" or "this title isn't licensed for your region" are out
-//!   of scope — neon can't help with those.
+//!   of scope — silvervine can't help with those.
 
 mod codes;
 

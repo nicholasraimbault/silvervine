@@ -97,7 +97,7 @@ fn write_cdm_into(target: &Path, cdm_source: &Path) -> Result<()> {
     let dest = target.join(CDM_SUBDIR);
     // Idempotent: if `WidevineCdm/` already exists from a prior patch,
     // remove it so the new copy starts fresh. We hold the patch lockfile
-    // (the orchestrator acquired it) so no other Neon invocation can be
+    // (the orchestrator acquired it) so no other Silvervine invocation can be
     // racing here.
     if dest.exists() {
         fs::remove_dir_all(&dest)

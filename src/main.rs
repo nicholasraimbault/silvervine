@@ -1,21 +1,22 @@
-//! Neon — single-binary cross-platform DRM (Widevine) helper for Chromium-family browsers.
+//! Silvervine — single-binary cross-platform DRM (Widevine) helper for Chromium-family browsers.
 //!
 //! `main.rs` is the thin dispatcher: parse [`clap`] args, install logging,
 //! delegate to the matching `cli::<name>::run` impl. All real logic
 //! lives in the library crate.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 
-use neon::cli;
-use neon::Error;
+use silvervine::cli;
+use silvervine::Error;
 
-/// Neon — patches Chromium-family browsers to play Widevine-protected content.
+/// Silvervine — patches Chromium-family browsers to play Widevine-protected content.
 #[derive(Debug, Parser)]
 #[command(
-    name = "neon",
+    name = "silvervine",
     version,
     about,
     long_about = None,
@@ -37,16 +38,6 @@ struct Cli {
     /// Emit structured JSON output where supported.
     #[arg(long, global = true)]
     json: bool,
-
-    /// Internal: signal that this Neon process is the privileged child
-    /// of an earlier escalation (`pkexec` / `sudo` / `osascript`). The
-    /// patch flow uses this flag to (a) skip a second escalation attempt
-    /// and (b) place its rollback snapshot in a same-filesystem sibling
-    /// directory of the install path so atomic-swap rollback works
-    /// (cross-filesystem `renameat2(RENAME_EXCHANGE)` returns `EXDEV`).
-    /// Hidden from the help output — end users should never set this.
-    #[arg(long, global = true, hide = true)]
-    as_root: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -132,7 +123,7 @@ enum Command {
         browser: String,
     },
 
-    /// Remove the Neon daemon and cache (browsers stay patched until they auto-update).
+    /// Remove the Silvervine daemon and cache (browsers stay patched until they auto-update).
     Uninstall {
         /// Also remove the user config + state files.
         #[arg(long)]
@@ -148,6 +139,27 @@ enum Command {
 
     /// Generate the man page in roff format.
     Manpage,
+
+    /// Internal filesystem-only operation used after privilege escalation.
+    #[command(name = "__privileged-patch", hide = true)]
+    PrivilegedPatch {
+        #[arg(long)]
+        install_path: PathBuf,
+        #[arg(long)]
+        framework_name: Option<String>,
+        #[arg(long)]
+        framework_version: Option<String>,
+        #[arg(long)]
+        backup_parent: PathBuf,
+        #[arg(long)]
+        cdm_dir: PathBuf,
+        #[arg(long)]
+        cdm_version: String,
+        #[arg(long)]
+        browser_name: String,
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -166,26 +178,97 @@ enum UpdateTarget {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let _ = neon::log::init(cli.verbose, cli.quiet, cli.no_color);
+    // The privileged child is dispatched immediately after clap parsing. It
+    // must not discover browsers, read user configuration, migrate data, open
+    // logs, fetch manifests, touch caches, or emit hooks.
+    if let Some(Command::PrivilegedPatch {
+        install_path,
+        framework_name,
+        framework_version,
+        backup_parent,
+        cdm_dir,
+        cdm_version,
+        browser_name,
+        force,
+    }) = &cli.command
+    {
+        let result = cli::patch::run_privileged(&cli::patch::PrivilegedArgs {
+            install_path: install_path.clone(),
+            framework_name: framework_name.clone(),
+            framework_version: framework_version.clone(),
+            backup_parent: backup_parent.clone(),
+            cdm_dir: cdm_dir.clone(),
+            cdm_version: cdm_version.clone(),
+            browser_name: browser_name.clone(),
+            force: *force,
+        });
+        return result.map_or_else(
+            |error| {
+                eprintln!("silvervine: {error}");
+                ExitCode::from(category_to_exit_code(&error))
+            },
+            |()| ExitCode::SUCCESS,
+        );
+    }
+
+    match prepare_startup_migration() {
+        Ok(entries) => report_data_migration(&entries),
+        Err(error) => {
+            eprintln!("silvervine: {error}");
+            return ExitCode::from(category_to_exit_code(&error));
+        }
+    }
+    let _ = silvervine::log::init(cli.verbose, cli.quiet, cli.no_color);
     let output = cli::OutputOptions::from_flags(cli.json, cli.quiet, cli.no_color);
 
-    let result: neon::Result<()> = match cli.command {
+    let result: silvervine::Result<()> = match cli.command {
         // No subcommand → run the tray daemon (default).
-        None => neon::daemon::run(),
-        Some(cmd) => dispatch(cmd, output, cli.as_root),
+        None => silvervine::daemon::run(),
+        Some(cmd) => dispatch(cmd, output),
     };
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("neon: {e}");
+            eprintln!("silvervine: {e}");
             ExitCode::from(category_to_exit_code(&e))
         }
     }
 }
 
+fn prepare_startup_migration() -> silvervine::Result<Vec<silvervine::migration::DataMigrationEntry>>
+{
+    silvervine::migration::migrate_v2_startup()
+}
+
+fn report_data_migration(entries: &[silvervine::migration::DataMigrationEntry]) {
+    use silvervine::migration::DataMigrationStatus;
+    for entry in entries {
+        match &entry.status {
+            DataMigrationStatus::Migrated => eprintln!(
+                "Silvervine: migrated legacy Neon {} data from {} to {}",
+                entry.kind,
+                entry.from.display(),
+                entry.to.display()
+            ),
+            DataMigrationStatus::Conflict => eprintln!(
+                "Silvervine: kept both Neon and Silvervine {} data directories ({} and {})",
+                entry.kind,
+                entry.from.display(),
+                entry.to.display()
+            ),
+            DataMigrationStatus::Error(error) => eprintln!(
+                "Silvervine: could not migrate Neon {} data from {}: {error}",
+                entry.kind,
+                entry.from.display()
+            ),
+            DataMigrationStatus::MissingSource => {}
+        }
+    }
+}
+
 /// Dispatch a parsed subcommand to its `cli::<name>::run` impl.
-fn dispatch(cmd: Command, output: cli::OutputOptions, as_root: bool) -> neon::Result<()> {
+fn dispatch(cmd: Command, output: cli::OutputOptions) -> silvervine::Result<()> {
     match cmd {
         Command::Init => cli::init::run(&cli::init::Args { output }),
         Command::Setup {
@@ -204,7 +287,6 @@ fn dispatch(cmd: Command, output: cli::OutputOptions, as_root: bool) -> neon::Re
             force,
             dry_run,
             browser,
-            as_root,
             output,
         }),
         Command::Status { watch } => cli::status::run(&cli::status::Args { watch, output }),
@@ -238,6 +320,7 @@ fn dispatch(cmd: Command, output: cli::OutputOptions, as_root: bool) -> neon::Re
         }
         Command::Completion { shell } => cli::completion::run(shell, Cli::command),
         Command::Manpage => cli::manpage::run(Cli::command),
+        Command::PrivilegedPatch { .. } => unreachable!("handled before startup side effects"),
     }
 }
 
@@ -246,9 +329,9 @@ fn dispatch(cmd: Command, output: cli::OutputOptions, as_root: bool) -> neon::Re
 /// 0 → success (handled in `main`).
 /// 1 → catch-all error.
 /// 2 → invalid usage (clap handles this internally for parse errors).
-/// 10+ → categorized neon failures.
+/// 10+ → categorized silvervine failures.
 fn category_to_exit_code(err: &Error) -> u8 {
-    use neon::ErrorCategory;
+    use silvervine::ErrorCategory;
     match err.category {
         ErrorCategory::PermissionDenied => 13,
         ErrorCategory::BrowserRunning => 11,

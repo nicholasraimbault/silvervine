@@ -16,11 +16,11 @@
 //! ## Atomic-patch protocol (per spec "Patch flow")
 //!
 //! ```text
-//! 1. Acquire lockfile (~/.cache/neon/patch.lock, flock exclusive).
+//! 1. Acquire lockfile (~/.cache/silvervine/patch.lock, flock exclusive).
 //! 2. Pre-flight:
 //!    a. Browser must not be running (unless --force-while-running).
 //!    b. CDM cache must be present and integrity-verified.
-//! 3. Snapshot original bundle    → ~/.cache/neon/backups/<browser>-<ver>-<ts>/
+//! 3. Snapshot original bundle    → ~/.cache/silvervine/backups/<browser>-<ver>-<ts>/
 //! 4. Platform impl writes CDM    → into the live bundle.
 //!    └ on any error → restore snapshot, return categorized Error.
 //! 5. Post-patch verification: CDM file present at the expected path.
@@ -101,44 +101,88 @@ pub fn host_patcher() -> Result<Box<dyn PlatformPatcher>> {
     }
 }
 
+/// Build the host patcher while preserving exact parent-selected macOS
+/// framework and version components for the privileged child. Linux ignores
+/// both values.
+///
+/// # Errors
+///
+/// Returns `UnknownBundleStructure` for missing/unsafe macOS components and
+/// `UnsupportedPlatform` outside Linux and macOS.
+pub fn host_patcher_for_layout(
+    framework_name: Option<&str>,
+    framework_version: Option<&str>,
+) -> Result<Box<dyn PlatformPatcher>> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (framework_name, framework_version);
+        Ok(Box::new(LinuxPatcher::new()))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let framework_name = framework_name.ok_or_else(|| {
+            Error::unknown_bundle_structure(
+                "privileged macOS patch requires an exact parent-selected framework",
+            )
+        })?;
+        let framework_version = framework_version.ok_or_else(|| {
+            Error::unknown_bundle_structure(
+                "privileged macOS patch requires an exact parent-selected framework version",
+            )
+        })?;
+        macos::validate_layout_component("framework", framework_name)?;
+        macos::validate_layout_component("framework version", framework_version)?;
+        Ok(Box::new(MacosPatcher::for_layout(
+            framework_name,
+            framework_version,
+        )))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(Error::unsupported_platform(
+            "patching is only implemented for Linux and macOS",
+        ))
+    }
+}
+
 /// Default lockfile path for patch operations.
 ///
-/// Per spec: `~/.cache/neon/patch.lock`. Returns `None` if `dirs::cache_dir()`
+/// Per spec: `~/.cache/silvervine/patch.lock`. Returns `None` if `dirs::cache_dir()`
 /// is unresolvable (e.g. no `$HOME`); callers in that case should surface a
 /// `StateCorrupted` error or use a caller-supplied path.
 #[must_use]
 pub fn default_patch_lock() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("neon").join("patch.lock"))
+    dirs::cache_dir().map(|d| d.join("silvervine").join("patch.lock"))
 }
 
 /// Options for [`patch_browser`].
 #[derive(Debug, Clone, Default)]
 pub struct PatchOptions {
     /// If `true`, patch even when the browser is currently running. Spec
-    /// recommends against this; reserved for `neon patch --force-while-running`.
+    /// recommends against this; reserved for `silvervine patch --force-while-running`.
     pub force_while_running: bool,
     /// If `true`, run all pre-flight + post-patch checks but do not touch
-    /// the bundle. Used by `neon patch --dry-run`.
+    /// the bundle. Used by `silvervine patch --dry-run`.
     pub dry_run: bool,
     /// Override the lockfile path. `None` uses [`default_patch_lock`].
     pub lock_path: Option<PathBuf>,
     /// Override the backups root. `None` triggers the writability-aware
     /// default: when the install path is writable by the current process,
-    /// backups go under [`backup::default_backups_dir`] (`~/.cache/neon/backups/`);
-    /// when it isn't, backups go under `<install-parent>/.neon-backups/`
-    /// so atomic-swap rollback stays on a single filesystem (no EXDEV).
+    /// backups go under [`backup::default_backups_dir`] (`~/.cache/silvervine/backups/`);
+    /// when it isn't, backups use an exclusively-created random sibling under
+    /// `<install-parent>` so atomic-swap rollback stays on one filesystem.
     /// Tests pass a `tempfile::TempDir` to bypass both defaults.
     pub backups_dir: Option<PathBuf>,
     /// `true` when this invocation is the privileged child of a previous
-    /// `neon patch` that escalated via `pkexec` / `sudo` / `osascript`.
-    /// Set by the CLI's hidden `--as-root` flag. Wires two pieces of
+    /// `silvervine patch` that escalated via `pkexec` / `sudo` / `osascript`.
+    /// Set only by the hidden privileged patch operation. Wires two pieces of
     /// behavior:
     ///
     /// 1. Don't try to escalate again (we're already root); a second
     ///    escalation attempt would loop or surface an extra password prompt.
     /// 2. Default `backups_dir` resolution falls through to
     ///    [`backup::snapshot_into_sibling`] (root-owned, same-filesystem)
-    ///    rather than `~/.cache/neon/backups/` (which would be the
+    ///    rather than `~/.cache/silvervine/backups/` (which would be the
     ///    elevation user's home).
     pub as_root: bool,
 }
@@ -236,7 +280,7 @@ pub trait PlatformPatcher {
 /// 1. Acquire patch lockfile (blocking).
 /// 2. If browser is running and `force_while_running` is false, error out
 ///    with [`crate::ErrorCategory::BrowserRunning`].
-/// 3. Snapshot the install path to `~/.cache/neon/backups/<browser>-<ver>-<ts>/`.
+/// 3. Snapshot the install path to `~/.cache/silvervine/backups/<browser>-<ver>-<ts>/`.
 /// 4. Call [`PlatformPatcher::write_cdm`] with the cached CDM directory as
 ///    source → on error, restore snapshot if the install was modified.
 /// 5. Call [`PlatformPatcher::verify_post_patch`] → on error, restore snapshot.
@@ -261,7 +305,7 @@ pub fn patch_browser(
     patcher: &dyn PlatformPatcher,
     options: &PatchOptions,
 ) -> Result<PatchOutcome> {
-    // `--as-root` invocations are the privileged children of an escalation
+    // Privileged-operation invocations are children of an escalation
     // — the parent process holds the lockfile and is blocked waiting for
     // this child to finish. Re-acquiring would deadlock both (issue #30).
     // Skip the lockfile entirely; the parent's lock covers us.
@@ -285,7 +329,7 @@ pub fn patch_browser(
 /// Escalation is needed **only** when none of the privilege paths apply:
 ///
 /// * `as_root` — already the elevated child of an escalation.
-/// * `running_as_root` — process started with euid 0 (e.g. `sudo neon`).
+/// * `running_as_root` — process started with euid 0 (e.g. `sudo silvervine`).
 ///   Re-escalating in that case caused issue #30: a redundant osascript
 ///   prompt followed by a deadlock against the parent's lockfile.
 /// * `target_writable` — the install path is writable by the current
@@ -305,7 +349,10 @@ fn run_patch(
     let started = Instant::now();
 
     // Pre-flight: refuse to patch a running browser unless --force-while-running.
-    if !options.force_while_running && discovery::is_running(browser) {
+    // The locked parent already performed this preflight before escalation;
+    // the privileged child must remain filesystem-only and not rediscover
+    // processes under a different account/session.
+    if !options.as_root && !options.force_while_running && discovery::is_running(browser) {
         return Err(Error::browser_running(format!(
             "{} is currently running; close it first or use --force-while-running",
             browser.name()
@@ -392,7 +439,7 @@ fn run_patch(
 ///    sibling-of-parent directory of the install path so
 ///    [`crate::platform::atomic_rename`] rollback stays on a single
 ///    filesystem (no `EXDEV`).
-/// 3. Else fall through to `~/.cache/neon/backups/` — the user-controlled
+/// 3. Else fall through to `~/.cache/silvervine/backups/` — the user-controlled
 ///    install case where the parent dir is typically `~/...` and shares a
 ///    filesystem with `~/.cache` anyway.
 fn take_snapshot(
@@ -431,7 +478,10 @@ pub fn target_writable(path: &Path) -> bool {
         return false;
     }
     let n = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let probe = path.join(format!(".neon-write-probe-{}-{n}", std::process::id()));
+    let probe = path.join(format!(
+        ".silvervine-write-probe-{}-{n}",
+        std::process::id()
+    ));
     match OpenOptions::new().create_new(true).write(true).open(&probe) {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);
@@ -441,12 +491,92 @@ pub fn target_writable(path: &Path) -> bool {
     }
 }
 
-/// Re-invoke the current Neon binary with elevated privileges and let the
+fn select_privileged_snapshot_parent(install_path: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let canonical_install = std::fs::canonicalize(install_path).map_err(|error| {
+        Error::other(format!(
+            "could not canonicalize browser install {}",
+            install_path.display()
+        ))
+        .with_source(error)
+    })?;
+    let install_device = std::fs::metadata(&canonical_install)
+        .map_err(Error::from)?
+        .dev();
+    let candidate = canonical_install.parent().ok_or_else(|| {
+        Error::unknown_bundle_structure("browser install has no parent for a secure snapshot")
+    })?;
+
+    #[cfg(test)]
+    {
+        let _ = install_device;
+        Ok(candidate.to_path_buf())
+    }
+    #[cfg(not(test))]
+    {
+        let mut candidate = candidate;
+        if platform::is_running_as_root() {
+            return Ok(candidate.to_path_buf());
+        }
+        loop {
+            let metadata = std::fs::metadata(candidate).map_err(Error::from)?;
+            if metadata.dev() != install_device {
+                return Err(Error::permission_denied(
+                    "no non-writable same-filesystem ancestor is available for a secure privileged snapshot",
+                ));
+            }
+            if !target_writable(candidate) {
+                return Ok(candidate.to_path_buf());
+            }
+            candidate = candidate.parent().ok_or_else(|| {
+                Error::permission_denied(
+                    "no trusted same-filesystem directory is available for a privileged snapshot",
+                )
+            })?;
+        }
+    }
+}
+
+/// Validate the exact snapshot parent handed to the privileged child.
+///
+/// # Errors
+/// Rejects symlinked/non-canonical directories and cross-filesystem parents.
+pub fn validate_privileged_snapshot_parent(install_path: &Path, parent: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let install_metadata = std::fs::symlink_metadata(install_path).map_err(Error::from)?;
+    if install_metadata.file_type().is_symlink() {
+        return Err(Error::unknown_bundle_structure(
+            "privileged browser install path must not be a symlink",
+        ));
+    }
+    let canonical_parent = std::fs::canonicalize(parent).map_err(Error::from)?;
+    if canonical_parent != parent {
+        return Err(Error::unknown_bundle_structure(
+            "privileged snapshot parent must be an exact canonical directory",
+        ));
+    }
+    let parent_metadata = std::fs::symlink_metadata(parent).map_err(Error::from)?;
+    if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
+        return Err(Error::unknown_bundle_structure(
+            "privileged snapshot parent must be a non-symlink directory",
+        ));
+    }
+    if install_metadata.dev() != parent_metadata.dev() {
+        return Err(Error::unknown_bundle_structure(
+            "privileged snapshot parent must share the browser filesystem",
+        ));
+    }
+    Ok(())
+}
+
+/// Re-invoke the current Silvervine binary with elevated privileges and let the
 /// privileged child do the actual filesystem work. The parent process
 /// (this one) only validates that the child exited cleanly; the child
 /// writes the snapshot, the CDM, and the verify in one go.
 ///
-/// On `NEON_TEST_ESCALATE_NOOP=1`, [`platform::run_as_root`] returns a
+/// On `SILVERVINE_TEST_ESCALATE_NOOP=1`, [`platform::run_as_root`] returns a
 /// canned successful [`Output`](std::process::Output) without actually
 /// spawning anything — the test branch surfaces a synthetic
 /// [`PatchOutcome`] with the version-before captured pre-escalation. Tests
@@ -465,28 +595,9 @@ fn run_patch_via_escalation(
         .to_str()
         .ok_or_else(|| Error::other("current executable path is not valid UTF-8"))?;
 
-    // Build the argv for the elevated child: re-run `neon` with
-    // `--as-root patch [--force] <browser>`. The child re-enters this
-    // very flow with `as_root = true`, which short-circuits the
-    // writability check and selects the same-filesystem snapshot
-    // location.
-    //
-    // The browser is identified by its display name; the elevated child
-    // re-runs `detect_browsers()` and matches by name. Passing the
-    // install path directly would short-circuit detection but break the
-    // contract that all `neon` subcommands operate on detected browsers.
-    //
-    // Propagate `--force`: if the parent decided to patch despite the
-    // browser running (because the user asked), the child must inherit
-    // that decision. Otherwise the child's pre-flight check would refuse
-    // to patch and exit nonzero, which the parent would surface as a
-    // confusing "elevated patch failed" error.
-    let mut argv: Vec<&str> = vec![exe_str, "--as-root", "patch"];
-    if options.force_while_running {
-        argv.push("--force");
-    }
-    argv.push(browser.name());
-    let output = platform::run_as_root(&argv)?;
+    let argv = privileged_patch_argv(exe_str, browser, cdm, options)?;
+    let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let output = platform::run_as_root(&argv_refs)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -544,6 +655,60 @@ enum PatchAttempt {
 /// roll back. A `write_cdm` failure is classified according to whether the
 /// platform implementation modified the install before failing; verification
 /// failures always require rollback.
+fn privileged_patch_argv(
+    exe: &str,
+    browser: &Browser,
+    cdm: &CachedCdm,
+    options: &PatchOptions,
+) -> Result<Vec<String>> {
+    let install = browser
+        .install_path()
+        .to_str()
+        .ok_or_else(|| Error::other("browser install path is not valid UTF-8"))?;
+    let cdm_dir = cdm
+        .cdm_dir()
+        .to_str()
+        .ok_or_else(|| Error::other("CachedCdm path is not valid UTF-8"))?;
+    let backup_parent = select_privileged_snapshot_parent(browser.install_path())?;
+    let backup_parent = backup_parent
+        .to_str()
+        .ok_or_else(|| Error::other("snapshot parent path is not valid UTF-8"))?;
+    let mut argv = vec![
+        exe.to_string(),
+        "__privileged-patch".into(),
+        "--install-path".into(),
+        install.into(),
+        "--backup-parent".into(),
+        backup_parent.into(),
+        "--cdm-dir".into(),
+        cdm_dir.into(),
+        "--cdm-version".into(),
+        cdm.version().into(),
+        "--browser-name".into(),
+        browser.name().into(),
+    ];
+    #[cfg(target_os = "macos")]
+    {
+        let (framework, version) = macos::resolve_privileged_layout(
+            browser.install_path(),
+            browser.framework_name.as_deref(),
+        )?;
+        argv.push("--framework-name".into());
+        argv.push(framework);
+        argv.push("--framework-version".into());
+        argv.push(version);
+    }
+    #[cfg(not(target_os = "macos"))]
+    if let Some(framework) = &browser.framework_name {
+        argv.push("--framework-name".into());
+        argv.push(framework.clone());
+    }
+    if options.force_while_running {
+        argv.push("--force".into());
+    }
+    Ok(argv)
+}
+
 fn perform_patch(
     browser: &Browser,
     cdm: &CachedCdm,
@@ -834,9 +999,9 @@ mod tests {
         let cases = [
             ((false, false, false), true),
             ((false, false, true), false),
-            ((false, true, false), false), // sudo neon: don't re-prompt
+            ((false, true, false), false), // sudo silvervine: don't re-prompt
             ((false, true, true), false),
-            ((true, false, false), false), // --as-root child: never recurse
+            ((true, false, false), false), // privileged child: never recurse
             ((true, false, true), false),
             ((true, true, false), false),
             ((true, true, true), false),
@@ -910,9 +1075,9 @@ mod tests {
     }
 
     #[test]
-    fn default_patch_lock_path_resolves_to_neon_subdir() {
+    fn default_patch_lock_path_resolves_to_silvervine_subdir() {
         if let Some(p) = default_patch_lock() {
-            let suffix = std::path::Path::new("neon").join("patch.lock");
+            let suffix = std::path::Path::new("silvervine").join("patch.lock");
             assert!(p.ends_with(&suffix), "got {}", p.display());
         }
     }
@@ -985,6 +1150,22 @@ mod tests {
     }
 
     /// `target_writable` returns `false` when the path doesn't exist.
+    #[cfg(unix)]
+    #[test]
+    fn privileged_snapshot_parent_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let install = tmp.path().join("install");
+        let real_parent = tmp.path().join("trusted");
+        let linked_parent = tmp.path().join("linked");
+        fs::create_dir_all(&install).unwrap();
+        fs::create_dir_all(&real_parent).unwrap();
+        symlink(&real_parent, &linked_parent).unwrap();
+        let error = validate_privileged_snapshot_parent(&install, &linked_parent).unwrap_err();
+        assert!(error.to_string().contains("exact canonical"));
+    }
+
     #[test]
     fn target_writable_returns_false_for_missing_path() {
         let tmp = TempDir::new().expect("tempdir");
@@ -1040,8 +1221,8 @@ mod tests {
     }
 
     /// When `as_root` is set and no `backups_dir` is provided, the snapshot
-    /// goes under `<install-parent>/.neon-backups/...` so `atomic_rename`
-    /// rollback works on a single filesystem.
+    /// uses an exclusively-created random sibling under `<install-parent>` so
+    /// `atomic_rename` rollback works on a single filesystem.
     #[test]
     fn take_snapshot_uses_sibling_when_as_root_and_no_override() {
         let tmp = TempDir::new().expect("tempdir");
@@ -1057,16 +1238,11 @@ mod tests {
             as_root: true,
         };
         let handle = take_snapshot(&browser, &opts, Some("v1")).expect("ok");
-        let expected_root = install
-            .parent()
-            .expect("install has parent")
-            .join(".neon-backups");
-        assert!(
-            handle.snapshot_path().starts_with(&expected_root),
-            "snapshot {} should be under {}",
-            handle.snapshot_path().display(),
-            expected_root.display()
-        );
+        let expected_parent = install.parent().expect("install has parent");
+        assert_eq!(handle.snapshot_path().parent(), Some(expected_parent));
+        assert!(handle.snapshot_path().file_name().is_some_and(|name| name
+            .to_string_lossy()
+            .starts_with(".silvervine-TestBrowser-v1-")));
         let _ = handle.commit();
     }
 
@@ -1108,7 +1284,7 @@ mod tests {
 
     /// When the install path is not writable AND `as_root` is `false`,
     /// `run_patch` escalates via `platform::run_as_root`. With
-    /// `NEON_TEST_ESCALATE_NOOP=1` the escalation is a stub that returns
+    /// `SILVERVINE_TEST_ESCALATE_NOOP=1` the escalation is a stub that returns
     /// success, so we can verify the parent-side flow without actually
     /// elevating.
     #[cfg(unix)]
@@ -1148,9 +1324,9 @@ mod tests {
         }
 
         // SAFETY: env mutation under env_lock; restored at end of test.
-        unsafe { std::env::set_var("NEON_TEST_ESCALATE_NOOP", "1") };
+        unsafe { std::env::set_var("SILVERVINE_TEST_ESCALATE_NOOP", "1") };
         let outcome = patch_browser(&browser, &cdm, &patcher, &opts);
-        unsafe { std::env::remove_var("NEON_TEST_ESCALATE_NOOP") };
+        unsafe { std::env::remove_var("SILVERVINE_TEST_ESCALATE_NOOP") };
 
         // Restore perms so tempdir cleanup can succeed.
         let perms = fs::Permissions::from_mode(0o755);
@@ -1170,6 +1346,78 @@ mod tests {
     /// When `as_root` is set, `run_patch` skips the writability check
     /// and proceeds normally — the elevated child trusts that it has
     /// permission already.
+    #[test]
+    fn privileged_handoff_carries_exact_parent_selection() {
+        let tmp = TempDir::new().unwrap();
+        let install = tmp.path().join("exact custom install");
+        let cdm_root = tmp.path().join("exact cache");
+        fs::create_dir_all(&install).unwrap();
+        #[cfg(target_os = "macos")]
+        fs::create_dir_all(
+            install.join("Contents/Frameworks/Exact Framework.framework/Versions/2.0/Libraries"),
+        )
+        .unwrap();
+        let cdm = make_cached_cdm(&cdm_root, "9.8.7.6");
+        let mut browser = make_browser(install.clone());
+        browser.name = "Parent Custom".into();
+        browser.framework_name = Some("Exact Framework".into());
+        let argv = privileged_patch_argv(
+            "/bin/silvervine",
+            &browser,
+            &cdm,
+            &PatchOptions {
+                force_while_running: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(argv[0], "/bin/silvervine");
+        assert!(argv
+            .windows(2)
+            .any(|v| v == ["--install-path", install.to_str().unwrap()]));
+        assert!(argv
+            .windows(2)
+            .any(|v| v == ["--cdm-dir", cdm.cdm_dir().to_str().unwrap()]));
+        assert!(argv.windows(2).any(|v| v == ["--cdm-version", "9.8.7.6"]));
+        assert!(argv
+            .windows(2)
+            .any(|v| v == ["--browser-name", "Parent Custom"]));
+        assert!(argv
+            .windows(2)
+            .any(|v| v == ["--framework-name", "Exact Framework"]));
+        #[cfg(target_os = "macos")]
+        assert!(argv.windows(2).any(|v| v == ["--framework-version", "2.0"]));
+        assert!(argv.contains(&"--force".to_string()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn privileged_handoff_resolves_missing_custom_framework_in_parent() {
+        let tmp = TempDir::new().unwrap();
+        let install = tmp.path().join("Custom.app");
+        fs::create_dir_all(
+            install.join("Contents/Frameworks/Selected Framework.framework/Versions/1.0/Libraries"),
+        )
+        .unwrap();
+        let cdm = make_cached_cdm(&tmp.path().join("cache"), "1.0");
+        let mut browser = make_browser(install);
+        browser.framework_name = None;
+
+        let argv = privileged_patch_argv(
+            "/usr/local/bin/silvervine",
+            &browser,
+            &cdm,
+            &PatchOptions::default(),
+        )
+        .unwrap();
+        assert!(argv
+            .windows(2)
+            .any(|args| args == ["--framework-name", "Selected Framework"]));
+        assert!(argv
+            .windows(2)
+            .any(|args| args == ["--framework-version", "1.0"]));
+    }
+
     #[test]
     fn run_patch_with_as_root_skips_escalation_and_invokes_patcher() {
         let tmp = TempDir::new().expect("tempdir");

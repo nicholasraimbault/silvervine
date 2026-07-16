@@ -3,7 +3,7 @@
 //! ## Why this module exists
 //!
 //! Multiple test modules across the crate mutate process-wide env vars
-//! like `$HOME`, `$XDG_CONFIG_HOME`, `NEON_TEST_*`. Each test module
+//! like `$HOME`, `$XDG_CONFIG_HOME`, `SILVERVINE_TEST_*`. Each test module
 //! historically had its own `static ENV_MUTEX: Mutex<()>` to serialize
 //! tests *within that module*, but two tests **in different modules**
 //! could still race on the same env var because they hold different
@@ -19,7 +19,7 @@
 //! Tests call:
 //!
 //! ```ignore
-//! let _guard = neon::test_support::env_lock();
+//! let _guard = silvervine::test_support::env_lock();
 //! ```
 //!
 //! `env_lock()` recovers from a poisoned mutex automatically — when a

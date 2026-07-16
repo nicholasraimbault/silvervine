@@ -37,16 +37,16 @@ impl PlatformPaths for MacosPaths {
     fn cache_dir() -> PathBuf {
         dirs::cache_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("neon")
+            .join("silvervine")
     }
 
     fn config_dir() -> PathBuf {
         // `dirs::config_dir()` returns `~/Library/Application Support`
-        // on macOS — that's where Neon's `config.toml` and `state.json`
+        // on macOS — that's where Silvervine's `config.toml` and `state.json`
         // live.
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("neon")
+            .join("silvervine")
     }
 
     fn applications_dirs() -> Vec<PathBuf> {
@@ -62,35 +62,6 @@ pub(super) fn config_dir() -> PathBuf {
 }
 pub(super) fn applications_dirs() -> Vec<PathBuf> {
     MacosPaths::applications_dirs()
-}
-
-/// Re-invoke the current Neon binary with elevated privileges via
-/// `osascript do shell script ... with administrator privileges`.
-///
-/// The current binary is resolved via `std::env::current_exe()`. The
-/// elevated child receives `--as-root patch <target>` so the CLI's
-/// `--as-root` branch can do the privileged write.
-pub(super) fn escalate_for_patch(target: &Path) -> Result<()> {
-    let exe = std::env::current_exe()
-        .map_err(|e| Error::other("could not resolve current executable").with_source(e))?;
-    let exe_str = exe
-        .to_str()
-        .ok_or_else(|| Error::other("current executable path is not valid UTF-8"))?;
-    let target_str = target
-        .to_str()
-        .ok_or_else(|| Error::other("target path is not valid UTF-8"))?;
-    let cmd: &[&str] = &[exe_str, "--as-root", "patch", target_str];
-    let output = run_as_root(cmd)?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(Error::permission_denied(format!(
-            "elevated patch failed ({}): {}",
-            super::format_exit_status(output.status),
-            stderr.trim()
-        )))
-    }
 }
 
 /// Run `command` under `osascript do shell script ...` and return the
@@ -262,7 +233,7 @@ fn io_invalid(e: std::ffi::NulError) -> std::io::Error {
 /// Fallback when `RENAME_SWAP` is unsupported: rename `dst` aside,
 /// move `src` into place, then remove the saved `dst`.
 fn fallback_two_step_rename(src: &Path, dst: &Path) -> Result<()> {
-    let backup = dst.with_extension("neon-tmp");
+    let backup = dst.with_extension("silvervine-tmp");
     std::fs::rename(dst, &backup).map_err(|e| {
         Error::from(e).message_or(format!(
             "fallback rename: could not move {} aside",
@@ -312,13 +283,13 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn cache_dir_ends_with_neon() {
-        assert!(MacosPaths::cache_dir().ends_with("neon"));
+    fn cache_dir_ends_with_silvervine() {
+        assert!(MacosPaths::cache_dir().ends_with("silvervine"));
     }
 
     #[test]
-    fn config_dir_ends_with_neon() {
-        assert!(MacosPaths::config_dir().ends_with("neon"));
+    fn config_dir_ends_with_silvervine() {
+        assert!(MacosPaths::config_dir().ends_with("silvervine"));
     }
 
     #[test]

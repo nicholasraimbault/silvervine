@@ -1,4 +1,4 @@
-//! `neon test` — EME (Widevine) playback health check.
+//! `silvervine test` — EME (Widevine) playback health check.
 //!
 //! Designed to spawn a headless Chromium-family browser against a known
 //! EME test page (e.g. Shaka Player demo). Verifies whether the patched
@@ -7,9 +7,9 @@
 //! ## Critical guardrail
 //!
 //! The actual browser launch is gated behind a runtime path that is
-//! **only triggered when the user invokes `neon test` from the
+//! **only triggered when the user invokes `silvervine test` from the
 //! command line** — never from tests. Inside `cargo test`, every
-//! [`Plan::execute`] short-circuits via `NEON_TEST_BROWSER_TEST_NOOP=1`
+//! [`Plan::execute`] short-circuits via `SILVERVINE_TEST_BROWSER_TEST_NOOP=1`
 //! (set by the test harness when it doesn't want the real browser
 //! launched).
 //!
@@ -27,14 +27,14 @@ use crate::error::{Error, Result};
 /// Env var that, when set, makes [`Plan::execute_real_browser`] return
 /// `Ok(())` without actually spawning a browser. Used by integration
 /// tests + by the `cargo test` harness for safety.
-pub const NOOP_ENV: &str = "NEON_TEST_BROWSER_TEST_NOOP";
+pub const NOOP_ENV: &str = "SILVERVINE_TEST_BROWSER_TEST_NOOP";
 
 /// URL of the default EME test page. Shaka Player's demo is the
 /// canonical "does Widevine work?" page on the open web; it serves an
 /// MPEG-DASH manifest with Widevine-encrypted segments.
 pub const DEFAULT_TEST_URL: &str = "https://shaka-player-demo.appspot.com/demo/";
 
-/// Args for `neon test`.
+/// Args for `silvervine test`.
 #[derive(Debug, Clone, Default)]
 pub struct Args {
     /// Optional positional: which browser to use. Defaults to the
@@ -46,7 +46,7 @@ pub struct Args {
     pub output: OutputOptions,
 }
 
-/// Plan describing what `neon test` would do.
+/// Plan describing what `silvervine test` would do.
 ///
 /// Tests build a [`Plan`] from synthetic input and assert against its
 /// fields directly. Production code calls [`Plan::execute_real_browser`]
@@ -103,7 +103,7 @@ impl Plan {
     }
 
     /// Actually spawn the browser. **Only callable from the user's
-    /// runtime command path** — short-circuits if `NEON_TEST_BROWSER_TEST_NOOP=1`.
+    /// runtime command path** — short-circuits if `SILVERVINE_TEST_BROWSER_TEST_NOOP=1`.
     ///
     /// # Errors
     ///

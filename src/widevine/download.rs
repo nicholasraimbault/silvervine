@@ -13,7 +13,7 @@
 //! ## Output
 //!
 //! A path to the verified `.crx3` file on disk. In production this is
-//! typically `~/.cache/neon/downloads/<sha-prefix>.crx3`; tests pass a
+//! typically `~/.cache/silvervine/downloads/<sha-prefix>.crx3`; tests pass a
 //! `tempfile::TempDir`.
 //!
 //! ## Hash mismatch handling
@@ -42,12 +42,12 @@ use crate::widevine::manifest::PlatformEntry;
 /// HTTP transport timeout per URL. Mirrors the manifest fetcher's value.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Default download cache directory: `~/.cache/neon/downloads/`.
+/// Default download cache directory: `~/.cache/silvervine/downloads/`.
 ///
 /// Returns `None` if `dirs::cache_dir()` is unresolvable.
 #[must_use]
 pub fn default_download_dir() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("neon").join("downloads"))
+    dirs::cache_dir().map(|d| d.join("silvervine").join("downloads"))
 }
 
 /// Download the CRX3 described by `entry` and verify its SHA-512.
@@ -66,7 +66,9 @@ pub fn default_download_dir() -> Option<PathBuf> {
 ///   creation).
 pub fn download_to_cache(entry: &PlatformEntry) -> Result<PathBuf> {
     let dir = default_download_dir().ok_or_else(|| {
-        Error::state_corrupted("cannot resolve ~/.cache/neon/downloads (no \\$HOME / cache dir)")
+        Error::state_corrupted(
+            "cannot resolve ~/.cache/silvervine/downloads (no \\$HOME / cache dir)",
+        )
     })?;
     download_to(entry, &dir)
 }
@@ -457,9 +459,9 @@ mod tests {
     }
 
     #[test]
-    fn default_download_dir_resolves_under_neon_subdir() {
+    fn default_download_dir_resolves_under_silvervine_subdir() {
         if let Some(p) = default_download_dir() {
-            let suffix = std::path::Path::new("neon").join("downloads");
+            let suffix = std::path::Path::new("silvervine").join("downloads");
             assert!(p.ends_with(&suffix), "got {}", p.display());
         }
     }

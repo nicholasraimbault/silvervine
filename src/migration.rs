@@ -20,7 +20,7 @@
 //! | `/lib/systemd/system/neon-fix-drm.{path,service}` | Linux Debian / pre-merged-usr units | leave; surface pkg-manager hint |
 //! | `~/Library/LaunchAgents/com.neon.app.plist` | Mac DMG/Swift app legacy | unload + remove (user) |
 //! | `~/.config/autostart/neon.desktop` | Linux tray-app legacy | remove (user) |
-//! | `~/.local/share/WidevineCdm/` | Legacy CDM cache | migrate to `~/.cache/neon/widevine/<version>/` |
+//! | `~/.local/share/WidevineCdm/` | Legacy CDM cache | migrate to `~/.cache/silvervine/widevine/<version>/` |
 //! | `/usr/lib/neon/` | Linux packaged install (AUR / .deb / .rpm) | leave; surface pkg-manager hint |
 //!
 //! Artifacts under `/usr/lib/` and `/lib/` are owned by the system package
@@ -39,13 +39,13 @@
 //! expected `LegacyArtifact`s are reported. Removal tests use the same
 //! temp root and check for absence afterward; commands that would
 //! normally need root (`launchctl`, `systemctl`) are guarded by the
-//! `NEON_TEST_ESCALATE_NOOP=1` env var that `crate::platform` honors.
+//! `SILVERVINE_TEST_ESCALATE_NOOP=1` env var that `crate::platform` honors.
 //!
 //! ## What this module does NOT do
 //!
 //! * No backup of removed artifacts. The legacy install is by definition
 //!   broken/being replaced; preserving plists or service files would just
-//!   confuse later runs of `neon doctor`.
+//!   confuse later runs of `silvervine doctor`.
 //! * No state-file migration beyond the `WidevineCdm` cache move. Legacy
 //!   never had a stable state file.
 
@@ -53,6 +53,461 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::platform;
+
+/// Filesystem locations used to migrate data from the Neon V2 layout.
+///
+/// Tests inject temporary paths; production uses [`DataMigrationPaths::host`].
+#[derive(Debug, Clone)]
+pub struct DataMigrationPaths {
+    /// Legacy and current config directories.
+    pub config: (PathBuf, PathBuf),
+    /// Legacy and current cache directories. The cache contains CLI/daemon logs.
+    pub cache: (PathBuf, PathBuf),
+    /// Optional separate tray-log directories (used on macOS).
+    pub logs: Option<(PathBuf, PathBuf)>,
+}
+
+impl DataMigrationPaths {
+    /// Resolve the host's Neon and Silvervine V2 data directories.
+    #[must_use]
+    pub fn host() -> Self {
+        let current_config = platform::config_dir();
+        let current_cache = platform::cache_dir();
+        let legacy_config = sibling_named(&current_config, "neon");
+        let legacy_cache = sibling_named(&current_cache, "neon");
+        #[cfg(target_os = "macos")]
+        let logs = dirs::home_dir().map(|home| {
+            let base = home.join("Library").join("Logs");
+            (base.join("neon"), base.join("silvervine"))
+        });
+        #[cfg(not(target_os = "macos"))]
+        let logs = None;
+        Self {
+            config: (legacy_config, current_config),
+            cache: (legacy_cache, current_cache),
+            logs,
+        }
+    }
+}
+
+fn sibling_named(path: &Path, name: &str) -> PathBuf {
+    path.parent()
+        .map_or_else(|| PathBuf::from(name), |parent| parent.join(name))
+}
+
+/// Result of attempting one Neon V2 data-directory migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataMigrationEntry {
+    /// Kind of data represented by this directory.
+    pub kind: &'static str,
+    /// Legacy Neon source.
+    pub from: PathBuf,
+    /// Silvervine destination.
+    pub to: PathBuf,
+    /// Observable result; conflicts and errors never overwrite either path.
+    pub status: DataMigrationStatus,
+}
+
+/// Status for one V2 data-directory migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataMigrationStatus {
+    /// The source was atomically renamed to the destination.
+    Migrated,
+    /// No source existed; repeated runs are harmless.
+    MissingSource,
+    /// Both paths existed, so both were preserved.
+    Conflict,
+    /// Migration could not proceed; the source was left in place.
+    Error(String),
+}
+
+/// Migrate host Neon V2 data directories to Silvervine locations.
+#[must_use]
+pub fn migrate_v2_data() -> Vec<DataMigrationEntry> {
+    if std::env::var_os("SILVERVINE_TEST_DATA_MIGRATION_NOOP").is_some() {
+        return Vec::new();
+    }
+    migrate_v2_data_with(&DataMigrationPaths::host())
+}
+
+/// Serialize and transactionally coordinate Neon V2 daemon/data transition.
+/// The lock lives beside (not inside) the renameable config directories, so
+/// its inode remains stable for the entire first-launch transaction.
+///
+/// # Errors
+///
+/// Returns an error when preflight, daemon transition, a directory move,
+/// rollback, or replacement registration fails.
+pub fn migrate_v2_startup() -> Result<Vec<DataMigrationEntry>> {
+    if std::env::var_os("SILVERVINE_TEST_DATA_MIGRATION_NOOP").is_some() {
+        return Ok(Vec::new());
+    }
+    let paths = DataMigrationPaths::host();
+    let lock = migration_lock_path(&paths);
+    crate::lockfile::with_lock(&lock, || {
+        startup_transaction(&paths, &mut HostLegacyLifecycle)
+    })
+}
+
+fn migration_lock_path(paths: &DataMigrationPaths) -> PathBuf {
+    paths
+        .config
+        .0
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".silvervine-v2-migration.lock")
+}
+
+trait LegacyLifecycle {
+    fn is_registered(&mut self) -> Result<bool>;
+    fn silvervine_is_registered(&mut self) -> Result<bool>;
+    /// Stop Neon and return whether it was running before the stop.
+    fn stop(&mut self) -> Result<bool>;
+    /// Restore Neon only when it was running before the transaction.
+    fn restore(&mut self, was_running: bool) -> Result<()>;
+    fn register_silvervine(&mut self) -> Result<()>;
+    fn unregister_silvervine(&mut self) -> Result<()>;
+    fn remove_registration(&mut self) -> Result<()>;
+}
+
+struct HostLegacyLifecycle;
+
+impl LegacyLifecycle for HostLegacyLifecycle {
+    fn is_registered(&mut self) -> Result<bool> {
+        crate::daemon::lifecycle::legacy_is_registered()
+    }
+    fn silvervine_is_registered(&mut self) -> Result<bool> {
+        crate::daemon::lifecycle::registration_exists()
+    }
+    fn stop(&mut self) -> Result<bool> {
+        crate::daemon::lifecycle::stop_legacy()
+    }
+    fn restore(&mut self, was_running: bool) -> Result<()> {
+        crate::daemon::lifecycle::restore_legacy(was_running)
+    }
+    fn register_silvervine(&mut self) -> Result<()> {
+        crate::daemon::lifecycle::register()
+    }
+    fn unregister_silvervine(&mut self) -> Result<()> {
+        crate::daemon::lifecycle::unregister_for_rollback()
+    }
+    fn remove_registration(&mut self) -> Result<()> {
+        crate::daemon::lifecycle::remove_legacy_registration()
+    }
+}
+
+fn startup_transaction(
+    paths: &DataMigrationPaths,
+    lifecycle: &mut dyn LegacyLifecycle,
+) -> Result<Vec<DataMigrationEntry>> {
+    startup_transaction_with(paths, lifecycle, &mut no_replace_rename)
+}
+
+fn startup_transaction_with(
+    paths: &DataMigrationPaths,
+    lifecycle: &mut dyn LegacyLifecycle,
+    promote: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<Vec<DataMigrationEntry>> {
+    let pairs = migration_pairs(paths);
+    preflight_pairs(&pairs)?;
+    let had_registration = lifecycle.is_registered()?;
+    if had_registration && lifecycle.silvervine_is_registered()? {
+        return Err(Error::other(
+            "both Neon and Silvervine daemon registrations exist; refusing an ambiguous migration",
+        ));
+    }
+    let was_running = if had_registration {
+        lifecycle.stop()?
+    } else {
+        false
+    };
+
+    let mut moved = Vec::new();
+    let data_transaction = (|| {
+        refuse_connectable_legacy_socket(paths)?;
+        let mut entries = Vec::new();
+        for (kind, from, to) in &pairs {
+            let entry = migrate_data_directory(kind, from, to, promote);
+            match &entry.status {
+                DataMigrationStatus::Migrated => moved.push((from.clone(), to.clone())),
+                DataMigrationStatus::Error(message) => {
+                    return Err(Error::other(format!(
+                        "could not migrate Neon {kind} data from {}: {message}",
+                        from.display()
+                    )));
+                }
+                _ => {}
+            }
+            entries.push(entry);
+        }
+        Ok(entries)
+    })();
+
+    let entries = match data_transaction {
+        Ok(entries) => entries,
+        Err(error) => {
+            return Err(rollback_data_and_restore_legacy(
+                error,
+                &moved,
+                lifecycle,
+                had_registration,
+                was_running,
+            ));
+        }
+    };
+
+    if had_registration {
+        if let Err(error) = lifecycle.register_silvervine() {
+            // Even registration's internal rollback can itself fail. An
+            // idempotent unregister is the final safety barrier before
+            // moving data back underneath Neon.
+            if let Err(unregister) = lifecycle.unregister_silvervine() {
+                return Err(with_rollback_failure(
+                    error,
+                    "unregister Silvervine after registration failure",
+                    &unregister,
+                ));
+            }
+            return Err(rollback_data_and_restore_legacy(
+                error,
+                &moved,
+                lifecycle,
+                true,
+                was_running,
+            ));
+        }
+        if let Err(error) = lifecycle.remove_registration() {
+            // The new daemon must be stopped and unregistered before its data
+            // paths can safely move back underneath Neon.
+            if let Err(unregister) = lifecycle.unregister_silvervine() {
+                return Err(with_rollback_failure(
+                    error,
+                    "unregister Silvervine",
+                    &unregister,
+                ));
+            }
+            return Err(rollback_data_and_restore_legacy(
+                error,
+                &moved,
+                lifecycle,
+                true,
+                was_running,
+            ));
+        }
+    }
+    Ok(entries)
+}
+
+fn rollback_data_and_restore_legacy(
+    error: Error,
+    moved: &[(PathBuf, PathBuf)],
+    lifecycle: &mut dyn LegacyLifecycle,
+    had_registration: bool,
+    was_running: bool,
+) -> Error {
+    if let Err(rollback) = rollback_moves(moved) {
+        return with_rollback_failure(error, "restore Neon data", &rollback);
+    }
+    if had_registration {
+        if let Err(restore) = lifecycle.restore(was_running) {
+            return with_rollback_failure(error, "restore Neon daemon state", &restore);
+        }
+    }
+    error
+}
+
+fn with_rollback_failure(primary: Error, action: &str, rollback: &Error) -> Error {
+    let category = primary.category;
+    Error::new(
+        category,
+        format!("{primary}; rollback failed while attempting to {action}: {rollback}"),
+    )
+    .with_source(primary)
+}
+
+fn migration_pairs(paths: &DataMigrationPaths) -> Vec<(&'static str, PathBuf, PathBuf)> {
+    let mut pairs = vec![
+        ("config", paths.config.0.clone(), paths.config.1.clone()),
+        ("cache/log", paths.cache.0.clone(), paths.cache.1.clone()),
+    ];
+    if let Some((from, to)) = &paths.logs {
+        pairs.push(("log", from.clone(), to.clone()));
+    }
+    pairs
+}
+
+fn preflight_pairs(pairs: &[(&'static str, PathBuf, PathBuf)]) -> Result<()> {
+    for (kind, from, to) in pairs {
+        if from.exists() && !from.is_dir() {
+            return Err(Error::other(format!(
+                "could not migrate Neon {kind} data from {}: source is not a directory",
+                from.display()
+            )));
+        }
+        if to.exists() && !to.is_dir() {
+            return Err(Error::other(format!(
+                "could not migrate Neon {kind} data to {}: destination is not a directory",
+                to.display()
+            )));
+        }
+        if from.is_dir() && !to.exists() {
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent).map_err(Error::from)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn refuse_connectable_legacy_socket(paths: &DataMigrationPaths) -> Result<()> {
+    let socket = paths.cache.0.join("daemon.sock");
+    #[cfg(unix)]
+    if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+        return Err(Error::other(format!(
+            "legacy Neon daemon is still reachable at {}; refusing to migrate its cache",
+            socket.display()
+        )));
+    }
+    Ok(())
+}
+
+fn rollback_moves(moved: &[(PathBuf, PathBuf)]) -> Result<()> {
+    for (from, to) in moved.iter().rev() {
+        no_replace_rename(to, from).map_err(|error| {
+            Error::other(format!(
+                "could not roll back data migration {} -> {}: {error}",
+                to.display(),
+                from.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Injection-friendly V2 data migration used by startup and tests.
+///
+/// Promotion uses the host's atomic no-replace rename primitive, so a
+/// destination created after inspection is preserved and reported as a
+/// [`DataMigrationStatus::Conflict`].
+#[must_use]
+pub fn migrate_v2_data_with(paths: &DataMigrationPaths) -> Vec<DataMigrationEntry> {
+    migrate_v2_data_with_promoter(paths, no_replace_rename)
+}
+
+fn migrate_v2_data_with_promoter<F>(
+    paths: &DataMigrationPaths,
+    mut promote: F,
+) -> Vec<DataMigrationEntry>
+where
+    F: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    let mut pairs = vec![
+        ("config", &paths.config.0, &paths.config.1),
+        ("cache/log", &paths.cache.0, &paths.cache.1),
+    ];
+    if let Some((from, to)) = &paths.logs {
+        pairs.push(("log", from, to));
+    }
+    pairs
+        .into_iter()
+        .map(|(kind, from, to)| migrate_data_directory(kind, from, to, &mut promote))
+        .collect()
+}
+
+fn migrate_data_directory<F>(
+    kind: &'static str,
+    from: &Path,
+    to: &Path,
+    promote: &mut F,
+) -> DataMigrationEntry
+where
+    F: FnMut(&Path, &Path) -> std::io::Result<()> + ?Sized,
+{
+    let status = if !from.exists() {
+        DataMigrationStatus::MissingSource
+    } else if to.exists() {
+        DataMigrationStatus::Conflict
+    } else if !from.is_dir() {
+        DataMigrationStatus::Error("source is not a directory".into())
+    } else {
+        let result = to
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| promote(from, to));
+        match result {
+            Ok(()) => DataMigrationStatus::Migrated,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                DataMigrationStatus::Conflict
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && !from.exists()
+                    && to.is_dir() =>
+            {
+                DataMigrationStatus::Migrated
+            }
+            Err(error) => DataMigrationStatus::Error(error.to_string()),
+        }
+    };
+    DataMigrationEntry {
+        kind,
+        from: from.to_path_buf(),
+        to: to.to_path_buf(),
+        status,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn no_replace_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in source path"))?;
+    let to = CString::new(to.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in destination path")
+    })?;
+
+    #[cfg(target_os = "linux")]
+    // SAFETY: both C strings remain alive for the call; AT_FDCWD makes both
+    // paths relative to the current working directory when not absolute.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    // SAFETY: both C strings remain alive for the call. RENAME_EXCL is the
+    // Darwin no-replace flag (0x4), not RENAME_SWAP.
+    let result = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn no_replace_rename(_from: &Path, _to: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace rename is only supported on Linux and macOS",
+    ))
+}
 
 /// One artifact of a legacy install detected on the host.
 ///
@@ -433,7 +888,7 @@ pub fn legacy_package_uninstall_hint(pm: PackageManager, pkg: &str) -> String {
 /// `<cache_dir>/widevine/legacy/`. The "legacy" suffix is intentional —
 /// the V2 CDM cache uses the version string (e.g. `4.10.2934.0/`); we
 /// stash the legacy cache under a sibling without claiming a version.
-/// V2's update flow (`neon update widevine`) will replace it with a
+/// V2's update flow (`silvervine update widevine`) will replace it with a
 /// properly-versioned cache at first use.
 #[must_use]
 pub fn legacy_cdm_destination() -> PathBuf {
@@ -455,7 +910,7 @@ pub fn legacy_cdm_destination() -> PathBuf {
 ///   caller via the returned [`MigrationOutcome`].
 ///
 /// Privilege escalation goes through [`platform::run_as_root`]; this
-/// honors `NEON_TEST_ESCALATE_NOOP=1` so tests don't actually elevate.
+/// honors `SILVERVINE_TEST_ESCALATE_NOOP=1` so tests don't actually elevate.
 ///
 /// # Errors
 ///
@@ -759,6 +1214,104 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    fn data_paths(tmp: &Path) -> DataMigrationPaths {
+        DataMigrationPaths {
+            config: (tmp.join("config/neon"), tmp.join("config/silvervine")),
+            cache: (tmp.join("cache/neon"), tmp.join("cache/silvervine")),
+            logs: Some((tmp.join("logs/neon"), tmp.join("logs/silvervine"))),
+        }
+    }
+
+    #[test]
+    fn v2_data_migration_atomically_moves_all_directories() {
+        let tmp = TempDir::new().unwrap();
+        let paths = data_paths(tmp.path());
+        for (from, marker) in [
+            (&paths.config.0, "config.toml"),
+            (&paths.cache.0, "widevine/marker"),
+            (&paths.logs.as_ref().unwrap().0, "silvervine.log"),
+        ] {
+            fs::create_dir_all(from.join(Path::new(marker).parent().unwrap())).unwrap();
+            fs::write(from.join(marker), b"data").unwrap();
+        }
+
+        let result = migrate_v2_data_with(&paths);
+        assert!(result
+            .iter()
+            .all(|entry| entry.status == DataMigrationStatus::Migrated));
+        assert!(paths.config.1.join("config.toml").is_file());
+        assert!(paths.cache.1.join("widevine/marker").is_file());
+        assert!(paths
+            .logs
+            .as_ref()
+            .unwrap()
+            .1
+            .join("silvervine.log")
+            .is_file());
+        assert!(!paths.config.0.exists());
+        assert!(!paths.cache.0.exists());
+    }
+
+    #[test]
+    fn v2_data_migration_is_idempotent_when_sources_are_missing() {
+        let tmp = TempDir::new().unwrap();
+        let result = migrate_v2_data_with(&data_paths(tmp.path()));
+        assert!(result
+            .iter()
+            .all(|entry| entry.status == DataMigrationStatus::MissingSource));
+    }
+
+    #[test]
+    fn v2_data_migration_preserves_both_sides_on_conflict() {
+        let tmp = TempDir::new().unwrap();
+        let paths = data_paths(tmp.path());
+        fs::create_dir_all(&paths.config.0).unwrap();
+        fs::create_dir_all(&paths.config.1).unwrap();
+        fs::write(paths.config.0.join("old"), b"old").unwrap();
+        fs::write(paths.config.1.join("new"), b"new").unwrap();
+
+        let result = migrate_v2_data_with(&paths);
+        let config = result.iter().find(|entry| entry.kind == "config").unwrap();
+        assert_eq!(config.status, DataMigrationStatus::Conflict);
+        assert!(paths.config.0.join("old").is_file());
+        assert!(paths.config.1.join("new").is_file());
+    }
+
+    #[test]
+    fn v2_data_migration_race_preserves_destination_and_source() {
+        let tmp = TempDir::new().unwrap();
+        let paths = data_paths(tmp.path());
+        fs::create_dir_all(&paths.config.0).unwrap();
+        fs::write(paths.config.0.join("old"), b"old").unwrap();
+
+        let result = migrate_v2_data_with_promoter(&paths, |from, to| {
+            if from == paths.config.0 && to == paths.config.1 {
+                fs::create_dir_all(to)?;
+                fs::write(to.join("racer"), b"new")?;
+            }
+            no_replace_rename(from, to)
+        });
+
+        let config = result.iter().find(|entry| entry.kind == "config").unwrap();
+        assert_eq!(config.status, DataMigrationStatus::Conflict);
+        assert_eq!(fs::read(paths.config.0.join("old")).unwrap(), b"old");
+        assert_eq!(fs::read(paths.config.1.join("racer")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn v2_data_migration_reports_errors_without_removing_source() {
+        let tmp = TempDir::new().unwrap();
+        let paths = data_paths(tmp.path());
+        fs::create_dir_all(paths.config.0.parent().unwrap()).unwrap();
+        fs::write(&paths.config.0, b"not a directory").unwrap();
+
+        let result = migrate_v2_data_with(&paths);
+        let config = result.iter().find(|entry| entry.kind == "config").unwrap();
+        assert!(matches!(config.status, DataMigrationStatus::Error(_)));
+        assert!(paths.config.0.is_file());
+        assert!(!paths.config.1.exists());
+    }
+
     /// Build a fully-synthesized legacy install under `tmp` and return
     /// the [`FsRoots`] that points at it.
     fn synthesize_full_legacy(tmp: &Path) -> FsRoots {
@@ -917,7 +1470,7 @@ mod tests {
     }
 
     /// `remove_legacy_with` removes all user artifacts cleanly when
-    /// running with `NEON_TEST_ESCALATE_NOOP` set so root operations
+    /// running with `SILVERVINE_TEST_ESCALATE_NOOP` set so root operations
     /// don't actually shell out.
     #[test]
     fn remove_legacy_under_noop_short_circuit() {
@@ -925,7 +1478,7 @@ mod tests {
         let roots = synthesize_full_legacy(tmp.path());
         // SAFETY: env mutations happen in serial test threads; we
         // restore at end-of-test.
-        unsafe { std::env::set_var("NEON_TEST_ESCALATE_NOOP", "1") };
+        unsafe { std::env::set_var("SILVERVINE_TEST_ESCALATE_NOOP", "1") };
         let install = detect_legacy_install_in(&roots);
         let cdm_dest = tmp.path().join("v2-cache").join("widevine").join("legacy");
         let outcome = remove_legacy_with(install, &cdm_dest).expect("ok");
@@ -955,7 +1508,7 @@ mod tests {
             .any(|p| p.ends_with("Library/LaunchDaemons/com.neon.fix-drm.plist")));
         assert!(!outcome.migrated.is_empty());
 
-        unsafe { std::env::remove_var("NEON_TEST_ESCALATE_NOOP") };
+        unsafe { std::env::remove_var("SILVERVINE_TEST_ESCALATE_NOOP") };
     }
 
     #[test]
@@ -967,10 +1520,10 @@ mod tests {
         fs::create_dir_all(&cdm_dest).unwrap();
         fs::write(cdm_dest.join("v2-marker"), b"v2").unwrap();
 
-        unsafe { std::env::set_var("NEON_TEST_ESCALATE_NOOP", "1") };
+        unsafe { std::env::set_var("SILVERVINE_TEST_ESCALATE_NOOP", "1") };
         let install = detect_legacy_install_in(&roots);
         let outcome = remove_legacy_with(install, &cdm_dest).expect("ok");
-        unsafe { std::env::remove_var("NEON_TEST_ESCALATE_NOOP") };
+        unsafe { std::env::remove_var("SILVERVINE_TEST_ESCALATE_NOOP") };
 
         // Legacy CDM cache is gone; v2 marker is intact.
         let home = roots.home.as_ref().unwrap();
@@ -986,12 +1539,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_cdm_destination_lives_under_neon_cache() {
+    fn legacy_cdm_destination_lives_under_silvervine_cache() {
         let p = legacy_cdm_destination();
         assert!(p.ends_with("widevine/legacy"), "{}", p.display());
-        // The parent should end with `neon` (cache_dir is .../neon).
         let parent = p.parent().expect("has parent").parent().expect("has gp");
-        assert!(parent.ends_with("neon"));
+        assert!(parent.ends_with("silvervine"));
     }
 
     #[test]
@@ -1429,12 +1981,12 @@ mod tests {
             home: None,
         };
 
-        unsafe { std::env::set_var("NEON_TEST_ESCALATE_NOOP", "1") };
+        unsafe { std::env::set_var("SILVERVINE_TEST_ESCALATE_NOOP", "1") };
         let install = detect_legacy_install_in(&roots);
         assert_eq!(install.package_manager, PackageManager::Pacman);
         let cdm_dest = tmp.path().join("v2-cache/widevine/legacy");
         let outcome = remove_legacy_with(install, &cdm_dest).expect("ok");
-        unsafe { std::env::remove_var("NEON_TEST_ESCALATE_NOOP") };
+        unsafe { std::env::remove_var("SILVERVINE_TEST_ESCALATE_NOOP") };
 
         // Units under /usr/lib are reported as skipped with a pacman hint.
         let unit_skips: Vec<&SkipReason> = outcome
@@ -1467,5 +2019,246 @@ mod tests {
                 p.display()
             );
         }
+    }
+
+    #[derive(Default)]
+    struct MockLegacyLifecycle {
+        registered: bool,
+        running: bool,
+        failures: Vec<&'static str>,
+        calls: Vec<&'static str>,
+    }
+
+    impl LegacyLifecycle for MockLegacyLifecycle {
+        fn is_registered(&mut self) -> Result<bool> {
+            self.calls.push("probe");
+            Ok(self.registered)
+        }
+        fn silvervine_is_registered(&mut self) -> Result<bool> {
+            self.calls.push("silvervine-probe");
+            Ok(false)
+        }
+        fn stop(&mut self) -> Result<bool> {
+            self.calls.push("stop");
+            Ok(self.running)
+        }
+        fn restore(&mut self, was_running: bool) -> Result<()> {
+            self.calls.push(if was_running {
+                "restore-running"
+            } else {
+                "restore-inactive"
+            });
+            Ok(())
+        }
+        fn register_silvervine(&mut self) -> Result<()> {
+            self.calls.push("register");
+            if self.failures.contains(&"register") {
+                Err(Error::other("new registration failed"))
+            } else {
+                Ok(())
+            }
+        }
+        fn unregister_silvervine(&mut self) -> Result<()> {
+            self.calls.push("unregister");
+            if self.failures.contains(&"unregister") {
+                Err(Error::other("new unregistration failed"))
+            } else {
+                Ok(())
+            }
+        }
+        fn remove_registration(&mut self) -> Result<()> {
+            self.calls.push("remove");
+            if self.failures.contains(&"retire") {
+                Err(Error::other("legacy retirement failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn startup_without_legacy_registration_migrates_without_registering() {
+        let tmp = TempDir::new().unwrap();
+        let paths = data_paths(tmp.path());
+        fs::create_dir_all(&paths.config.0).unwrap();
+        fs::write(paths.config.0.join("marker"), b"config").unwrap();
+        let mut lifecycle = MockLegacyLifecycle::default();
+        startup_transaction(&paths, &mut lifecycle).unwrap();
+        assert!(paths.config.1.join("marker").is_file());
+        assert_eq!(lifecycle.calls, ["probe"]);
+    }
+
+    #[test]
+    fn registration_failure_rolls_back_all_moves_and_restarts_neon() {
+        let tmp = TempDir::new().unwrap();
+        let paths = data_paths(tmp.path());
+        for from in [&paths.config.0, &paths.cache.0] {
+            fs::create_dir_all(from).unwrap();
+            fs::write(from.join("marker"), b"legacy").unwrap();
+        }
+        let mut lifecycle = MockLegacyLifecycle {
+            registered: true,
+            running: true,
+            failures: vec!["register"],
+            ..Default::default()
+        };
+        let result = startup_transaction(&paths, &mut lifecycle);
+        assert!(result.is_err());
+        assert!(paths.config.0.join("marker").is_file());
+        assert!(paths.cache.0.join("marker").is_file());
+        assert!(!paths.config.1.exists());
+        assert!(!paths.cache.1.exists());
+        assert_eq!(
+            lifecycle.calls,
+            [
+                "probe",
+                "silvervine-probe",
+                "stop",
+                "register",
+                "unregister",
+                "restore-running"
+            ]
+        );
+    }
+
+    #[test]
+    fn second_move_failure_rolls_back_first_and_restarts_neon() {
+        let tmp = TempDir::new().unwrap();
+        let paths = data_paths(tmp.path());
+        for from in [&paths.config.0, &paths.cache.0] {
+            fs::create_dir_all(from).unwrap();
+            fs::write(from.join("marker"), b"legacy").unwrap();
+        }
+        let mut lifecycle = MockLegacyLifecycle {
+            registered: true,
+            running: true,
+            ..Default::default()
+        };
+        let mut moves = 0;
+        let result = startup_transaction_with(&paths, &mut lifecycle, &mut |from, to| {
+            moves += 1;
+            if moves == 2 {
+                Err(std::io::Error::other("injected move failure"))
+            } else {
+                no_replace_rename(from, to)
+            }
+        });
+        assert!(result.is_err());
+        assert!(paths.config.0.join("marker").is_file());
+        assert!(paths.cache.0.join("marker").is_file());
+        assert!(!paths.config.1.exists());
+        assert_eq!(
+            lifecycle.calls,
+            ["probe", "silvervine-probe", "stop", "restore-running"]
+        );
+    }
+
+    #[test]
+    fn enoent_is_peer_completion_only_for_present_destination_directory() {
+        let tmp = TempDir::new().unwrap();
+        let paths = data_paths(tmp.path());
+        fs::create_dir_all(&paths.config.0).unwrap();
+        let result = migrate_v2_data_with_promoter(&paths, |from, to| {
+            if from == paths.config.0 {
+                fs::remove_dir_all(from)?;
+                fs::create_dir_all(to)?;
+            }
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        let config = result.iter().find(|entry| entry.kind == "config").unwrap();
+        assert_eq!(config.status, DataMigrationStatus::Migrated);
+        let cache = result
+            .iter()
+            .find(|entry| entry.kind == "cache/log")
+            .unwrap();
+        assert_eq!(cache.status, DataMigrationStatus::MissingSource);
+    }
+
+    #[test]
+    fn retirement_failure_unregisters_new_daemon_then_rolls_back_data() {
+        let tmp = TempDir::new().unwrap();
+        let paths = data_paths(tmp.path());
+        fs::create_dir_all(&paths.config.0).unwrap();
+        fs::write(paths.config.0.join("marker"), b"legacy").unwrap();
+        let mut lifecycle = MockLegacyLifecycle {
+            registered: true,
+            running: true,
+            failures: vec!["retire"],
+            ..Default::default()
+        };
+
+        let error = startup_transaction(&paths, &mut lifecycle).unwrap_err();
+        assert!(error.to_string().contains("legacy retirement failed"));
+        assert!(paths.config.0.join("marker").is_file());
+        assert!(!paths.config.1.exists());
+        assert_eq!(
+            lifecycle.calls,
+            [
+                "probe",
+                "silvervine-probe",
+                "stop",
+                "register",
+                "remove",
+                "unregister",
+                "restore-running"
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_transaction_does_not_start_previously_inactive_neon() {
+        let tmp = TempDir::new().unwrap();
+        let paths = data_paths(tmp.path());
+        fs::create_dir_all(&paths.config.0).unwrap();
+        fs::write(paths.config.0.join("marker"), b"legacy").unwrap();
+        let mut lifecycle = MockLegacyLifecycle {
+            registered: true,
+            running: false,
+            failures: vec!["register"],
+            ..Default::default()
+        };
+
+        startup_transaction(&paths, &mut lifecycle).unwrap_err();
+        assert_eq!(
+            lifecycle.calls,
+            [
+                "probe",
+                "silvervine-probe",
+                "stop",
+                "register",
+                "unregister",
+                "restore-inactive"
+            ]
+        );
+    }
+
+    #[test]
+    fn retirement_rollback_failure_keeps_migrated_data_for_active_silvervine() {
+        let tmp = TempDir::new().unwrap();
+        let paths = data_paths(tmp.path());
+        fs::create_dir_all(&paths.config.0).unwrap();
+        fs::write(paths.config.0.join("marker"), b"legacy").unwrap();
+        let mut lifecycle = MockLegacyLifecycle {
+            registered: true,
+            running: true,
+            failures: vec!["retire", "unregister"],
+            ..Default::default()
+        };
+
+        let error = startup_transaction(&paths, &mut lifecycle).unwrap_err();
+        assert!(error.to_string().contains("rollback failed"));
+        assert!(!paths.config.0.exists());
+        assert!(paths.config.1.join("marker").is_file());
+        assert_eq!(
+            lifecycle.calls,
+            [
+                "probe",
+                "silvervine-probe",
+                "stop",
+                "register",
+                "remove",
+                "unregister"
+            ]
+        );
     }
 }

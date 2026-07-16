@@ -24,7 +24,7 @@
 //! pub fn run_with(options: RunOptions) -> Result<()>;
 //! ```
 //!
-//! `run()` is the entry point invoked by `neon` with no arguments
+//! `run()` is the entry point invoked by `silvervine` with no arguments
 //! (Phase 4 wires this from `main.rs`). It:
 //!
 //! 1. Installs a `tracing-subscriber`.
@@ -49,7 +49,7 @@
 //! * No real watcher (skips `notify::recommended_watcher`).
 //! * IPC binds to a `tempfile::TempDir`-supplied path.
 //! * No `lifecycle::register` / `power::subscribe_wake_events` (relies on
-//!   the existing `NEON_TEST_LIFECYCLE_NOOP` / `NEON_TEST_POWER_NOOP`
+//!   the existing `SILVERVINE_TEST_LIFECYCLE_NOOP` / `SILVERVINE_TEST_POWER_NOOP`
 //!   gates).
 //! * No `tracing_subscriber::fmt` install — tests can install their own.
 
@@ -83,7 +83,7 @@ pub const HEARTBEAT_INTERVAL_SECS: u64 = 60;
 /// the cached CDM's hash against the manifest and notifies on mismatch.
 pub const INTEGRITY_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 
-/// Filename of the heartbeat artifact under `cache_dir/neon/`.
+/// Filename of the heartbeat artifact under `cache_dir/silvervine/`.
 pub const HEARTBEAT_FILENAME: &str = "heartbeat";
 
 /// Filename of the shutdown timestamp written when `run()` returns.
@@ -98,10 +98,10 @@ pub struct RunOptions {
     /// lifecycle/power side-effects (those env-gate themselves).
     pub test_mode: bool,
     /// Override the heartbeat path. `None` resolves to
-    /// `cache_dir/neon/heartbeat`.
+    /// `cache_dir/silvervine/heartbeat`.
     pub heartbeat_path: Option<PathBuf>,
     /// Override the IPC socket path. `None` resolves to
-    /// `cache_dir/neon/daemon.sock`.
+    /// `cache_dir/silvervine/daemon.sock`.
     pub ipc_socket_path: Option<PathBuf>,
     /// Override the heartbeat interval. `None` uses [`HEARTBEAT_INTERVAL_SECS`].
     pub heartbeat_interval: Option<Duration>,
@@ -119,7 +119,7 @@ pub struct RunOptions {
 }
 
 /// Entry point for the daemon. Production callers in
-/// [`crate::main`] invoke this when `neon` is run with no arguments.
+/// [`crate::main`] invoke this when `silvervine` is run with no arguments.
 ///
 /// Returns once the user / system requests shutdown.
 ///
@@ -144,7 +144,7 @@ pub fn run() -> Result<()> {
 ///
 /// See [`run`].
 pub fn run_with(options: &RunOptions) -> Result<()> {
-    tracing::info!(target: "neon::daemon", "neon daemon starting");
+    tracing::info!(target: "silvervine::daemon", "silvervine daemon starting");
 
     let config = match options.config_override.clone() {
         Some(c) => c,
@@ -155,7 +155,7 @@ pub fn run_with(options: &RunOptions) -> Result<()> {
         Some(b) => b,
         None => browsers::detect_browsers().unwrap_or_else(|e| {
             tracing::warn!(
-                target: "neon::daemon",
+                target: "silvervine::daemon",
                 error = %e,
                 "browser detection failed; continuing with empty list"
             );
@@ -184,7 +184,7 @@ pub fn run_with(options: &RunOptions) -> Result<()> {
     // keep going (the daemon still serves IPC).
     let watcher_callback: WatcherCallback = Arc::new(|browser: &Browser| {
         tracing::info!(
-            target: "neon::daemon",
+            target: "silvervine::daemon",
             browser = %browser.name(),
             "watcher fired callback; running patch flow"
         );
@@ -242,7 +242,7 @@ pub fn run_with(options: &RunOptions) -> Result<()> {
     let result = run_event_loop(&tray, &stop, options.single_iteration, Some(&ipc_state));
 
     // Tear down: writes shutdown stamp + joins threads.
-    tracing::info!(target: "neon::daemon", "neon daemon shutting down");
+    tracing::info!(target: "silvervine::daemon", "silvervine daemon shutting down");
     stop.store(true, Ordering::SeqCst);
     drop(watcher); // close fs watcher + dispatch thread
     drop(ipc); // close IPC server + remove socket file
@@ -273,7 +273,7 @@ fn build_tray_with_fallback(initial: MenuState, test_mode: bool) -> Tray {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(
-                target: "neon::daemon",
+                target: "silvervine::daemon",
                 error = %e,
                 "tray initialization failed; running in --no-tray mode (notifications only)"
             );
@@ -296,7 +296,7 @@ fn build_watcher_with_fallback(
         Ok(w) => w,
         Err(e) => {
             tracing::warn!(
-                target: "neon::daemon",
+                target: "silvervine::daemon",
                 error = %e,
                 "watcher initialization failed; daemon will not auto-detect browser updates"
             );
@@ -306,7 +306,7 @@ fn build_watcher_with_fallback(
     for browser in browsers {
         if let Err(e) = watcher.watch(browser.clone()) {
             tracing::warn!(
-                target: "neon::daemon",
+                target: "silvervine::daemon",
                 browser = %browser.name(),
                 error = %e,
                 "failed to add browser to watcher"
@@ -372,14 +372,14 @@ fn subscribe_wake_for_recheck(stop: Arc<AtomicBool>) -> Option<power::WakeSubscr
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        tracing::info!(target: "neon::daemon", "wake event received; re-checking browsers");
+        tracing::info!(target: "silvervine::daemon", "wake event received; re-checking browsers");
         // Phase 4 wires the actual re-check flow; for now we just trace.
     });
     match power::subscribe_wake_events(cb) {
         Ok(sub) => Some(sub),
         Err(e) => {
             tracing::warn!(
-                target: "neon::daemon",
+                target: "silvervine::daemon",
                 error = %e,
                 "wake subscription failed; daemon will not re-check after sleep"
             );
@@ -399,12 +399,12 @@ fn spawn_heartbeat(
         let _ = std::fs::create_dir_all(parent);
     }
     std::thread::Builder::new()
-        .name("neon-heartbeat".to_string())
+        .name("silvervine-heartbeat".to_string())
         .spawn(move || {
             while !stop.load(Ordering::SeqCst) {
                 if let Err(e) = write_heartbeat(&path) {
                     tracing::warn!(
-                        target: "neon::daemon",
+                        target: "silvervine::daemon",
                         error = %e,
                         path = %path.display(),
                         "heartbeat write failed"
@@ -426,7 +426,7 @@ fn spawn_heartbeat(
 /// Spawn the weekly CDM integrity-check thread.
 fn spawn_integrity_check(interval: Duration, stop: Arc<AtomicBool>) -> Option<JoinHandle<()>> {
     std::thread::Builder::new()
-        .name("neon-integrity".to_string())
+        .name("silvervine-integrity".to_string())
         .spawn(move || {
             while !stop.load(Ordering::SeqCst) {
                 let mut slept = Duration::ZERO;
@@ -454,7 +454,7 @@ fn check_cdm_integrity() {
     use crate::widevine::manifest::{cached_manifest_path, parse_manifest};
     let Some(cache_path) = cached_manifest_path() else {
         tracing::info!(
-            target: "neon::daemon",
+            target: "silvervine::daemon",
             "integrity check: no resolvable manifest cache path; skipping"
         );
         return;
@@ -463,7 +463,7 @@ fn check_cdm_integrity() {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::info!(
-                target: "neon::daemon",
+                target: "silvervine::daemon",
                 "integrity check: no cached manifest at {}; skipping",
                 cache_path.display()
             );
@@ -471,7 +471,7 @@ fn check_cdm_integrity() {
         }
         Err(e) => {
             tracing::warn!(
-                target: "neon::daemon",
+                target: "silvervine::daemon",
                 error = %e,
                 path = %cache_path.display(),
                 "integrity check: failed to read cached manifest"
@@ -483,7 +483,7 @@ fn check_cdm_integrity() {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(
-                target: "neon::daemon",
+                target: "silvervine::daemon",
                 error = %e,
                 "integrity check: failed to parse cached manifest"
             );
@@ -492,11 +492,11 @@ fn check_cdm_integrity() {
     };
     match verify_integrity(&manifest) {
         Ok(()) => {
-            tracing::debug!(target: "neon::daemon", "integrity check passed");
+            tracing::debug!(target: "silvervine::daemon", "integrity check passed");
         }
         Err(e) => {
             tracing::warn!(
-                target: "neon::daemon",
+                target: "silvervine::daemon",
                 error = %e,
                 "integrity check failed; CDM may need redownload"
             );
@@ -533,11 +533,12 @@ fn write_shutdown_timestamp(dir: &Path) {
 /// Resolve the heartbeat file path from options (or the default).
 fn resolve_heartbeat_path(options: &RunOptions) -> PathBuf {
     options.heartbeat_path.clone().unwrap_or_else(|| {
-        default_heartbeat_path().unwrap_or_else(|| std::env::temp_dir().join("neon-heartbeat"))
+        default_heartbeat_path()
+            .unwrap_or_else(|| std::env::temp_dir().join("silvervine-heartbeat"))
     })
 }
 
-/// Default heartbeat path: `<cache_dir>/neon/heartbeat`.
+/// Default heartbeat path: `<cache_dir>/silvervine/heartbeat`.
 #[must_use]
 pub fn default_heartbeat_path() -> Option<PathBuf> {
     Some(platform::cache_dir().join(HEARTBEAT_FILENAME))
@@ -546,7 +547,8 @@ pub fn default_heartbeat_path() -> Option<PathBuf> {
 /// Resolve the IPC socket path from options (or the default).
 fn resolve_socket_path(options: &RunOptions) -> PathBuf {
     options.ipc_socket_path.clone().unwrap_or_else(|| {
-        ipc::default_socket_path().unwrap_or_else(|| std::env::temp_dir().join("neon-daemon.sock"))
+        ipc::default_socket_path()
+            .unwrap_or_else(|| std::env::temp_dir().join("silvervine-daemon.sock"))
     })
 }
 
@@ -568,12 +570,12 @@ fn run_event_loop(
         let cmd = tray.try_recv();
         match cmd {
             Some(TrayCommand::Quit) => {
-                tracing::info!(target: "neon::daemon", "tray Quit; exiting");
+                tracing::info!(target: "silvervine::daemon", "tray Quit; exiting");
                 stop.store(true, Ordering::SeqCst);
                 return Ok(());
             }
             Some(TrayCommand::PatchAll) => {
-                tracing::info!(target: "neon::daemon", "tray PatchAll");
+                tracing::info!(target: "silvervine::daemon", "tray PatchAll");
                 if !daemon_patch_noop() {
                     let detected = detected_browsers_from(state);
                     let results = drive_patch_flow(&detected, None, false);
@@ -581,7 +583,7 @@ fn run_event_loop(
                 }
             }
             Some(TrayCommand::PatchOne(name)) => {
-                tracing::info!(target: "neon::daemon", browser = %name, "tray PatchOne");
+                tracing::info!(target: "silvervine::daemon", browser = %name, "tray PatchOne");
                 if !daemon_patch_noop() {
                     let detected = detected_browsers_from(state);
                     let results = drive_patch_flow(&detected, Some(&name), false);
@@ -589,12 +591,12 @@ fn run_event_loop(
                 }
             }
             Some(TrayCommand::UpdateWidevine) => {
-                tracing::info!(target: "neon::daemon", "tray UpdateWidevine");
+                tracing::info!(target: "silvervine::daemon", "tray UpdateWidevine");
                 handle_update_widevine();
             }
             Some(TrayCommand::ToggleLaunchAtLogin(target)) => {
                 tracing::info!(
-                    target: "neon::daemon",
+                    target: "silvervine::daemon",
                     target_state = target,
                     "tray ToggleLaunchAtLogin"
                 );
@@ -612,7 +614,7 @@ fn run_event_loop(
 
 /// Best-effort: returns `true` if the daemon is registered for auto-start.
 /// Lifecycle's `is_registered` is short-circuited to `false` under
-/// `NEON_TEST_LIFECYCLE_NOOP`, so test runs never observe stale daemon
+/// `SILVERVINE_TEST_LIFECYCLE_NOOP`, so test runs never observe stale daemon
 /// state.
 fn lifecycle_is_registered() -> bool {
     lifecycle::is_registered()
@@ -622,7 +624,7 @@ fn lifecycle_is_registered() -> bool {
 /// handlers short-circuit without invoking the real patch flow. Used by
 /// daemon tests + by the IPC dispatch tests that want to exercise the
 /// JSON shape without spawning a network fetch.
-pub const DAEMON_PATCH_NOOP_ENV: &str = "NEON_TEST_DAEMON_PATCH_NOOP";
+pub const DAEMON_PATCH_NOOP_ENV: &str = "SILVERVINE_TEST_DAEMON_PATCH_NOOP";
 
 /// Returns `true` when [`DAEMON_PATCH_NOOP_ENV`] is set in the
 /// environment.
@@ -631,7 +633,7 @@ fn daemon_patch_noop() -> bool {
 }
 
 /// Drive the actual patch flow (in production) or short-circuit to a
-/// per-browser `false` result (under `NEON_TEST_DAEMON_PATCH_NOOP=1`).
+/// per-browser `false` result (under `SILVERVINE_TEST_DAEMON_PATCH_NOOP=1`).
 ///
 /// `name_filter` constrains which browser to patch; `force` toggles
 /// the `force_while_running` patch option.
@@ -650,6 +652,15 @@ pub fn drive_patch_flow(
     name_filter: Option<&str>,
     force: bool,
 ) -> Vec<(String, bool)> {
+    drive_patch_flow_with_cdm(browsers, name_filter, force, None)
+}
+
+fn drive_patch_flow_with_cdm(
+    browsers: &[Browser],
+    name_filter: Option<&str>,
+    force: bool,
+    fresh_cdm: Option<crate::widevine::CachedCdm>,
+) -> Vec<(String, bool)> {
     if daemon_patch_noop() {
         return browsers
             .iter()
@@ -667,10 +678,15 @@ pub fn drive_patch_flow(
     // Partition into browsers that need a real patch and those already
     // at the cached version. The latter get reported as success without
     // the patcher running.
-    let cached_version = crate::widevine::current_cdm()
-        .ok()
-        .flatten()
-        .map(|c| c.version().to_string());
+    let cached_version = fresh_cdm
+        .as_ref()
+        .map(|cdm| cdm.version().to_string())
+        .or_else(|| {
+            crate::widevine::current_cdm()
+                .ok()
+                .flatten()
+                .map(|cdm| cdm.version().to_string())
+        });
     let candidates: Vec<&Browser> = browsers
         .iter()
         .filter(|b| name_filter.is_none_or(|n| n == b.name()))
@@ -683,7 +699,10 @@ pub fn drive_patch_flow(
     if needs.is_empty() {
         return results;
     }
-    let cdm_resolver = || -> Result<crate::widevine::CachedCdm> {
+    let cdm_resolver = move || -> Result<crate::widevine::CachedCdm> {
+        if let Some(cdm) = fresh_cdm {
+            return Ok(cdm);
+        }
         let manifest = crate::widevine::fetch_manifest()?;
         crate::widevine::cache::ensure_cdm_for(&manifest)
     };
@@ -748,11 +767,25 @@ fn handle_update_widevine() {
     if daemon_patch_noop() {
         return;
     }
-    if let Ok(manifest) = crate::widevine::fetch_manifest() {
-        let _ = crate::widevine::cache::ensure_cdm_for(&manifest);
-    }
+    let update = crate::widevine::fetch_manifest()
+        .and_then(|manifest| crate::widevine::cache::ensure_cdm_for(&manifest));
+    let cdm = match update {
+        Ok(cdm) => cdm,
+        Err(error) => {
+            crate::hooks::emit_post_update(None, false);
+            tracing::warn!(
+                target: "silvervine::daemon",
+                error = %error,
+                "Widevine update failed"
+            );
+            notify_user::notify_failure(error.category, &error.message);
+            return;
+        }
+    };
+    let version = cdm.version().to_string();
     let detected = browsers::detect_browsers().unwrap_or_default();
-    let results = drive_patch_flow(&detected, None, false);
+    let results = drive_patch_flow_with_cdm(&detected, None, false, Some(cdm));
+    crate::hooks::emit_post_update(Some(&version), true);
     notify_user::notify_info(&format!(
         "Widevine refreshed; {}",
         summarize_patch_results(&results)
@@ -775,7 +808,7 @@ fn handle_toggle_launch_at_login(target: bool) {
         }),
         Err(e) => {
             tracing::warn!(
-                target: "neon::daemon",
+                target: "silvervine::daemon",
                 error = %e,
                 "lifecycle toggle failed"
             );
@@ -869,7 +902,7 @@ mod tests {
 
     /// Build a minimal `RunOptions` that uses the supplied tempdir for all
     /// paths and runs in single-iteration test mode. Caller MUST set the
-    /// `NEON_TEST_*_NOOP` env vars before invoking `run_with`.
+    /// `SILVERVINE_TEST_*_NOOP` env vars before invoking `run_with`.
     fn test_options(tmp: &TempDir, browsers: Vec<Browser>) -> RunOptions {
         RunOptions {
             test_mode: true,
@@ -1094,12 +1127,12 @@ mod tests {
         assert!(ts > 1_700_000_000);
     }
 
-    /// `default_heartbeat_path` ends in `neon/heartbeat`.
+    /// `default_heartbeat_path` ends in `silvervine/heartbeat`.
     #[test]
-    fn default_heartbeat_path_ends_with_neon_heartbeat() {
+    fn default_heartbeat_path_ends_with_silvervine_heartbeat() {
         if let Some(p) = default_heartbeat_path() {
             assert!(p.ends_with(HEARTBEAT_FILENAME), "{}", p.display());
-            assert!(p.parent().is_some_and(|d| d.ends_with("neon")));
+            assert!(p.parent().is_some_and(|d| d.ends_with("silvervine")));
         }
     }
 
@@ -1107,12 +1140,12 @@ mod tests {
     #[test]
     fn resolve_heartbeat_path_honors_override() {
         let opts = RunOptions {
-            heartbeat_path: Some(PathBuf::from("/tmp/neon-test/hb")),
+            heartbeat_path: Some(PathBuf::from("/tmp/silvervine-test/hb")),
             ..RunOptions::default()
         };
         assert_eq!(
             resolve_heartbeat_path(&opts),
-            PathBuf::from("/tmp/neon-test/hb")
+            PathBuf::from("/tmp/silvervine-test/hb")
         );
     }
 
@@ -1120,12 +1153,12 @@ mod tests {
     #[test]
     fn resolve_socket_path_honors_override() {
         let opts = RunOptions {
-            ipc_socket_path: Some(PathBuf::from("/tmp/neon-test/sock")),
+            ipc_socket_path: Some(PathBuf::from("/tmp/silvervine-test/sock")),
             ..RunOptions::default()
         };
         assert_eq!(
             resolve_socket_path(&opts),
-            PathBuf::from("/tmp/neon-test/sock")
+            PathBuf::from("/tmp/silvervine-test/sock")
         );
     }
 

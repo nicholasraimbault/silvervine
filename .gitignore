@@ -18,10 +18,8 @@
 .DS_Store
 Thumbs.db
 
-# V1 leftovers (keep paths excluded from new V2 builds)
+# Local build output from removed V1 tooling
 build/
-packaging/deb/neon-drm_*
-packaging/deb/neon-tray
 
 # Coverage reports
 cobertura.xml

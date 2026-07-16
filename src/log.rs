@@ -9,7 +9,7 @@
 //! * The `RUST_LOG` env var for an `EnvFilter` override (this is what
 //!   `tracing-subscriber` uses upstream; we delegate to it).
 //!
-//! The file appender writes to `~/.cache/neon/logs/neon.log` with daily
+//! The file appender writes to `~/.cache/silvervine/logs/silvervine.log` with daily
 //! rotation. The `tracing-appender` crate's `Rotation::DAILY` is the
 //! closest fit to "weekly with 5 MB cap"; we accept the daily rotation
 //! and rely on the cache cleanup pass in `daemon::run()` to enforce the
@@ -30,7 +30,7 @@
 //! ## What this module does NOT do
 //!
 //! * No JSON output — we emit human-readable text. JSON is a V2.1 add.
-//! * No log shipping. Neon doesn't transmit logs anywhere — bug reports
+//! * No log shipping. Silvervine doesn't transmit logs anywhere — bug reports
 //!   go through GitHub Issues, full stop.
 
 use std::path::PathBuf;
@@ -49,12 +49,12 @@ use crate::error::{Error, Result};
 /// installation.
 static GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
 
-/// Default log directory: `<cache_dir>/neon/logs/`.
+/// Default log directory: `<cache_dir>/silvervine/logs/`.
 ///
 /// Returns `None` if `dirs::cache_dir()` is unresolvable.
 #[must_use]
 pub fn log_dir() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("neon").join("logs"))
+    dirs::cache_dir().map(|d| d.join("silvervine").join("logs"))
 }
 
 /// Initialize the global tracing subscriber.
@@ -127,14 +127,14 @@ fn level_for(verbosity: u8, quiet: bool) -> LevelFilter {
     }
 }
 
-/// Build the rolling-file layer pointed at `<cache_dir>/neon/logs/neon.log`.
+/// Build the rolling-file layer pointed at `<cache_dir>/silvervine/logs/silvervine.log`.
 ///
 /// Returned as a boxed `Layer<Registry>` so it composes uniformly with
 /// the stderr layer in [`init`].
 fn setup_file_layer() -> Result<Box<dyn Layer<Registry> + Send + Sync>> {
-    let dir = log_dir().ok_or_else(|| Error::other("cannot resolve neon log dir"))?;
+    let dir = log_dir().ok_or_else(|| Error::other("cannot resolve silvervine log dir"))?;
     std::fs::create_dir_all(&dir).map_err(Error::from)?;
-    let file_appender = tracing_appender::rolling::daily(&dir, "neon.log");
+    let file_appender = tracing_appender::rolling::daily(&dir, "silvervine.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
     // Stash the guard in OnceLock so it isn't dropped on return.
     let _ = GUARD.set(guard);
@@ -166,9 +166,9 @@ mod tests {
     }
 
     #[test]
-    fn log_dir_ends_under_neon_logs() {
+    fn log_dir_ends_under_silvervine_logs() {
         if let Some(dir) = log_dir() {
-            assert!(dir.ends_with(std::path::Path::new("neon").join("logs")));
+            assert!(dir.ends_with(std::path::Path::new("silvervine").join("logs")));
         }
     }
 

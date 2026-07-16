@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use neon::widevine::{parse_manifest, Platform, PlatformEntry};
+use silvervine::widevine::{parse_manifest, Platform, PlatformEntry};
 
 fn fixture_bytes() -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

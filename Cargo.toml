@@ -1,23 +1,23 @@
 [package]
-name = "neon"
-version = "2.0.0-rc.2"
+name = "silvervine"
+version = "2.0.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Nicholas Raimbault <nraimbault16@gmail.com>"]
 license = "MIT"
 description = "Single-binary cross-platform DRM (Widevine) helper for Chromium-family browsers"
-repository = "https://github.com/nicholasraimbault/neon"
-homepage = "https://github.com/nicholasraimbault/neon"
+repository = "https://github.com/nicholasraimbault/silvervine"
+homepage = "https://github.com/nicholasraimbault/silvervine"
 readme = "README.md"
 keywords = ["drm", "widevine", "chromium", "helium", "thorium"]
-categories = ["command-line-utilities"]
+categories = ["command-line-utilities", "multimedia"]
 
 [lib]
-name = "neon"
+name = "silvervine"
 path = "src/lib.rs"
 
 [[bin]]
-name = "neon"
+name = "silvervine"
 path = "src/main.rs"
 
 [dependencies]
@@ -81,28 +81,31 @@ notify = "8"
 #     don't use.
 # Linux-only ksni declaration is in `[target.'cfg(target_os = "linux")'`.
 # macOS-only tray-icon declaration is in `[target.'cfg(target_os = "macos")'`.
-# Interactive prompts for `neon init`. The default features are fine for
+# Interactive prompts for `silvervine init`. The default features are fine for
 # our use; the crate gracefully falls back to non-interactive mode when
 # stdin isn't a TTY (we explicit-check `is_terminal()` at the call sites
 # anyway so we can switch to defaults without prompting).
 dialoguer = { version = "0.12", default-features = false }
-# Cross-platform terminal control for `neon status --watch`. We use only
+# Cross-platform terminal control for `silvervine status --watch`. We use only
 # the cursor + clear primitives; no async event polling needed.
 crossterm = { version = "0.29", default-features = false }
-# Shell completion script generation for `neon completion <shell>`.
+# Shell completion script generation for `silvervine completion <shell>`.
 clap_complete = "4.6"
-# Man-page generation for `neon manpage`.
+# Man-page generation for `silvervine manpage`.
 clap_mangen = "0.3"
-# URL-encoding for the `neon doctor --share` issue-template URL builder.
+# URL-encoding for the `silvervine doctor --share` issue-template URL builder.
 urlencoding = "2"
 # Tracing subscriber's rolling-file appender — used by `crate::log` to
-# rotate the daemon's `~/.cache/neon/logs/neon.log`.
+# rotate the daemon's `~/.cache/silvervine/logs/silvervine.log`.
 tracing-appender = "0.2"
-# PNG decoder for the embedded tray icon. Used only by the Linux ksni
-# tray backend to convert `linux-app/neon.png` into the ARGB32 pixel
-# buffer ksni::Icon expects. ~70KB compile cost; smaller and more
-# focused than the full `image` crate, which we don't otherwise need.
+# PNG decoder for the embedded tray icon. The RGBA decode is shared by the
+# Linux ksni ARGB32 conversion and the macOS tray-icon backend. ~70KB compile
+# cost; smaller and more focused than the full `image` crate.
 png = "0.18"
+# Collision-resistant, exclusively-created snapshot directories. This is a
+# runtime dependency because privileged patch rollback must never reuse an
+# attacker-planted path.
+tempfile = "3"
 
 # macOS-specific deps: ObjC FFI for NSWorkspace wake notifications.
 # `block2` is required because NSNotificationCenter takes a block-typed
@@ -140,9 +143,7 @@ objc2-app-kit = { version = "0.2", features = ["NSWorkspace"] }
 block2 = "~0.5"
 # NSStatusItem-backed tray for macOS via Tauri's tray-icon crate.
 # Default features pull libxdo for keyboard accelerators we don't use,
-# so opt out. The ksni migration in commit 735dcfe moved this dep here
-# from the cross-platform [dependencies] block; the move was documented
-# but the line itself was dropped, which broke macOS builds.
+# so opt out. This remains macOS-only; Linux uses ksni.
 tray-icon = { version = "0.24", default-features = false }
 
 # Linux-specific deps:
@@ -156,8 +157,6 @@ tray-icon = { version = "0.24", default-features = false }
 zbus = { version = "5" }
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 [dev-dependencies]
-# Sandboxed temporary directories for filesystem-shaped tests.
-tempfile = "3"
 
 [profile.release]
 opt-level = 3
@@ -184,22 +183,11 @@ ci = "github"
 #  - shell: the universal `curl … | sh` installer; works on Linux + macOS
 #           when the user doesn't have a native package manager preference.
 #
-# TODO(macos-validation): once the V2 binary is smoke-tested end-to-end on
-# a real Mac, flip this to `["shell", "homebrew"]` and uncomment `tap` +
-# `publish-jobs` below. cargo-dist will then auto-publish a Formula to
-# the homebrew-neon tap on every release tag. Until then, Mac users
-# continue to get V1 via the existing `brew install` (the tap repo
-# still points at v1.0.0 bash scripts) — known-good rather than
-# unvalidated-V2.
+# cargo-dist automates GitHub Release artifacts and the shell installer. It
+# does not publish to crates.io; the first crates.io publish is an explicit,
+# separately validated release step. The obsolete V1 Homebrew tap remains
+# retired rather than being reused for the renamed product.
 installers = ["shell"]
-# Homebrew tap that will receive the auto-generated Formula once the
-# `homebrew` installer above is re-enabled.
-# tap = "nicholasraimbault/homebrew-neon"
-# Activate the Homebrew publish job. Needs a `HOMEBREW_TAP_TOKEN` repo
-# secret (a fine-grained PAT scoped to homebrew-neon with
-# `contents:write` + `pull-requests:write`) for cargo-dist to push the
-# Formula commit.
-# publish-jobs = ["homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-musl"]
 # Path that installers should place binaries in

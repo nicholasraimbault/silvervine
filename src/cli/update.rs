@@ -1,12 +1,12 @@
-//! `neon update widevine` — update or roll back the Widevine CDM.
+//! `silvervine update widevine` — update or roll back the Widevine CDM.
 //!
 //! ## Subcommand surface
 //!
 //! ```text
-//! neon update widevine [--rollback] [--cdm-source=<url>]
+//! silvervine update widevine [--rollback] [--cdm-source=<url>]
 //! ```
 //!
-//! ### `neon update widevine`
+//! ### `silvervine update widevine`
 //!
 //! 1. Fetch the manifest (custom URL chain if `--cdm-source` is set).
 //! 2. `widevine::cache::ensure_cdm_for(manifest)`.
@@ -22,7 +22,7 @@ use crate::error::{Error, Result};
 use crate::patch::{self, PatchOptions};
 use crate::widevine;
 
-/// Args for `neon update widevine`.
+/// Args for `silvervine update widevine`.
 #[derive(Debug, Clone, Default)]
 pub struct WidevineArgs {
     /// `--rollback`: revert to the previous cached version.
@@ -33,7 +33,7 @@ pub struct WidevineArgs {
     pub output: OutputOptions,
 }
 
-/// Outcome record for `neon update widevine`.
+/// Outcome record for `silvervine update widevine`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WidevineUpdateOutcome {
     /// CDM version now active.
@@ -44,7 +44,7 @@ pub struct WidevineUpdateOutcome {
     pub patch_reports: Vec<crate::cli::patch::PatchReport>,
 }
 
-/// Run the `neon update widevine` flow.
+/// Run the `silvervine update widevine` flow.
 ///
 /// `cdm_source` is `None` for the default Mozilla chain, or `Some(url)`
 /// for a single-URL override (as used with `--cdm-source`).
@@ -55,36 +55,58 @@ pub struct WidevineUpdateOutcome {
 pub fn run_widevine(args: &WidevineArgs) -> Result<()> {
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    let outcome = if args.rollback {
-        let cdm = widevine::cache::rollback()?;
-        writeln!(handle, "Rolled back to {}", cdm.version()).map_err(Error::from)?;
-        WidevineUpdateOutcome {
-            current_version: cdm.version().to_string(),
-            downloaded: false,
-            patch_reports: Vec::new(),
+    let mut operation = || -> Result<WidevineUpdateOutcome> {
+        if args.rollback {
+            let cdm = widevine::cache::rollback()?;
+            if !args.output.json {
+                writeln!(handle, "Rolled back to {}", cdm.version()).map_err(Error::from)?;
+            }
+            Ok(WidevineUpdateOutcome {
+                current_version: cdm.version().to_string(),
+                downloaded: false,
+                patch_reports: Vec::new(),
+            })
+        } else {
+            run_widevine_install(args, &mut handle)
         }
-    } else {
-        run_widevine_install(args, &mut handle)?
+    };
+    let outcome = match operation() {
+        Ok(outcome) => {
+            crate::hooks::emit_post_update(Some(&outcome.current_version), true);
+            outcome
+        }
+        Err(error) => {
+            crate::hooks::emit_post_update(None, false);
+            return Err(error);
+        }
     };
     if args.output.json {
-        let body = serde_json::json!({
-            "current_version": outcome.current_version,
-            "downloaded": outcome.downloaded,
-            "patch_reports": outcome.patch_reports,
-        });
-        writeln!(handle, "{}", serde_json::to_string_pretty(&body)?).map_err(Error::from)?;
+        render_json(&outcome, &mut handle)?;
     }
     Ok(())
 }
 
+fn render_json(outcome: &WidevineUpdateOutcome, out: &mut dyn Write) -> Result<()> {
+    let body = serde_json::json!({
+        "current_version": outcome.current_version,
+        "downloaded": outcome.downloaded,
+        "patch_reports": outcome.patch_reports,
+    });
+    writeln!(out, "{}", serde_json::to_string_pretty(&body)?).map_err(Error::from)
+}
+
 fn run_widevine_install(args: &WidevineArgs, out: &mut dyn Write) -> Result<WidevineUpdateOutcome> {
-    writeln!(out, "Fetching Widevine manifest…").map_err(Error::from)?;
+    if !args.output.json {
+        writeln!(out, "Fetching Widevine manifest…").map_err(Error::from)?;
+    }
     let manifest = match &args.cdm_source {
         Some(url) => fetch_from_custom(url)?,
         None => widevine::fetch_manifest()?,
     };
     let cdm = widevine::cache::ensure_cdm_for(&manifest)?;
-    writeln!(out, "Cached CDM version: {}", cdm.version()).map_err(Error::from)?;
+    if !args.output.json {
+        writeln!(out, "Cached CDM version: {}", cdm.version()).map_err(Error::from)?;
+    }
 
     // Re-patch every detected browser at the new version.
     let detected = crate::browsers::detect_browsers().unwrap_or_default();
@@ -101,11 +123,13 @@ fn run_widevine_install(args: &WidevineArgs, out: &mut dyn Write) -> Result<Wide
         patcher.as_ref(),
         &opts,
     );
-    for r in &reports {
-        if r.success {
-            writeln!(out, "Re-patched {}: ok", r.browser).map_err(Error::from)?;
-        } else if let Some(e) = &r.error {
-            writeln!(out, "Re-patch {} FAILED: {e}", r.browser).map_err(Error::from)?;
+    if !args.output.json {
+        for r in &reports {
+            if r.success {
+                writeln!(out, "Re-patched {}: ok", r.browser).map_err(Error::from)?;
+            } else if let Some(e) = &r.error {
+                writeln!(out, "Re-patch {} FAILED: {e}", r.browser).map_err(Error::from)?;
+            }
         }
     }
     Ok(WidevineUpdateOutcome {
@@ -144,17 +168,17 @@ mod tests {
     }
 
     #[test]
-    fn widevine_update_outcome_serializes_via_json_value() {
-        // The runtime serializes via serde_json::json!, exercise the
-        // structure with a unit test on the field shape.
+    fn install_or_cache_hit_json_is_one_parseable_document() {
         let outcome = WidevineUpdateOutcome {
             current_version: "1.0".into(),
             downloaded: true,
             patch_reports: vec![],
         };
-        assert_eq!(outcome.current_version, "1.0");
-        assert!(outcome.downloaded);
-        assert!(outcome.patch_reports.is_empty());
+        let mut output = Vec::new();
+        render_json(&outcome, &mut output).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["current_version"], "1.0");
+        assert_eq!(parsed["downloaded"], true);
     }
 
     /// `run_widevine` with `--rollback` against an empty cache surfaces
@@ -163,7 +187,7 @@ mod tests {
     /// install.
     #[test]
     fn run_widevine_rollback_with_no_previous_errors() {
-        // The default cache root is the user's real ~/.cache/neon —
+        // The default cache root is the user's real ~/.cache/silvervine —
         // we can't safely call run_widevine() in a test without
         // disturbing that. Instead, exercise the underlying API
         // (rollback() with no previous link) which we expect to fail.

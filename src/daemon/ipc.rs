@@ -9,7 +9,7 @@
 //!
 //! ## Socket location and permissions
 //!
-//! Socket lives at `<cache_dir>/neon/daemon.sock`. After binding we
+//! Socket lives at `<cache_dir>/silvervine/daemon.sock`. After binding we
 //! `chmod 0600` so only the owning user can connect — the daemon never
 //! talks to other users, and anyone with write access to the socket can
 //! invoke privileged-elevation flows on the daemon's behalf.
@@ -63,14 +63,14 @@ use crate::error::{Error, ErrorCategory, Result};
 /// hundred bytes in V1.
 pub const MAX_MESSAGE_SIZE: usize = 1 << 20; // 1 MiB
 
-/// Default socket path: `<cache_dir>/neon/daemon.sock`.
+/// Default socket path: `<cache_dir>/silvervine/daemon.sock`.
 ///
 /// Returns `None` when `dirs::cache_dir()` is unresolvable (e.g. no
 /// `$HOME` / `$XDG_CACHE_HOME`); callers in that case should treat IPC as
 /// unavailable.
 #[must_use]
 pub fn default_socket_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("neon").join("daemon.sock"))
+    dirs::cache_dir().map(|d| d.join("silvervine").join("daemon.sock"))
 }
 
 /// Request methods sent by CLI clients.
@@ -297,7 +297,7 @@ where
     let handler = Arc::new(handler);
 
     let accept_thread = std::thread::Builder::new()
-        .name("neon-ipc".to_string())
+        .name("silvervine-ipc".to_string())
         .spawn(move || run_accept_loop(&listener, &stop_for_thread, handler))
         .map_err(|e| Error::other(format!("cannot spawn IPC accept thread: {e}")))?;
 
@@ -325,7 +325,7 @@ where
 {
     loop {
         if stop.load(Ordering::SeqCst) {
-            tracing::debug!(target: "neon::ipc", "accept loop received stop signal");
+            tracing::debug!(target: "silvervine::ipc", "accept loop received stop signal");
             return;
         }
         match listener.accept() {
@@ -333,7 +333,7 @@ where
                 let h = Arc::clone(&handler);
                 if let Err(e) = handle_one(stream, h.as_ref()) {
                     tracing::warn!(
-                        target: "neon::ipc",
+                        target: "silvervine::ipc",
                         error = %e,
                         "IPC connection error"
                     );
@@ -343,7 +343,7 @@ where
                 std::thread::sleep(Duration::from_millis(200));
             }
             Err(e) => {
-                tracing::warn!(target: "neon::ipc", error = %e, "accept failed");
+                tracing::warn!(target: "silvervine::ipc", error = %e, "accept failed");
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
@@ -778,11 +778,11 @@ mod tests {
         assert!(!path.exists());
     }
 
-    /// `default_socket_path` ends in `daemon.sock` under `neon/`.
+    /// `default_socket_path` ends in `daemon.sock` under `silvervine/`.
     #[test]
-    fn default_socket_path_ends_with_neon_daemon_sock() {
+    fn default_socket_path_ends_with_silvervine_daemon_sock() {
         if let Some(p) = default_socket_path() {
-            let suffix = std::path::Path::new("neon").join("daemon.sock");
+            let suffix = std::path::Path::new("silvervine").join("daemon.sock");
             assert!(p.ends_with(&suffix), "{}", p.display());
         }
     }
