@@ -355,6 +355,14 @@ fn handle_one<F>(mut stream: UnixStream, handler: &F) -> Result<()>
 where
     F: Fn(IpcRequest) -> IpcResponse + Send + Sync + 'static,
 {
+    // BSD/macOS accepted sockets inherit O_NONBLOCK from the listener, while
+    // Linux accepted sockets generally do not. The protocol handler uses
+    // blocking `read_exact`/`write_all`, so establish the same semantics on
+    // every supported platform before applying bounded I/O timeouts.
+    stream
+        .set_nonblocking(false)
+        .map_err(|e| Error::other(format!("set accepted stream blocking: {e}")).with_source(e))?;
+
     // Each connection processes a single request → response round trip.
     // (Ergonomic for the CLI; the daemon doesn't need long-lived sessions.)
     stream
@@ -628,6 +636,52 @@ mod tests {
             other => panic!("{other:?}"),
         }
         drop(server);
+    }
+
+    /// A nonblocking accepted connection may sit idle briefly before sending
+    /// its request. This models the macOS/BSD behavior where accepted sockets
+    /// inherit the listener's nonblocking flag.
+    #[test]
+    fn accepted_stream_waits_for_delayed_request() {
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        server.set_nonblocking(true).expect("set nonblocking");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+
+        let server_thread =
+            std::thread::spawn(move || handle_one(server, &|_| IpcResponse::ok(IpcResult::Ack)));
+        // Ensure `handle_one` attempts its read before the request arrives. It
+        // must restore blocking mode rather than fail immediately with
+        // WouldBlock.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let body = serde_json::to_vec(&IpcRequest::Status).expect("serialize request");
+        let len = u32::try_from(body.len()).expect("request length fits");
+        client.write_all(&len.to_be_bytes()).expect("write length");
+        client.write_all(&body).expect("write body");
+
+        let mut len_buf = [0u8; 4];
+        client
+            .read_exact(&mut len_buf)
+            .expect("read response length");
+        let response_len = u32::from_be_bytes(len_buf) as usize;
+        let mut response_body = vec![0u8; response_len];
+        client
+            .read_exact(&mut response_body)
+            .expect("read response body");
+        let response: IpcResponse =
+            serde_json::from_slice(&response_body).expect("decode response");
+        assert!(matches!(
+            response,
+            IpcResponse::Ok {
+                result: IpcResult::Ack
+            }
+        ));
+        server_thread
+            .join()
+            .expect("server thread")
+            .expect("handle request");
     }
 
     /// Handler that returns an error → wire-format `Err` response.

@@ -1,13 +1,13 @@
 //! User-defined hook script runner.
 //!
 //! After certain daemon events (a successful patch, a CDM update, etc.) the
-//! daemon shells out to user-supplied scripts in `~/.config/neon/hooks/`,
+//! daemon shells out to user-supplied scripts in the platform config directory,
 //! passing context as environment variables. The contract with the user is:
 //!
-//! * Hook scripts live at the path configured via `[hooks]` in
-//!   `~/.config/neon/config.toml`, defaulting to
-//!   `~/.config/neon/hooks/post-patch` and `~/.config/neon/hooks/post-update`
-//!   when no explicit path is set.
+//! * Hook scripts live at the path configured via `[hooks]` in the Neon config,
+//!   defaulting to `~/.config/neon/hooks/` on Linux and
+//!   `~/Library/Application Support/neon/hooks/` on macOS when no explicit
+//!   path is set.
 //! * Scripts must be **executable files** (`chmod +x`). Non-executable or
 //!   missing files are not an error — they're [`HookOutcome::NotConfigured`]
 //!   so a user who never wired up hooks doesn't get spurious daemon errors.
@@ -27,8 +27,8 @@
 //!
 //! ## What this module does NOT do
 //!
-//! * No hook discovery — callers (daemon team's `mod.rs`) decide which
-//!   `~/.config/neon/hooks/<name>` to invoke.
+//! * No hook discovery — callers (daemon team's `mod.rs`) decide which named
+//!   hook under the platform config directory to invoke.
 //! * No `tracing` subscriber configuration — the daemon installs one in
 //!   `daemon::run()`. The hook runner uses `tracing::warn!`/`info!` calls
 //!   that are no-ops without a subscriber installed.
@@ -41,10 +41,9 @@
 //! pub fn run_hook_at(path: &Path, env: &HashMap<String, String>) -> Result<HookOutcome>;
 //! ```
 //!
-//! The first form resolves `name` against `~/.config/neon/hooks/<name>`
-//! (honoring the `[hooks]` config block); the second form takes an explicit
-//! path and is used by tests + by the rare caller that already knows the
-//! path.
+//! The first form resolves `name` against the platform config directory's
+//! `neon/hooks/<name>` path (honoring the `[hooks]` config block); the second
+//! form takes an explicit path.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -93,10 +92,11 @@ impl HookOutcome {
 ///
 /// The hook path is resolved against the user's config:
 ///
-/// 1. If `[hooks]` in `~/.config/neon/config.toml` sets `post_patch =`
-///    or `post_update =` for the named event, that path is used (with
-///    `~` expansion).
-/// 2. Otherwise the default path `~/.config/neon/hooks/<name>` is tried.
+/// 1. If `[hooks]` in the Neon config sets `post_patch =` or
+///    `post_update =` for the named event, that path is used (with `~`
+///    expansion).
+/// 2. Otherwise `neon/hooks/<name>` under the platform config directory is
+///    tried.
 /// 3. If neither resolves to an executable file, returns
 ///    [`HookOutcome::NotConfigured`] without an error.
 ///
@@ -203,7 +203,7 @@ fn resolve_hook_path(name: &str, config: &Config) -> Option<PathBuf> {
     if let Some(p) = configured {
         return Some(p);
     }
-    // 2. Default: ~/.config/neon/hooks/<name>
+    // 2. Default: <platform-config-dir>/neon/hooks/<name>
     let cfg = dirs::config_dir()?;
     Some(cfg.join("neon").join("hooks").join(name))
 }
@@ -428,18 +428,12 @@ exit 0
 
         let config = Config::default();
         let path = resolve_hook_path("post-patch", &config).expect("default path resolves");
-        // The path must live inside our redirected env tree and end in
-        // `neon/hooks/post-patch`.
-        assert!(path.starts_with(tmp.path()), "{}", path.display());
-        assert!(
-            path.ends_with(
-                std::path::Path::new("neon")
-                    .join("hooks")
-                    .join("post-patch")
-            ),
-            "{}",
-            path.display()
-        );
+        let expected = dirs::config_dir()
+            .expect("config dir")
+            .join("neon")
+            .join("hooks")
+            .join("post-patch");
+        assert_eq!(path, expected);
     }
 
     /// `run_hook(name, env)` returns `NotConfigured` when no script exists
@@ -464,7 +458,11 @@ exit 0
         let _xdg = ScopedEnv::set("XDG_CONFIG_HOME", tmp.path());
         let _home = ScopedEnv::set("HOME", tmp.path());
 
-        let hook_path = tmp.path().join("neon").join("hooks").join("post-patch");
+        let hook_path = dirs::config_dir()
+            .expect("config dir")
+            .join("neon")
+            .join("hooks")
+            .join("post-patch");
         write_executable_script(&hook_path, "#!/bin/sh\necho yo\nexit 0\n");
 
         let outcome = run_hook("post-patch", &HashMap::new()).unwrap();

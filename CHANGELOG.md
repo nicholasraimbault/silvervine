@@ -10,6 +10,13 @@ Once V1.0 ships, future entries will be auto-generated from
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed macOS daemon IPC connections closing before clients could send their
+  request when accepted sockets inherited nonblocking mode.
+- Fixed macOS file-watcher events failing to match browser paths reported
+  through canonical aliases such as `/private/var` versus `/var`.
+
 ### Removed
 
 - Removed the unsupported experimental VM/GPU bridge, including the

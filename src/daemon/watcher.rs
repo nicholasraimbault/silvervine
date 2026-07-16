@@ -46,11 +46,9 @@
 //!
 //! ## Test mode
 //!
-//! Tests create a `tempfile::TempDir`, register a synthesized "browser"
-//! that points at the temp path, and `touch` files inside it. The
-//! callback fires after the debounce window. Tests pass an explicit
-//! `is_running` predicate (via [`Watcher::with_running_predicate`]) so
-//! they don't accidentally observe real running processes.
+//! Tests use synthesized browser paths and drive the debounce state machine
+//! directly, avoiding timing assumptions from platform watcher backends. They
+//! pass explicit running predicates so no real processes are inspected.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -541,13 +539,21 @@ fn mtime_of(path: &Path) -> Option<SystemTime> {
 
 /// Search `browsers` for the entry whose install path is a prefix of
 /// `event_path`. Returns `(install_path, &Browser)` of the matching entry.
+///
+/// macOS FSEvents reports canonical paths (for example, `/private/var/...`)
+/// even when the registered path used an alias (`/var/...`). Compare both the
+/// configured path and its canonical form so those events still resolve to
+/// the browser that owns them. The original key remains unchanged so unwatch
+/// and deletion handling keep working when the target later disappears.
 fn find_owning_browser<'a>(
     browsers: &'a HashMap<PathBuf, Browser>,
     event_path: &Path,
 ) -> Option<(&'a PathBuf, &'a Browser)> {
-    browsers
-        .iter()
-        .find(|(install, _)| event_path.starts_with(install))
+    browsers.iter().find(|(install, _)| {
+        event_path.starts_with(install)
+            || std::fs::canonicalize(install)
+                .is_ok_and(|canonical| event_path.starts_with(canonical))
+    })
 }
 
 /// Default running predicate: delegates to
@@ -575,55 +581,61 @@ mod tests {
         }
     }
 
-    /// Wait up to `timeout` for the predicate to become true.
-    fn wait_until<F: Fn() -> bool>(timeout: Duration, predicate: F) -> bool {
-        let start = Instant::now();
-        while start.elapsed() < timeout {
-            if predicate() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        predicate()
+    /// Build isolated watcher state for direct debounce tests.
+    fn state_with(browser: Browser) -> Arc<Mutex<WatcherState>> {
+        let install = browser.install_path().to_path_buf();
+        let mut state = WatcherState::default();
+        state.browsers.insert(install, browser);
+        Arc::new(Mutex::new(state))
     }
 
-    /// Touching a file inside the watched dir fires the callback after the
-    /// debounce window.
+    /// Force all armed debounce timers to be eligible for the next tick.
+    fn expire_debounce(inner: &Arc<Mutex<WatcherState>>) {
+        for deadline in inner.lock().unwrap().next_dispatch_at.values_mut() {
+            *deadline = Instant::now();
+        }
+    }
+
+    /// An event inside a watched directory fires only after its debounce
+    /// deadline expires.
     #[test]
     fn touch_fires_callback_after_debounce() {
         let tmp = TempDir::new().unwrap();
         let install = tmp.path().join("install");
         fs::create_dir_all(&install).unwrap();
         let browser = fake_browser("Test", install.clone());
+        let inner = state_with(browser);
 
         let count = Arc::new(AtomicUsize::new(0));
         let count_for_cb = Arc::clone(&count);
         let cb: WatcherCallback = Arc::new(move |_b: &Browser| {
             count_for_cb.fetch_add(1, Ordering::SeqCst);
         });
-        // Tight debounce + always-not-running predicate.
         let not_running: RunningPredicate = Arc::new(|_| false);
-        let mut watcher =
-            Watcher::with_options(cb, not_running, Duration::from_millis(100)).unwrap();
-        watcher.watch(browser).unwrap();
 
-        // Trigger an event.
-        fs::write(install.join("touch"), b"x").unwrap();
+        handle_fs_event(
+            &install.join("touch"),
+            &inner,
+            &cb,
+            &not_running,
+            Duration::from_millis(100),
+        );
+        handle_tick(&inner, &cb, &not_running);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
 
-        // Wait long enough for the debounce window to elapse + dispatch.
-        let fired = wait_until(Duration::from_secs(2), || count.load(Ordering::SeqCst) >= 1);
-        assert!(fired, "callback should have fired");
-        watcher.close();
+        expire_debounce(&inner);
+        handle_tick(&inner, &cb, &not_running);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
-    /// Multiple writes within the debounce window only fire the callback
-    /// once.
+    /// Multiple events within the debounce window produce one callback.
     #[test]
     fn debounce_collapses_burst() {
         let tmp = TempDir::new().unwrap();
         let install = tmp.path().join("install");
         fs::create_dir_all(&install).unwrap();
         let browser = fake_browser("Test", install.clone());
+        let inner = state_with(browser);
 
         let count = Arc::new(AtomicUsize::new(0));
         let count_for_cb = Arc::clone(&count);
@@ -631,42 +643,33 @@ mod tests {
             count_for_cb.fetch_add(1, Ordering::SeqCst);
         });
         let not_running: RunningPredicate = Arc::new(|_| false);
-        // Use a longer debounce so a real burst stays inside the window.
-        let mut watcher =
-            Watcher::with_options(cb, not_running, Duration::from_millis(200)).unwrap();
-        watcher.watch(browser).unwrap();
 
-        // Burst of 10 events in ~50ms — well within the 200ms window.
         for i in 0..10 {
-            fs::write(install.join(format!("touch_{i}")), b"x").unwrap();
-            std::thread::sleep(Duration::from_millis(5));
+            handle_fs_event(
+                &install.join(format!("touch_{i}")),
+                &inner,
+                &cb,
+                &not_running,
+                Duration::from_millis(200),
+            );
         }
+        assert_eq!(inner.lock().unwrap().next_dispatch_at.len(), 1);
 
-        // Trailing-edge debounce: the callback fires only after the path
-        // has been quiet for the full window. Wait past debounce + the
-        // 500ms tick interval so the dispatch had a chance to run.
-        std::thread::sleep(Duration::from_millis(900));
-        let n = count.load(Ordering::SeqCst);
-        assert!(
-            n <= 2,
-            "trailing-edge debounce should collapse the burst; got {n}"
-        );
-        watcher.close();
+        expire_debounce(&inner);
+        handle_tick(&inner, &cb, &not_running);
+        handle_tick(&inner, &cb, &not_running);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
-    /// Trailing-edge debounce contract: a burst of events must NOT fire
-    /// the callback during the burst itself. The leading-edge variant
-    /// (which we replaced) fired immediately on the first event and then
-    /// suppressed — meaning a 30-event browser-update storm patched on
-    /// top of an in-flight write. With trailing edge, the callback only
-    /// runs after the quiet period that follows the burst, so the patch
-    /// sees the post-update bundle.
+    /// Trailing-edge debounce never fires during a burst; it fires once after
+    /// the final event's quiet window expires.
     #[test]
     fn burst_does_not_fire_during_window() {
         let tmp = TempDir::new().unwrap();
         let install = tmp.path().join("install");
         fs::create_dir_all(&install).unwrap();
         let browser = fake_browser("Test", install.clone());
+        let inner = state_with(browser);
 
         let count = Arc::new(AtomicUsize::new(0));
         let count_for_cb = Arc::clone(&count);
@@ -674,29 +677,22 @@ mod tests {
             count_for_cb.fetch_add(1, Ordering::SeqCst);
         });
         let not_running: RunningPredicate = Arc::new(|_| false);
-        let mut watcher =
-            Watcher::with_options(cb, not_running, Duration::from_millis(500)).unwrap();
-        watcher.watch(browser).unwrap();
 
-        // Continuous events well shorter than the debounce window — every
-        // event resets the timer, so the callback must not fire while the
-        // burst is in flight.
         for i in 0..6 {
-            fs::write(install.join(format!("touch_{i}")), b"x").unwrap();
-            std::thread::sleep(Duration::from_millis(100));
+            handle_fs_event(
+                &install.join(format!("touch_{i}")),
+                &inner,
+                &cb,
+                &not_running,
+                Duration::from_millis(500),
+            );
+            handle_tick(&inner, &cb, &not_running);
+            assert_eq!(count.load(Ordering::SeqCst), 0);
         }
-        // Right after the burst (no quiet period yet), count must still
-        // be 0 — that's the trailing-edge guarantee.
-        let mid_burst = count.load(Ordering::SeqCst);
-        assert_eq!(
-            mid_burst, 0,
-            "trailing-edge debounce must not fire during the burst; got {mid_burst}"
-        );
 
-        // Now let the quiet period elapse so the callback eventually fires.
-        let fired = wait_until(Duration::from_secs(2), || count.load(Ordering::SeqCst) >= 1);
-        assert!(fired, "callback must fire after the burst quiets");
-        watcher.close();
+        expire_debounce(&inner);
+        handle_tick(&inner, &cb, &not_running);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     /// When the running predicate returns true, we don't fire — we defer.
@@ -791,6 +787,30 @@ mod tests {
         let resolved =
             find_owning_browser(&map, Path::new("/opt/helium-browser-bin/chrome/VERSION")).unwrap();
         assert_eq!(resolved.1.name(), "Helium");
+    }
+
+    /// `find_owning_browser` also matches events reported through the
+    /// canonical form of a configured path alias.
+    #[cfg(unix)]
+    #[test]
+    fn find_owning_browser_matches_canonical_path_alias() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real-install");
+        let alias = tmp.path().join("install-alias");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let browser = fake_browser("Alias", alias.clone());
+        let mut map = HashMap::new();
+        map.insert(alias.clone(), browser);
+        let event = fs::canonicalize(&real)
+            .unwrap()
+            .join("chrome")
+            .join("VERSION");
+
+        let (root, owner) = find_owning_browser(&map, &event).expect("canonical alias matches");
+        assert_eq!(root, &alias);
+        assert_eq!(owner.name(), "Alias");
     }
 
     /// `find_owning_browser` returns `None` when no install root prefixes

@@ -48,13 +48,6 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # macOS test job is advisory because daemon and IPC tests are tightly
-    # coupled to Linux environment semantics (XDG_CONFIG_HOME, /proc paths,
-    # etc.). Project is Linux-primary;
-    # macOS support is best-effort and welcomes contributors. The build
-    # and clippy macOS jobs stay strict so we don't ship code that
-    # can't compile on macOS.
-    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     strategy:
       fail-fast: false
       matrix:
