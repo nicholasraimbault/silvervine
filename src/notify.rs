@@ -240,7 +240,7 @@ mod tests {
         let out = truncate_body(&s);
         // The output is well-formed UTF-8 (would panic at the assertion
         // below if we'd sliced into a codepoint).
-        assert!(out.chars().count() == BODY_MAX_LEN);
+        assert_eq!(out.chars().count(), BODY_MAX_LEN);
     }
 
     /// `NEON_TEST_NOTIFY_NOOP=1` short-circuits dispatch — the function
