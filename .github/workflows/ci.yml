@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [master, v2-rust-rewrite]
+    branches: [master, v2-rust-rewrite, experimental-bridge]
   pull_request:
-    branches: [master, v2-rust-rewrite]
+    branches: [master, v2-rust-rewrite, experimental-bridge]
 
 # Cancel previous in-flight runs on the same ref to save CI minutes.
 concurrency:

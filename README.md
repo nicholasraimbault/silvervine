@@ -1,3 +1,6 @@
+> [!WARNING]
+> **Unsupported experimental branch:** `experimental-bridge` contains the VM/GPU/TPM/Looking Glass bridge, is excluded from normal releases and crates.io, and intentionally retains the legacy Neon identity. Contributor PRs targeting `experimental-bridge` are welcome.
+
 # Neon
 
 **Single-binary cross-platform DRM (Widevine) helper for Chromium-family browsers on macOS and Linux.**
