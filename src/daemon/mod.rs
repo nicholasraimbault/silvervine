@@ -672,18 +672,11 @@ fn drive_patch_flow_with_cdm(
             .map(|b| (b.name().to_string(), false))
             .collect();
     };
-    // Partition into browsers that need a real patch and those already
-    // at the cached version. The latter get reported as success without
-    // the patcher running.
-    let cached_version = fresh_cdm
-        .as_ref()
-        .map(|cdm| cdm.version().to_string())
-        .or_else(|| {
-            crate::widevine::current_cdm()
-                .ok()
-                .flatten()
-                .map(|cdm| cdm.version().to_string())
-        });
+    // Retain the selected CDM so repair does not fetch a manifest when the
+    // verified current cache is already usable.
+    let cached_cdm =
+        fresh_cdm.or_else(|| crate::widevine::cache::validated_current().ok().flatten());
+    let cached_version = cached_cdm.as_ref().map(|cdm| cdm.version().to_string());
     let candidates: Vec<&Browser> = browsers
         .iter()
         .filter(|b| name_filter.is_none_or(|n| n == b.name()))
@@ -696,8 +689,8 @@ fn drive_patch_flow_with_cdm(
     if needs.is_empty() {
         return results;
     }
-    let cdm_resolver = move || -> Result<crate::widevine::CachedCdm> {
-        if let Some(cdm) = fresh_cdm {
+    let cdm_resolver = move || {
+        if let Some(cdm) = cached_cdm {
             return Ok(cdm);
         }
         let manifest = crate::widevine::fetch_manifest()?;

@@ -77,13 +77,7 @@ pub fn build_diagnostics(
     };
     let browsers_snapshot = detected
         .iter()
-        .map(|b| crate::cli::status::BrowserStatus {
-            name: b.name().to_string(),
-            install_path: b.install_path().display().to_string(),
-            patched: b.is_patched(),
-            cdm_version: b.installed_cdm_version(),
-            last_patched_at: None,
-        })
+        .map(crate::cli::status::BrowserStatus::from_browser)
         .collect();
     Diagnostics {
         silvervine_version: env!("CARGO_PKG_VERSION").to_string(),

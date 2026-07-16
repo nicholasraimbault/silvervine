@@ -8,11 +8,10 @@
 //!    * macOS: scan `/Applications/*.app` for Chromium-framework bundles.
 //!    * Linux: scan `/opt/*`, `/usr/lib/*`, `/usr/lib64/*`,
 //!      `/usr/local/lib/*` for `chrome-sandbox` / `chromium-sandbox`.
-//! 3. **Process-based discovery** ([`discovery::discover_processes`]).
-//! 4. **Custom config entries** ([`crate::config::CustomBrowserConfig`])
-//!    — read from `~/.config/silvervine/config.toml`.
+//! 3. **Custom config entries** ([`crate::config::CustomBrowserConfig`])
+//!    — read from the platform config file.
 //!
-//! All four sources are unioned with same-`install_path` deduplication
+//! All sources are unioned with same-`install_path` deduplication
 //! (keeping the first occurrence wins).
 
 use std::path::{Path, PathBuf};
@@ -228,11 +227,7 @@ pub fn detect_browsers_with(os: Os, roots: &FilesystemRoots, config: &Config) ->
     for b in discovery::discover_filesystem(os, roots) {
         push(b, &mut out, &mut seen);
     }
-    // 3. Process-based discovery.
-    for b in discovery::discover_processes() {
-        push(b, &mut out, &mut seen);
-    }
-    // 4. Custom config entries
+    // 3. Custom config entries
     for entry in &config.browsers {
         if let Some(b) = browser_from_custom(os, entry) {
             push(b, &mut out, &mut seen);

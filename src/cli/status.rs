@@ -31,8 +31,7 @@ pub struct Args {
     pub output: OutputOptions,
 }
 
-/// Per-browser status entry. Public so the daemon (Phase 4 IPC
-/// `GetState`) can reuse the same shape.
+/// Per-browser status entry shared by CLI and daemon diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrowserStatus {
     /// Display name.
@@ -45,6 +44,20 @@ pub struct BrowserStatus {
     pub cdm_version: Option<String>,
     /// Last patch timestamp (Unix seconds), if recorded.
     pub last_patched_at: Option<u64>,
+}
+
+impl BrowserStatus {
+    /// Inspect one browser without resolving a valid CDM manifest twice.
+    pub(crate) fn from_browser(browser: &Browser) -> Self {
+        let cdm_version = browser.installed_cdm_version();
+        Self {
+            name: browser.name().to_string(),
+            install_path: browser.install_path().display().to_string(),
+            patched: cdm_version.is_some() || browser.is_patched(),
+            cdm_version,
+            last_patched_at: None,
+        }
+    }
 }
 
 /// Top-level status report rendered by `silvervine status`.
@@ -71,16 +84,7 @@ pub fn build_status(
     heartbeat_at: Option<u64>,
     current_cdm_version: Option<String>,
 ) -> StatusReport {
-    let browsers = detected
-        .iter()
-        .map(|b| BrowserStatus {
-            name: b.name().to_string(),
-            install_path: b.install_path().display().to_string(),
-            patched: b.is_patched(),
-            cdm_version: b.installed_cdm_version(),
-            last_patched_at: None,
-        })
-        .collect();
+    let browsers = detected.iter().map(BrowserStatus::from_browser).collect();
     StatusReport {
         browsers,
         heartbeat_at,
@@ -322,8 +326,41 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let detected = vec![fake_browser("Helium", tmp.path().join("h"))];
         let report = build_status(&detected, None, None);
-        // is_patched() is the Phase-1 stub that returns false.
         assert!(!report.browsers[0].patched);
+    }
+
+    #[test]
+    fn build_status_reuses_installed_cdm_version_for_patched_state() {
+        let tmp = TempDir::new().unwrap();
+        let install = tmp.path().join("h");
+        let cdm = install.join("WidevineCdm");
+        std::fs::create_dir_all(&cdm).unwrap();
+        std::fs::write(cdm.join("manifest.json"), r#"{"version":"4.10.2934.0"}"#).unwrap();
+        let detected = vec![fake_browser("Helium", install)];
+
+        let report = build_status(&detected, None, None);
+
+        assert!(report.browsers[0].patched);
+        assert_eq!(
+            report.browsers[0].cdm_version.as_deref(),
+            Some("4.10.2934.0")
+        );
+    }
+
+    #[test]
+    fn browser_status_keeps_versionless_or_malformed_manifest_patched() {
+        for manifest in [r"{}", "not-json"] {
+            let tmp = TempDir::new().unwrap();
+            let install = tmp.path().join("h");
+            let cdm = install.join("WidevineCdm");
+            std::fs::create_dir_all(&cdm).unwrap();
+            std::fs::write(cdm.join("manifest.json"), manifest).unwrap();
+
+            let status = BrowserStatus::from_browser(&fake_browser("Helium", install));
+
+            assert!(status.patched);
+            assert_eq!(status.cdm_version, None);
+        }
     }
 
     #[test]

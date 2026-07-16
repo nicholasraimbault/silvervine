@@ -11,13 +11,13 @@
 //!   `/usr/local/lib/*`. For each directory, check for presence of
 //!   `chrome-sandbox` or `chromium-sandbox`. If present, add to detected list.
 //!
-//! ## Process-based discovery
+//! ## Process inspection
 //!
-//! Phase 2 wires `sysinfo` to scan running processes; for Phase 1, we
-//! ship a stub returning an empty list. This keeps the API stable
-//! across phases and lets dependent teams (CLI) write code against
-//! it without waiting.
+//! [`is_running`] uses `sysinfo` to check whether a detected browser is active.
+//! Process enumeration alone does not provide enough installation metadata to
+//! construct additional [`Browser`] values.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::{Browser, BrowserKind, Os};
@@ -93,13 +93,20 @@ pub fn discover_filesystem(os: Os, roots: &FilesystemRoots) -> Vec<Browser> {
 /// `chromium-sandbox`.
 fn discover_linux(roots: &FilesystemRoots) -> Vec<Browser> {
     let mut out = Vec::new();
+    let mut scanned = HashSet::new();
     for root in &roots.linux_search {
+        if !scanned.insert(deduplication_key(root)) {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(root) else {
             continue;
         };
         for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
             let path = entry.path();
-            if !path.is_dir() {
+            if !(kind.is_dir() || kind.is_symlink() && path.is_dir()) {
                 continue;
             }
             if has_chromium_sandbox(&path) {
@@ -117,6 +124,11 @@ fn discover_linux(roots: &FilesystemRoots) -> Vec<Browser> {
         }
     }
     out
+}
+
+/// Resolve aliases for root deduplication without changing discovered paths.
+fn deduplication_key(root: &Path) -> PathBuf {
+    std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
 /// Returns true if `dir` looks like a standalone Chromium-family browser
@@ -222,12 +234,11 @@ fn has_versioned_subdir(versions_dir: &Path) -> bool {
     false
 }
 
-/// Process-based discovery scaffold.
+/// Process-only browser discovery.
 ///
-/// Phase 2 keeps this returning an empty `Vec` — the spec leaves
-/// "scan processes for install dirs" semantics ambiguous (the same path
-/// would already surface via the filesystem walk). Use [`is_running`]
-/// for the patch flow's "should we refuse?" check.
+/// Returns no entries because an executable path does not provide enough
+/// browser metadata to construct a reliable [`Browser`]. Use [`is_running`]
+/// to inspect the running state of browsers found by filesystem discovery.
 #[must_use]
 pub fn discover_processes() -> Vec<Browser> {
     Vec::new()
@@ -308,6 +319,57 @@ mod tests {
         assert_eq!(found[0].install_path, helium);
         assert_eq!(found[0].kind, BrowserKind::Detected);
         assert!(found[0].framework_name.is_none());
+    }
+
+    #[test]
+    fn linux_discovery_deduplicates_alias_roots_and_preserves_first_path() {
+        let tmp = TempDir::new().expect("tempdir");
+        let actual = tmp.path().join("lib");
+        let alias = tmp.path().join("lib64");
+        let browser = actual.join("chromium");
+        fs::create_dir_all(&browser).expect("mkdir browser");
+        fs::write(browser.join("chrome-sandbox"), b"").expect("touch sandbox");
+        fs::write(browser.join("chrome"), b"\x7fELF").expect("touch chrome");
+        std::os::unix::fs::symlink(&actual, &alias).expect("symlink alias");
+
+        let roots = FilesystemRoots {
+            macos_applications: vec![],
+            linux_search: vec![alias.clone(), actual],
+            sandbox_root: None,
+        };
+        let found = discover_filesystem(Os::Linux, &roots);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].install_path, alias.join("chromium"));
+    }
+
+    #[test]
+    fn linux_discovery_follows_browser_directory_symlinks() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().join("opt");
+        let actual = tmp.path().join("store").join("chromium");
+        fs::create_dir_all(&root).expect("mkdir root");
+        fs::create_dir_all(&actual).expect("mkdir browser");
+        fs::write(actual.join("chrome-sandbox"), b"").expect("touch sandbox");
+        fs::write(actual.join("chrome"), b"\x7fELF").expect("touch chrome");
+        std::os::unix::fs::symlink(&actual, root.join("chromium")).expect("symlink browser");
+
+        let roots = FilesystemRoots {
+            macos_applications: vec![],
+            linux_search: vec![root.clone()],
+            sandbox_root: None,
+        };
+        let found = discover_filesystem(Os::Linux, &roots);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].install_path, root.join("chromium"));
+    }
+
+    #[test]
+    fn deduplication_key_falls_back_to_original_missing_path() {
+        let tmp = TempDir::new().expect("tempdir");
+        let missing = tmp.path().join("missing");
+        assert_eq!(deduplication_key(&missing), missing);
     }
 
     #[test]
@@ -431,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn discover_processes_returns_empty_in_phase_1() {
+    fn process_only_discovery_returns_empty_without_install_metadata() {
         let processes = discover_processes();
         assert!(processes.is_empty());
     }
