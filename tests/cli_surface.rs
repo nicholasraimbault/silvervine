@@ -24,7 +24,7 @@ fn binary_reports_silvervine_identity() {
     assert!(version.status.success(), "version failed: {version:?}");
     assert_eq!(
         String::from_utf8(version.stdout).unwrap().trim(),
-        "silvervine 2.0.0"
+        concat!("silvervine ", env!("CARGO_PKG_VERSION"))
     );
     let help = run_help(&["--help"]);
     assert!(
