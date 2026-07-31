@@ -10,6 +10,34 @@ Future entries are generated from
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-07-31
+
+### Changed
+
+- Reused a platform-validated current Widevine cache during daemon repair
+  instead of repeating manifest and network resolution, and deduplicated
+  browser discovery across aliased install roots.
+- Reduced the runtime dependency graph and refreshed compatible dependencies.
+
+### Fixed
+
+- Propagated malformed browser configuration and background discovery failures
+  instead of silently reporting an empty browser list.
+- Made `status --watch` rediscovery and terminal restoration reliable, honored
+  daemon browser overrides, and classified storage exhaustion as `DiskFull`.
+- Serialized Widevine cache validation, repair, promotion, rollback, and
+  active-link updates; rejected unsafe versions, external links, symlinked
+  bundle contents, wrong-platform layouts, and mismatched cached manifests.
+- Repaired invalid cache files or directories before re-downloading and avoided
+  duplicate valid-manifest inspection in `status` and `doctor`.
+
+### Security
+
+- Updated the locked `quinn-proto` package from 0.11.14 to 0.11.16, resolving
+  [GHSA-4w2j-m93h-cj5j](https://github.com/quinn-rs/quinn/security/advisories/GHSA-4w2j-m93h-cj5j)
+  in Reqwest's optional HTTP/3 graph. Silvervine does not enable HTTP/3, so the
+  vulnerable code was not present in release binaries.
+
 ## [2.0.0] - 2026-07-16
 
 ### Added
@@ -225,7 +253,8 @@ rc.1 has a hard deadlock on the patch path.
   scripts. Both bugs are obsoleted by the rewrite, but the reports
   were on the money.
 
-[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.1...HEAD
+[2.0.1]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.0-rc.2...v2.0.0
 [2.0.0-rc.2]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.0-rc.1...v2.0.0-rc.2
 [2.0.0-rc.1]: https://github.com/nicholasraimbault/silvervine/compare/v1.0.0...v2.0.0-rc.1
