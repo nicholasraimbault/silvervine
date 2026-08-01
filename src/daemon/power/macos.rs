@@ -12,6 +12,7 @@
 //! 1. Get `NSWorkspace.sharedWorkspace().notificationCenter()`.
 //! 2. Register a block-based observer for `NSWorkspaceDidWakeNotification`.
 //! 3. Keep the returned `NSObjectProtocol` observer in a [`Handle`].
+//!
 //! On drop we call `removeObserver:` to un-register and let the block
 //! be released.
 //!

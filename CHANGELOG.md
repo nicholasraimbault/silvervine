@@ -10,6 +10,32 @@ Future entries are generated from
 
 ## [Unreleased]
 
+### Changed
+
+- Batched patching now resolves the CDM, acquires the patch lock, and snapshots
+  running processes once per operation; watcher scheduling uses one deadline
+  loop instead of a separate ticker thread.
+- Streamed CLI JSON directly to its destination, centralized platform CDM
+  layout constants, and aligned the macOS Objective-C dependency graph.
+- Raised the minimum supported Rust version from 1.85 to 1.88 so the locked
+  dependency graph can include current security fixes.
+
+### Fixed
+
+- Published Linux CDM directories and macOS application bundles through
+  staged transactions, with verification before publication and rollback on
+  failed live verification.
+- Corrected the non-native filesystem-exchange fallback so successful swaps
+  retain both entries and failed swaps preserve recoverable originals.
+- Added versioned cache-integrity metadata, one-time migration for valid
+  existing caches, and validation before activation or rollback.
+
+### Security
+
+- Updated `time` to 0.3.54, resolving
+  [RUSTSEC-2026-0009](https://rustsec.org/advisories/RUSTSEC-2026-0009.html)
+  in the notification and rolling-log dependency graph.
+
 ## [2.0.1] - 2026-07-31
 
 ### Changed
@@ -18,13 +44,6 @@ Future entries are generated from
   instead of repeating manifest and network resolution, and deduplicated
   browser discovery across aliased install roots.
 - Reduced the runtime dependency graph and refreshed compatible dependencies.
-- Batched patching now resolves the CDM, acquires the patch lock, and snapshots
-  running processes once per operation; watcher scheduling uses one deadline
-  loop instead of a separate ticker thread.
-- Streamed CLI JSON directly to its destination, centralized platform CDM
-  layout constants, and aligned the macOS Objective-C dependency graph.
-- Raised the minimum supported Rust version from 1.85 to 1.88 so the locked
-  dependency graph can include current security fixes.
 
 ### Fixed
 
@@ -37,13 +56,6 @@ Future entries are generated from
   bundle contents, wrong-platform layouts, and mismatched cached manifests.
 - Repaired invalid cache files or directories before re-downloading and avoided
   duplicate valid-manifest inspection in `status` and `doctor`.
-- Published Linux CDM directories and macOS application bundles through
-  staged transactions, with verification before publication and rollback on
-  failed live verification.
-- Corrected the non-native filesystem-exchange fallback so successful swaps
-  retain both entries and failed swaps preserve recoverable originals.
-- Added versioned cache-integrity metadata, one-time migration for valid
-  existing caches, and validation before activation or rollback.
 
 ### Security
 
@@ -51,9 +63,6 @@ Future entries are generated from
   [GHSA-4w2j-m93h-cj5j](https://github.com/quinn-rs/quinn/security/advisories/GHSA-4w2j-m93h-cj5j)
   in Reqwest's optional HTTP/3 graph. Silvervine does not enable HTTP/3, so the
   vulnerable code was not present in release binaries.
-- Updated `time` to 0.3.54, resolving
-  [RUSTSEC-2026-0009](https://rustsec.org/advisories/RUSTSEC-2026-0009.html)
-  in the notification and rolling-log dependency graph.
 
 ## [2.0.0] - 2026-07-16
 
