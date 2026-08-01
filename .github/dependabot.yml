@@ -32,29 +32,9 @@ updates:
         patterns:
           - "tracing"
           - "tracing-*"
-    # Ignore rules for deps that broke master in the 2026-05-14
-    # auto-merge incident. Each requires a coordinated migration that
-    # can't happen via a single-crate Dependabot bump:
-    #
-    # - block2, objc2, objc2-foundation, objc2-app-kit: the macOS FFI
-    #   stack moved from the 0.5/0.2 ecosystem to 0.6/0.3 in lockstep.
-    #   Migrating means rewriting `src/daemon/power/macos.rs` (and
-    #   anywhere else block2::IntoBlock / objc2 traits are touched).
-    #   Pinned until the migration lands manually.
-    # - tray-icon: 0.24 pulls block2 0.6 + objc2 0.6 transitively;
-    #   incompatible with our 0.5/0.2 pins above. Bump alongside the
-    #   objc2 migration.
-    # - sysinfo: 0.39 declares an MSRV (~1.86) above our Cargo.toml's
-    #   `rust-version = 1.85`. Bump alongside an MSRV bump.
-    # - png: 0.18 changed Decoder to require Read+Seek; we already
-    #   adapted `src/daemon/tray.rs`. Left unpinned but listed here
-    #   so future major bumps get extra eyes.
+    # Ignore updates that require a coordinated API migration. Dependabot
+    # should not turn a major sysinfo redesign into an unattended lockfile PR.
     ignore:
-      - dependency-name: "block2"
-      - dependency-name: "objc2"
-      - dependency-name: "objc2-foundation"
-      - dependency-name: "objc2-app-kit"
-      - dependency-name: "tray-icon"
       - dependency-name: "sysinfo"
 
   # GitHub Actions (workflow YAML pinning).
@@ -73,8 +53,8 @@ updates:
       prefix: "ci"
       include: "scope"
     # `dtolnay/rust-toolchain`'s `@<version>` ref pins a *Rust toolchain
-    # version* (e.g. `@1.85`), not an action release. Dependabot reads
-    # `@1.85` as a semver-ish pin and "bumps" it forward — but the
+    # version* (e.g. `@1.88`), not an action release. Dependabot reads
+    # `@1.88` as a semver-ish pin and "bumps" it forward — but the
     # bumped value (e.g. `1.100`) is a non-existent Rust release, which
     # breaks MSRV CI on every subsequent PR. Ignore entirely; the
     # toolchain version is bumped manually alongside Cargo.toml's

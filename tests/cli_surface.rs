@@ -2,7 +2,16 @@
 
 use std::process::{Command, Output};
 
+use silvervine::cli::patch::PatchReport as LegacyPatchReport;
 use tempfile::TempDir;
+
+#[test]
+fn legacy_patch_report_path_remains_public() {
+    assert_eq!(
+        std::any::TypeId::of::<LegacyPatchReport>(),
+        std::any::TypeId::of::<silvervine::patch::PatchReport>()
+    );
+}
 
 fn run(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_silvervine"))
@@ -141,7 +150,17 @@ fn rollback_json_stdout_is_exactly_one_document() {
     let cache = home.join("Library/Caches/silvervine/widevine");
     #[cfg(not(target_os = "macos"))]
     let cache = tmp.path().join("cache/silvervine/widevine");
-    std::fs::create_dir_all(cache.join("1.0")).unwrap();
+    let previous = cache.join("1.0");
+    #[cfg(target_os = "linux")]
+    let (platform_dir, library) = ("linux_x64", "libwidevinecdm.so");
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let (platform_dir, library) = ("mac_arm64", "libwidevinecdm.dylib");
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    let (platform_dir, library) = ("mac_x64", "libwidevinecdm.dylib");
+    let library_dir = previous.join("_platform_specific").join(platform_dir);
+    std::fs::create_dir_all(&library_dir).unwrap();
+    std::fs::write(previous.join("manifest.json"), br#"{"version":"1.0"}"#).unwrap();
+    std::fs::write(library_dir.join(library), b"fixture").unwrap();
     std::fs::create_dir_all(cache.join("2.0")).unwrap();
     symlink("2.0", cache.join("current")).unwrap();
     symlink("1.0", cache.join("previous")).unwrap();

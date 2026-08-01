@@ -18,7 +18,7 @@ use std::sync::OnceLock;
 /// Diagnosis of an EME error code: the service that emitted it, the
 /// likely root cause, and the `silvervine` subcommand the user should run
 /// to fix it (when applicable).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct EmeDiagnosis {
     /// The error code as the user entered it (normalized to upper case).
     pub code: String,

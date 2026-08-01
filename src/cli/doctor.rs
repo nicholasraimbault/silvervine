@@ -232,8 +232,7 @@ pub fn run(args: &Args) -> Result<()> {
         return Ok(());
     }
     if args.output.json {
-        let s = serde_json::to_string_pretty(&d)?;
-        writeln!(handle, "{s}").map_err(Error::from)?;
+        super::write_json(&mut handle, &d)?;
     } else {
         render_text(&d, &mut handle).map_err(Error::from)?;
     }
@@ -242,25 +241,17 @@ pub fn run(args: &Args) -> Result<()> {
 
 fn run_translate(code: &str, output: OutputOptions, out: &mut dyn Write) -> Result<()> {
     if let Some(d) = eme::translate_error_code(code) {
-        {
-            if output.json {
-                let body = serde_json::json!({
-                    "code": d.code,
-                    "service": d.service,
-                    "likely_cause": d.likely_cause,
-                    "suggested_command": d.suggested_command,
-                });
-                writeln!(out, "{}", serde_json::to_string_pretty(&body)?).map_err(Error::from)?;
+        if output.json {
+            super::write_json(out, &d)?;
+        } else {
+            writeln!(out, "Service: {}", d.service).map_err(Error::from)?;
+            writeln!(out, "Code: {}", d.code).map_err(Error::from)?;
+            writeln!(out, "Likely cause: {}", d.likely_cause).map_err(Error::from)?;
+            if let Some(cmd) = d.suggested_command {
+                writeln!(out, "Suggested: {cmd}").map_err(Error::from)?;
             } else {
-                writeln!(out, "Service: {}", d.service).map_err(Error::from)?;
-                writeln!(out, "Code: {}", d.code).map_err(Error::from)?;
-                writeln!(out, "Likely cause: {}", d.likely_cause).map_err(Error::from)?;
-                if let Some(cmd) = d.suggested_command {
-                    writeln!(out, "Suggested: {cmd}").map_err(Error::from)?;
-                } else {
-                    writeln!(out, "(silvervine cannot fix this code automatically)")
-                        .map_err(Error::from)?;
-                }
+                writeln!(out, "(silvervine cannot fix this code automatically)")
+                    .map_err(Error::from)?;
             }
         }
         Ok(())

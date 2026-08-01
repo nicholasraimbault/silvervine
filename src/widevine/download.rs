@@ -174,18 +174,7 @@ pub fn verify_file(path: &Path, expected_hash: &str, expected_size: Option<u64>)
             )));
         }
     }
-    let mut hasher = Sha512::new();
-    // 64 KiB buffer — heap-allocated to keep the stack frame small (clippy
-    // `large_stack_arrays` flags >16 KiB locals on certain targets).
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf).map_err(Error::from)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let actual = hex_lower(&hasher.finalize());
+    let actual = sha512_reader(&mut file)?;
     if !hashes_equal(&actual, expected_hash) {
         return Err(Error::hash_mismatch(format!(
             "{}: SHA-512 mismatch (expected {}, got {})",
@@ -195,6 +184,26 @@ pub fn verify_file(path: &Path, expected_hash: &str, expected_size: Option<u64>)
         )));
     }
     Ok(())
+}
+
+/// Stream an on-disk file into SHA-512 and return the lowercase digest.
+pub(crate) fn sha512_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path).map_err(Error::from)?;
+    sha512_reader(&mut file)
+}
+
+fn sha512_reader(reader: &mut impl Read) -> Result<String> {
+    let mut hasher = Sha512::new();
+    // 64 KiB on the heap keeps the stack frame small for release targets.
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(Error::from)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex_lower(&hasher.finalize()))
 }
 
 /// Compute SHA-512 of `bytes` and return the hex digest.

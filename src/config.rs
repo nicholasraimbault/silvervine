@@ -127,7 +127,7 @@ const DEPRECATED_TOP_LEVEL_SECTIONS: &[&str] = &["reporting"];
 impl Config {
     /// Parse a TOML string into a [`Config`].
     ///
-    /// Top-level sections listed in [`DEPRECATED_TOP_LEVEL_SECTIONS`] are
+    /// Top-level sections listed in `DEPRECATED_TOP_LEVEL_SECTIONS` are
     /// stripped before strict deserialization, so a config carried over
     /// from an older Silvervine release doesn't crash the daemon. Unknown
     /// *non-deprecated* keys still fail loudly to catch typos.

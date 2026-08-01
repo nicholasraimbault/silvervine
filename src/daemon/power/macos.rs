@@ -11,8 +11,7 @@
 //!
 //! 1. Get `NSWorkspace.sharedWorkspace().notificationCenter()`.
 //! 2. Register a block-based observer for `NSWorkspaceDidWakeNotification`.
-//! 3. Stash the returned `id<NSObject>` observer pointer in a [`Handle`].
-//!
+//! 3. Keep the returned `NSObjectProtocol` observer in a [`Handle`].
 //! On drop we call `removeObserver:` to un-register and let the block
 //! be released.
 //!
@@ -34,21 +33,20 @@
 //! the captured callback) is freed.
 
 use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
 use objc2_app_kit::NSWorkspace;
-use objc2_foundation::{NSNotification, NSNotificationCenter, NSObject, NSString};
+use objc2_foundation::{NSNotification, NSNotificationCenter, NSObjectProtocol};
 
 use crate::error::Result;
 
 use super::WakeCallback;
-
 /// Live handle for an active observer.
 ///
-/// Holds a strong reference to the observer object (`id` returned by
-/// `addObserverForName`) so we can pass it back to `removeObserver:` on
-/// drop.
+/// Holds a strong reference to the protocol-typed observer returned by
+/// `addObserverForName` so drop can pass it back to `removeObserver:`.
 pub(super) struct Handle {
     /// The observer object returned by AppKit. Drop runs `removeObserver:`.
-    observer: Retained<NSObject>,
+    observer: Retained<ProtocolObject<dyn NSObjectProtocol>>,
     /// Cached pointer to the notification center we registered against.
     notification_center: Retained<NSNotificationCenter>,
 }
@@ -64,28 +62,16 @@ pub(super) fn subscribe(callback: WakeCallback) -> Result<Handle> {
     // "any sender"), `queue:` is the dispatch queue (nil = "the posting
     // thread"), and `usingBlock:` is our handler.
 
-    // SAFETY: NSWorkspace is a singleton; `sharedWorkspace` returns a
-    // retained `&NSWorkspace`. We hold the resulting reference only
-    // long enough to fetch the notification center, after which the
-    // workspace itself doesn't matter — the center is what we keep.
-    let workspace = unsafe { NSWorkspace::sharedWorkspace() };
-    // SAFETY: `notificationCenter` returns a retained reference; we
-    // keep it alive in our handle so AppKit doesn't drop it under us.
-    let center = unsafe { workspace.notificationCenter() };
+    // Both generated objc2 methods return retained objects safely. The handle
+    // keeps the notification center alive after the workspace reference drops.
+    let workspace = NSWorkspace::sharedWorkspace();
+    let center = workspace.notificationCenter();
 
-    // The Cocoa notification name string. AppKit defines it as the
-    // global `NSWorkspaceDidWakeNotification`. objc2-app-kit re-exports
-    // these as `unsafe extern "C"` statics; we read the value once and
-    // wrap it in an `NSString`.
+    // AppKit exports the typed Cocoa notification name as an extern static.
     //
-    // SAFETY: The static is initialized by AppKit at framework load.
-    // We treat the resulting pointer as a `&NSString` valid for the
-    // lifetime of the process.
-    #[allow(
-        clippy::needless_borrow,
-        reason = "the extern static is `NSString`, not `&NSString`; the borrow is load-bearing"
-    )]
-    let wake_name: &NSString = unsafe { &objc2_app_kit::NSWorkspaceDidWakeNotification };
+    // SAFETY: AppKit initializes this process-lifetime reference when the
+    // framework loads.
+    let wake_name = unsafe { objc2_app_kit::NSWorkspaceDidWakeNotification };
 
     // Build a block that wraps the user callback. `block2::RcBlock`
     // gives us an ObjC-callable block whose captures are reference-
@@ -103,12 +89,10 @@ pub(super) fn subscribe(callback: WakeCallback) -> Result<Handle> {
         }
     });
 
-    // SAFETY: `addObserverForName:object:queue:usingBlock:` returns a
-    // retained `id<NSObject>` that we own. Passing `None` for `object`
-    // (any sender) and `None` for `queue` (synchronous on posting
-    // thread) is well-defined per AppKit docs. The block lives as long
-    // as the observer does; AppKit calls it with a non-null
-    // `NSNotification*`.
+    // SAFETY: the generated method returns a retained NSObjectProtocol
+    // object. `None` means any sender and synchronous delivery on the posting
+    // thread. AppKit retains the block and calls it with a non-null
+    // `NSNotification` while the observer remains registered.
     let observer = unsafe {
         center.addObserverForName_object_queue_usingBlock(Some(wake_name), None, None, &block)
     };
@@ -130,7 +114,8 @@ pub(super) fn drop_handle(handle: Handle) {
     // a strong reference to our block, so the captured callback is
     // freed when the local `observer` Retained drops.
     unsafe {
-        handle.notification_center.removeObserver(&handle.observer);
+        let observer = AsRef::<objc2::runtime::AnyObject>::as_ref(&*handle.observer);
+        handle.notification_center.removeObserver(observer);
     }
     // `handle.observer` and `handle.notification_center` drop here,
     // releasing the last AppKit-side references.

@@ -13,28 +13,30 @@
 //! Core engine **does not** reach into those files; the contract here is the
 //! whole interface.
 //!
-//! ## Atomic-patch protocol (per spec "Patch flow")
+//! ## Patch protocol
 //!
 //! ```text
-//! 1. Acquire lockfile (~/.cache/silvervine/patch.lock, flock exclusive).
-//! 2. Pre-flight:
-//!    a. Browser must not be running (unless --force-while-running).
-//!    b. CDM cache must be present and integrity-verified.
-//! 3. Snapshot original bundle    → ~/.cache/silvervine/backups/<browser>-<ver>-<ts>/
-//! 4. Platform impl writes CDM    → into the live bundle.
-//!    └ on any error → restore snapshot, return categorized Error.
-//! 5. Post-patch verification: CDM file present at the expected path.
-//! 6. Commit (delete the backup) on success.
-//! 7. Release lockfile.
+//! 1. Acquire the exclusive patch lock.
+//! 2. Reject a running browser unless --force-while-running is set.
+//! 3. For a transactional patcher:
+//!    a. The platform implementation stages, verifies, and publishes the update.
+//!    b. Core performs the final post-publish verification.
+//! 4. For a legacy non-transactional patcher:
+//!    a. Core snapshots the browser bundle.
+//!    b. The platform implementation writes and core verifies.
+//!    c. Core restores on a modified failure or commits on success.
+//! 5. Release the lock.
 //! ```
+//!
+//! Callers provide a [`CachedCdm`]; cache resolution and download are outside
+//! this orchestrator.
 //!
 //! ## Why a trait?
 //!
-//! The Linux patch is a copy-into-`<install_path>/WidevineCdm/` operation.
-//! The macOS patch involves the bundle layout, `xattr -cr`, and ad-hoc
-//! `codesign`. Two implementations, one orchestrator. A trait keeps the
-//! orchestrator testable with a `MockPlatformPatcher` that records the
-//! actions taken without touching the filesystem.
+//! Linux assembles and verifies a temporary `WidevineCdm` tree before
+//! exchanging it with the live directory. macOS clones the application bundle,
+//! updates and signs the clone, then exchanges whole bundles. A shared trait
+//! keeps orchestration testable while each platform owns its publish semantics.
 //!
 //! ## What this module does NOT do
 //!
@@ -44,6 +46,8 @@
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use crate::browsers::{discovery, Browser};
 use crate::error::{Error, Result};
@@ -58,9 +62,8 @@ pub mod backup;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
-/// macOS platform impl — owned by the platform team. Compiled only on
-/// `target_os = "macos"`.
-#[cfg(target_os = "macos")]
+/// macOS platform impl. Pure bundle tests also compile it on other hosts.
+#[cfg(any(target_os = "macos", test))]
 pub mod macos;
 
 pub use backup::{prune_backups, BackupHandle};
@@ -210,18 +213,63 @@ pub struct PatchOutcome {
     /// `true` if the patch was a dry run — no filesystem changes were made.
     pub dry_run: bool,
 }
+/// JSON-friendly outcome record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PatchReport {
+    /// Display name of the browser.
+    pub browser: String,
+    /// `true` when the patch succeeded (or dry-run completed).
+    pub success: bool,
+    /// CDM version that was written (or would have been, in dry-run).
+    pub cdm_version: Option<String>,
+    /// Browser version detected before patching.
+    pub version_before: Option<String>,
+    /// Browser version reported before the patch; CDM placement does not
+    /// change it.
+    pub version_after: Option<String>,
+    /// `true` if dry-run mode was used.
+    pub dry_run: bool,
+    /// Error message if `success == false`.
+    pub error: Option<String>,
+}
+
+impl PatchReport {
+    fn success(outcome: &PatchOutcome) -> Self {
+        Self {
+            browser: outcome.browser_name.clone(),
+            success: true,
+            cdm_version: Some(outcome.cdm_version.clone()),
+            version_before: outcome.version_before.clone(),
+            version_after: outcome.version_after.clone(),
+            dry_run: outcome.dry_run,
+            error: None,
+        }
+    }
+
+    fn failure(name: &str, dry_run: bool, error: &Error) -> Self {
+        Self {
+            browser: name.to_string(),
+            success: false,
+            cdm_version: None,
+            version_before: None,
+            version_after: None,
+            dry_run,
+            error: Some(error.to_string()),
+        }
+    }
+}
 
 /// Trait implemented by the per-OS patch modules.
 ///
-/// The orchestrator in [`patch_browser`] calls each method in a fixed
-/// order, between snapshot and commit. Implementations should surface
-/// every failure as a categorized [`Error`] (use the existing helpers
-/// — `Error::permission_denied`, `Error::unknown_bundle_structure`, etc.).
+/// The orchestrator reads the browser version, calls [`Self::write_cdm`], then
+/// calls [`Self::verify_post_patch`]. Every failure must be a categorized
+/// [`Error`].
 ///
-/// **Design note for platform team:** implementations do not snapshot or
-/// restore — that's the orchestrator's job, performed via [`BackupHandle`].
-/// You operate on the live bundle directly; if you fail, the orchestrator
-/// will roll back from the snapshot it took before invoking you.
+/// Implementations have two modes. A transactional implementation returns
+/// `true` from [`Self::writes_transactionally`] and owns staging, publication,
+/// and rollback during its write. A legacy implementation uses the default
+/// `false`, mutates the live bundle, and is wrapped in the core
+/// [`BackupHandle`] snapshot/restore path.
 pub trait PlatformPatcher {
     /// Place the CDM files into `target` (the browser's install path).
     ///
@@ -242,21 +290,23 @@ pub trait PlatformPatcher {
     ///
     /// # Errors
     ///
-    /// Surface anything that prevented the CDM placement as a categorized
-    /// [`Error`]. The orchestrator will catch the error and restore the
-    /// snapshot.
+    /// Surface anything that prevented CDM placement as a categorized
+    /// [`Error`]. Transactional implementations must leave the live bundle
+    /// unchanged or valid; core attempts snapshot restoration for legacy
+    /// implementations that modified it.
     fn write_cdm(&self, target: &Path, cdm_source: &Path) -> Result<()>;
 
-    /// Verify the CDM is present at the expected post-patch location.
+    /// Verify the CDM at its expected live post-patch location.
     ///
-    /// Run after [`PlatformPatcher::write_cdm`] succeeds, before the
-    /// orchestrator commits the snapshot. Returns `Ok(())` if the file is
-    /// present and minimally sane (non-empty); returns
-    /// [`crate::ErrorCategory::UnknownBundleStructure`] otherwise.
+    /// This runs after [`PlatformPatcher::write_cdm`]. For transactional
+    /// implementations it is a post-publish check; for legacy implementations
+    /// it runs before core commits the snapshot. Success requires a present,
+    /// non-empty platform library.
     ///
     /// # Errors
     ///
-    /// See above.
+    /// Returns [`crate::ErrorCategory::UnknownBundleStructure`] for an invalid
+    /// live layout, or another categorized error when inspection fails.
     fn verify_post_patch(&self, target: &Path) -> Result<()>;
 
     /// Read the current browser version (best-effort).
@@ -269,6 +319,138 @@ pub trait PlatformPatcher {
     /// rather than erroring — the patch flow proceeds with `None` recorded
     /// in [`PatchOutcome::version_before`].
     fn read_browser_version(&self, target: &Path) -> Option<String>;
+
+    /// Directory in which patch publication creates, removes, or renames
+    /// entries.
+    ///
+    /// The core probes this path before deciding whether privilege escalation
+    /// is required. Linux stages inside the install root and uses the default;
+    /// macOS overrides this with the application bundle's parent directory.
+    #[must_use]
+    fn write_access_root<'a>(&self, target: &'a Path) -> &'a Path {
+        target
+    }
+
+    /// Whether [`PlatformPatcher::write_cdm`] stages, verifies, and atomically
+    /// publishes its own update.
+    ///
+    /// Transactional implementations let the core skip its legacy full-bundle
+    /// snapshot. Returning `true` requires every error path to leave the live
+    /// browser bundle unchanged or fully valid.
+    fn writes_transactionally(&self) -> bool {
+        false
+    }
+}
+
+/// Borrow the detected browsers selected by an optional case-insensitive name.
+#[must_use]
+pub fn select_browsers<'a>(browsers: &'a [Browser], name_filter: Option<&str>) -> Vec<&'a Browser> {
+    browsers
+        .iter()
+        .filter(|browser| name_filter.is_none_or(|name| browser.name().eq_ignore_ascii_case(name)))
+        .collect()
+}
+
+/// Executes one coordinated patch transaction across borrowed browsers.
+///
+/// The batch resolves the CDM once, acquires the patch lock once, and refreshes
+/// the process table immediately before each browser's running-state preflight.
+pub struct PatchBatch<'a> {
+    patcher: &'a dyn PlatformPatcher,
+    options: &'a PatchOptions,
+}
+
+impl<'a> PatchBatch<'a> {
+    #[must_use]
+    /// Build a coordinated batch around one patcher and option set.
+    pub fn new(patcher: &'a dyn PlatformPatcher, options: &'a PatchOptions) -> Self {
+        Self { patcher, options }
+    }
+
+    /// Patch every selected browser, preserving per-browser failures.
+    pub fn execute<F>(&self, browsers: &[&Browser], cdm_resolver: F) -> Vec<PatchReport>
+    where
+        F: FnOnce() -> Result<CachedCdm>,
+    {
+        if browsers.is_empty() {
+            return Vec::new();
+        }
+
+        let cdm = match cdm_resolver() {
+            Ok(cdm) => cdm,
+            Err(error) => return reports_for_error(browsers, self.options.dry_run, &error),
+        };
+
+        if self.options.as_root {
+            return run_batch(browsers, &cdm, self.patcher, self.options);
+        }
+
+        let lock = match patch_lock_path(self.options) {
+            Ok(lock) => lock,
+            Err(error) => return reports_for_error(browsers, self.options.dry_run, &error),
+        };
+        match lockfile::with_lock(&lock, || {
+            Ok(run_batch(browsers, &cdm, self.patcher, self.options))
+        }) {
+            Ok(reports) => reports,
+            Err(error) => reports_for_error(browsers, self.options.dry_run, &error),
+        }
+    }
+}
+
+fn run_batch(
+    browsers: &[&Browser],
+    cdm: &CachedCdm,
+    patcher: &dyn PlatformPatcher,
+    options: &PatchOptions,
+) -> Vec<PatchReport> {
+    run_batch_with_processes(
+        browsers,
+        cdm,
+        patcher,
+        options,
+        discovery::ProcessSnapshot::capture,
+    )
+}
+
+fn run_batch_with_processes<F>(
+    browsers: &[&Browser],
+    cdm: &CachedCdm,
+    patcher: &dyn PlatformPatcher,
+    options: &PatchOptions,
+    mut capture_processes: F,
+) -> Vec<PatchReport>
+where
+    F: FnMut() -> discovery::ProcessSnapshot,
+{
+    browsers
+        .iter()
+        .map(|browser| {
+            let processes =
+                (!options.as_root && !options.force_while_running).then(&mut capture_processes);
+            match run_patch(browser, cdm, patcher, options, processes.as_ref()) {
+                Ok(outcome) => PatchReport::success(&outcome),
+                Err(error) => PatchReport::failure(browser.name(), options.dry_run, &error),
+            }
+        })
+        .collect()
+}
+
+fn reports_for_error(browsers: &[&Browser], dry_run: bool, error: &Error) -> Vec<PatchReport> {
+    browsers
+        .iter()
+        .map(|browser| PatchReport::failure(browser.name(), dry_run, error))
+        .collect()
+}
+
+fn patch_lock_path(options: &PatchOptions) -> Result<PathBuf> {
+    options
+        .lock_path
+        .clone()
+        .or_else(default_patch_lock)
+        .ok_or_else(|| {
+            Error::state_corrupted("cannot resolve patch lockfile path (no \\$HOME / cache dir)")
+        })
 }
 
 /// Patch a single browser with the given cached CDM.
@@ -277,28 +459,28 @@ pub trait PlatformPatcher {
 ///
 /// # Flow
 ///
-/// 1. Acquire patch lockfile (blocking).
-/// 2. If browser is running and `force_while_running` is false, error out
-///    with [`crate::ErrorCategory::BrowserRunning`].
-/// 3. Snapshot the install path to `~/.cache/silvervine/backups/<browser>-<ver>-<ts>/`.
-/// 4. Call [`PlatformPatcher::write_cdm`] with the cached CDM directory as
-///    source → on error, restore snapshot if the install was modified.
-/// 5. Call [`PlatformPatcher::verify_post_patch`] → on error, restore snapshot.
-/// 6. Commit (delete the snapshot).
-/// 7. Return [`PatchOutcome`].
+/// 1. Acquire the patch lock, unless this is the elevated child whose parent
+///    already holds it.
+/// 2. Reject a running browser unless `force_while_running` is set.
+/// 3. Escalate once when the patcher's write-access root is not writable.
+/// 4. For transactional patchers, call [`PlatformPatcher::write_cdm`] and then
+///    [`PlatformPatcher::verify_post_patch`]; the implementation owns staged
+///    publication and write-time rollback.
+/// 5. For legacy patchers, snapshot the install, write and verify, then restore
+///    a modified failure or commit a success.
+/// 6. Return [`PatchOutcome`].
 ///
-/// On `dry_run = true`, steps 3-6 are skipped; the function returns an
-/// outcome with `dry_run = true` and the versions that *would have* been
-/// written.
+/// With `dry_run = true`, both write paths are skipped; the returned outcome
+/// records the versions that would have been used.
 ///
 /// # Errors
 ///
-/// * [`crate::ErrorCategory::BrowserRunning`] — browser is running and
+/// * [`crate::ErrorCategory::BrowserRunning`] when the browser is running and
 ///   `force_while_running` is false.
-/// * Anything from [`PlatformPatcher::write_cdm`] or
-///   [`PlatformPatcher::verify_post_patch`] — the snapshot is restored
-///   if the install was modified before the error is returned.
-/// * [`crate::ErrorCategory::Other`] — lockfile or backup machinery failed.
+/// * Any categorized platform write or verification failure. Transactional
+///   implementations perform their own write-time recovery; core attempts
+///   snapshot restoration for modified legacy writes.
+/// * [`crate::ErrorCategory::Other`] for lockfile or backup machinery failures.
 pub fn patch_browser(
     browser: &Browser,
     cdm: &CachedCdm,
@@ -310,16 +492,13 @@ pub fn patch_browser(
     // this child to finish. Re-acquiring would deadlock both (issue #30).
     // Skip the lockfile entirely; the parent's lock covers us.
     if options.as_root {
-        return run_patch(browser, cdm, patcher, options);
+        return run_patch(browser, cdm, patcher, options, None);
     }
-    let lock = options
-        .lock_path
-        .clone()
-        .or_else(default_patch_lock)
-        .ok_or_else(|| {
-            Error::state_corrupted("cannot resolve patch lockfile path (no \\$HOME / cache dir)")
-        })?;
-    lockfile::with_lock(&lock, || run_patch(browser, cdm, patcher, options))
+    let lock = patch_lock_path(options)?;
+    lockfile::with_lock(&lock, || {
+        let processes = (!options.force_while_running).then(discovery::ProcessSnapshot::capture);
+        run_patch(browser, cdm, patcher, options, processes.as_ref())
+    })
 }
 
 /// Decide whether `run_patch` must re-invoke itself under elevated
@@ -332,11 +511,11 @@ pub fn patch_browser(
 /// * `running_as_root` — process started with euid 0 (e.g. `sudo silvervine`).
 ///   Re-escalating in that case caused issue #30: a redundant osascript
 ///   prompt followed by a deadlock against the parent's lockfile.
-/// * `target_writable` — the install path is writable by the current
-///   process anyway, so no elevation is needed.
+/// * `write_root_writable` — the patcher's publication directory is writable
+///   by the current process, so no elevation is needed.
 #[must_use]
-pub fn decide_escalate(as_root: bool, running_as_root: bool, target_writable: bool) -> bool {
-    !as_root && !running_as_root && !target_writable
+pub fn decide_escalate(as_root: bool, running_as_root: bool, write_root_writable: bool) -> bool {
+    !as_root && !running_as_root && !write_root_writable
 }
 
 /// Inner patch flow, run while the lockfile is held.
@@ -345,6 +524,7 @@ fn run_patch(
     cdm: &CachedCdm,
     patcher: &dyn PlatformPatcher,
     options: &PatchOptions,
+    processes: Option<&discovery::ProcessSnapshot>,
 ) -> Result<PatchOutcome> {
     let started = Instant::now();
 
@@ -352,7 +532,10 @@ fn run_patch(
     // The locked parent already performed this preflight before escalation;
     // the privileged child must remain filesystem-only and not rediscover
     // processes under a different account/session.
-    if !options.as_root && !options.force_while_running && discovery::is_running(browser) {
+    if !options.as_root
+        && !options.force_while_running
+        && processes.is_some_and(|snapshot| snapshot.is_running(browser))
+    {
         return Err(Error::browser_running(format!(
             "{} is currently running; close it first or use --force-while-running",
             browser.name()
@@ -372,53 +555,36 @@ fn run_patch(
         });
     }
 
-    // Decide whether we can write to the install path directly. If yes,
-    // proceed through the user-space code path (cheap, no escalation).
-    // If no AND we're not already running as root, hand off to a
-    // `pkexec` / `sudo` / `osascript`-elevated child invocation that
-    // re-enters this code with `as_root = true` set.
+    // Decide whether we can publish through the patcher's actual write root.
+    // If yes, proceed through the user-space code path (cheap, no escalation).
+    // If no AND we're not already running as root, hand off to a `pkexec` /
+    // `sudo` / `osascript`-elevated child invocation that re-enters this code
+    // with `as_root = true` set.
     if decide_escalate(
         options.as_root,
         platform::is_running_as_root(),
-        target_writable(browser.install_path()),
+        target_writable(patcher.write_access_root(browser.install_path())),
     ) {
         return run_patch_via_escalation(browser, cdm, patcher, options, started, version_before);
     }
 
-    // We're either running as root (post-escalation) or the user already
-    // owns the install path. Take a snapshot whose location matches the
-    // privilege context.
-    let snapshot = take_snapshot(browser, options, version_before.as_deref())?;
-    match perform_patch(browser, cdm, patcher) {
-        PatchAttempt::Success => {
-            // Best-effort commit (delete backup). If commit fails (e.g.
-            // permission to delete a backup we ourselves created), we still
-            // have a valid patched bundle; surface the commit error to
-            // observability but don't fail the patch itself.
-            snapshot.commit()?;
-        }
-        PatchAttempt::FailedBeforeModification(patch_err) => {
-            // The original is untouched — restore would either no-op
-            // wastefully or, worse, swap the empty staging snapshot in
-            // place of the still-good bundle. Drop the snapshot quietly
-            // and propagate the underlying error.
-            let _ = snapshot.commit();
-            return Err(patch_err);
-        }
-        PatchAttempt::ModifiedOriginal(patch_err) => {
-            // The original was modified; we need the snapshot to roll
-            // back. If restore fails, we surface restore's error chained
-            // under the original — both are bad news, but the restore
-            // failure is the more actionable one (left bundle in an
-            // inconsistent state).
+    if patcher.writes_transactionally() {
+        patcher.write_cdm(browser.install_path(), cdm.cdm_dir())?;
+        patcher.verify_post_patch(browser.install_path())?;
+    } else {
+        // Legacy implementations mutate the live bundle directly, so retain
+        // the full snapshot/restore protocol around their write.
+        let snapshot = take_snapshot(browser, options, version_before.as_deref())?;
+        if let Err(patch_err) = perform_patch(browser, cdm, patcher) {
             if let Err(restore_err) = snapshot.restore() {
                 return Err(restore_err.with_source(patch_err));
             }
             return Err(patch_err);
         }
+        snapshot.commit()?;
     }
 
-    let version_after = patcher.read_browser_version(browser.install_path());
+    let version_after = version_before.clone();
 
     Ok(PatchOutcome {
         browser_name: browser.name().to_string(),
@@ -624,37 +790,6 @@ fn run_patch_via_escalation(
     })
 }
 
-/// Outcome of a [`perform_patch`] call.
-///
-/// Distinguishes the two failure modes that affect rollback semantics:
-///
-/// * [`PatchAttempt::Success`] — everything worked; commit the snapshot.
-/// * [`PatchAttempt::FailedBeforeModification`] — write/verify errored
-///   before any byte of the original install was changed (e.g. CDM
-///   payload missing, target directory doesn't exist, permission denied
-///   on `create_dir_all`). Restoring the snapshot would needlessly swap
-///   the still-good bundle with a redundant copy. Discard the snapshot
-///   instead.
-/// * [`PatchAttempt::ModifiedOriginal`] — write started, then errored.
-///   The bundle is in an indeterminate state; restoring the snapshot is
-///   load-bearing.
-#[derive(Debug)]
-enum PatchAttempt {
-    /// CDM written + verified successfully.
-    Success,
-    /// Pre-modification failure — original install is untouched.
-    FailedBeforeModification(Error),
-    /// Post-modification failure — original install is partially mutated
-    /// and must be rolled back from the snapshot.
-    ModifiedOriginal(Error),
-}
-
-/// Run the platform impl + verification between snapshot and commit.
-///
-/// Returns a typed [`PatchAttempt`] so the caller can decide whether to
-/// roll back. A `write_cdm` failure is classified according to whether the
-/// platform implementation modified the install before failing; verification
-/// failures always require rollback.
 fn privileged_patch_argv(
     exe: &str,
     browser: &Browser,
@@ -709,54 +844,14 @@ fn privileged_patch_argv(
     Ok(argv)
 }
 
-fn perform_patch(
-    browser: &Browser,
-    cdm: &CachedCdm,
-    patcher: &dyn PlatformPatcher,
-) -> PatchAttempt {
-    if let Err(e) = patcher.write_cdm(browser.install_path(), cdm.cdm_dir()) {
-        return classify_write_error(e, browser.install_path());
-    }
-    if let Err(e) = patcher.verify_post_patch(browser.install_path()) {
-        return PatchAttempt::ModifiedOriginal(e);
-    }
-    PatchAttempt::Success
-}
-
-/// Classify a `write_cdm` error: distinguishes "platform impl bailed out
-/// before touching anything" (e.g. install-path missing, source missing)
-/// from "platform impl partially mutated the install."
-///
-/// We can't always tell from the error category alone — `PermissionDenied`
-/// could mean "couldn't even open `<install>/WidevineCdm/`" (untouched) or
-/// "removed `<install>/WidevineCdm/` cleanly but failed mid-`create_dir_all`"
-/// (modified). The conservative read is "if `WidevineCdm/` exists now and
-/// is non-empty, the impl got at least partway in." We only fall through
-/// to `FailedBeforeModification` when the impl reported an error
-/// indicative of a pre-write failure (missing target / missing source).
-fn classify_write_error(e: Error, install_path: &Path) -> PatchAttempt {
-    use crate::error::ErrorCategory;
-    // `UnknownBundleStructure` from a `write_cdm` impl exclusively means
-    // "the inputs we were given don't make sense" — install_path missing,
-    // cdm_source missing, etc. The impl returns this without touching the
-    // install path, so we know the bundle is untouched.
-    if e.category == ErrorCategory::UnknownBundleStructure {
-        return PatchAttempt::FailedBeforeModification(e);
-    }
-    // For anything else, ask the filesystem: did we leave a partial
-    // `WidevineCdm/` behind?
-    let widevine_dir = install_path.join("WidevineCdm");
-    let modified = widevine_dir.exists();
-    if modified {
-        PatchAttempt::ModifiedOriginal(e)
-    } else {
-        PatchAttempt::FailedBeforeModification(e)
-    }
+fn perform_patch(browser: &Browser, cdm: &CachedCdm, patcher: &dyn PlatformPatcher) -> Result<()> {
+    patcher.write_cdm(browser.install_path(), cdm.cdm_dir())?;
+    patcher.verify_post_patch(browser.install_path())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -784,6 +879,7 @@ mod tests {
         version: RefCell<Option<String>>,
         write_should_fail: bool,
         verify_should_fail: bool,
+        transactional: bool,
     }
 
     impl MockPatcher {
@@ -825,35 +921,24 @@ mod tests {
             self.version_calls.fetch_add(1, Ordering::SeqCst);
             self.version.borrow().clone()
         }
-    }
 
-    /// Mock that fails `write_cdm` with `UnknownBundleStructure` (the
-    /// canonical "platform impl bailed before touching anything" error).
-    struct UnknownBundleMock;
-    impl PlatformPatcher for UnknownBundleMock {
-        fn write_cdm(&self, _t: &Path, _s: &Path) -> Result<()> {
-            Err(Error::unknown_bundle_structure("missing target"))
-        }
-        fn verify_post_patch(&self, _t: &Path) -> Result<()> {
-            Ok(())
-        }
-        fn read_browser_version(&self, _t: &Path) -> Option<String> {
-            None
+        fn writes_transactionally(&self) -> bool {
+            self.transactional
         }
     }
 
-    /// Mock that fails `write_cdm` with `PermissionDenied` (used to
-    /// simulate a partial-write failure when combined with a pre-seeded
-    /// `WidevineCdm/` directory in the install path).
-    struct PartialFailMock;
-    impl PlatformPatcher for PartialFailMock {
-        fn write_cdm(&self, _t: &Path, _s: &Path) -> Result<()> {
-            Err(Error::permission_denied("partway failure"))
+    struct MutatingUnknownBundleMock;
+    impl PlatformPatcher for MutatingUnknownBundleMock {
+        fn write_cdm(&self, target: &Path, _source: &Path) -> Result<()> {
+            fs::write(target.join("partial-write"), b"damaged").map_err(Error::from)?;
+            Err(Error::unknown_bundle_structure("late layout failure"))
         }
-        fn verify_post_patch(&self, _t: &Path) -> Result<()> {
+
+        fn verify_post_patch(&self, _target: &Path) -> Result<()> {
             Ok(())
         }
-        fn read_browser_version(&self, _t: &Path) -> Option<String> {
+
+        fn read_browser_version(&self, _target: &Path) -> Option<String> {
             None
         }
     }
@@ -957,6 +1042,32 @@ mod tests {
         // The CDM_WRITTEN marker should NOT be present (the mock errored
         // before writing it).
         assert!(!install.join("CDM_WRITTEN").exists());
+    }
+
+    #[test]
+    fn unknown_bundle_write_failure_still_restores_snapshot() {
+        let tmp = TempDir::new().expect("tempdir");
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).expect("mkdir install");
+        fs::write(install.join("original.txt"), b"keep me").expect("seed");
+        let browser = make_browser(install.clone());
+        let cdm = make_cached_cdm(&tmp.path().join("widevine"), "4.10.0.0");
+        let options = PatchOptions {
+            force_while_running: true,
+            lock_path: Some(tmp.path().join("patch.lock")),
+            backups_dir: Some(tmp.path().join("backups")),
+            ..Default::default()
+        };
+
+        let error = patch_browser(&browser, &cdm, &MutatingUnknownBundleMock, &options)
+            .expect_err("write must fail");
+
+        assert_eq!(error.category, crate::ErrorCategory::UnknownBundleStructure);
+        assert!(!install.join("partial-write").exists());
+        assert_eq!(
+            fs::read(install.join("original.txt")).expect("read original"),
+            b"keep me"
+        );
     }
 
     #[test]
@@ -1118,6 +1229,7 @@ mod tests {
         };
         let outcome = patch_browser(&browser, &cdm, &patcher, &opts).expect("ok");
         assert_eq!(outcome.version_before, outcome.version_after);
+        assert_eq!(patcher.version_calls.load(Ordering::SeqCst), 1);
     }
 
     /// `PatchOptions` uses `Default` to produce sensible "off" values.
@@ -1244,42 +1356,6 @@ mod tests {
             .to_string_lossy()
             .starts_with(".silvervine-TestBrowser-v1-")));
         let _ = handle.commit();
-    }
-
-    /// `perform_patch` reports `FailedBeforeModification` when `write_cdm`
-    /// returns an `UnknownBundleStructure` error (the impl bailed out
-    /// before touching anything — common when install path is missing).
-    #[test]
-    fn perform_patch_classifies_unknown_bundle_as_failed_before_modification() {
-        let tmp = TempDir::new().expect("tempdir");
-        let install = tmp.path().join("install");
-        fs::create_dir_all(&install).expect("mkdir install");
-        let browser = make_browser(install.clone());
-        let cache = tmp.path().join("widevine");
-        let cdm = make_cached_cdm(&cache, "1.0");
-        let outcome = perform_patch(&browser, &cdm, &UnknownBundleMock);
-        assert!(matches!(outcome, PatchAttempt::FailedBeforeModification(_)));
-        assert!(!install.join("WidevineCdm").exists());
-    }
-
-    /// `perform_patch` classifies a `write_cdm` error as `ModifiedOriginal`
-    /// when `WidevineCdm/` exists in the install path post-error (i.e.
-    /// the impl got partway through before failing).
-    #[test]
-    fn perform_patch_classifies_partial_write_as_modified_original() {
-        let tmp = TempDir::new().expect("tempdir");
-        let install = tmp.path().join("install");
-        fs::create_dir_all(&install).expect("mkdir install");
-        // Pre-create a partial WidevineCdm/ to simulate "impl bailed
-        // mid-way, leaving turds behind."
-        let partial = install.join("WidevineCdm");
-        fs::create_dir_all(&partial).expect("mkdir WidevineCdm");
-        fs::write(partial.join("partial.txt"), b"oops").expect("seed");
-        let browser = make_browser(install.clone());
-        let cache = tmp.path().join("widevine");
-        let cdm = make_cached_cdm(&cache, "1.0");
-        let outcome = perform_patch(&browser, &cdm, &PartialFailMock);
-        assert!(matches!(outcome, PatchAttempt::ModifiedOriginal(_)));
     }
 
     /// When the install path is not writable AND `as_root` is `false`,
@@ -1446,5 +1522,109 @@ mod tests {
         assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 1);
         assert_eq!(patcher.verify_calls.load(Ordering::SeqCst), 1);
         assert!(!outcome.dry_run);
+    }
+    #[test]
+    fn patch_batch_borrows_selected_browsers_and_resolves_cdm_once() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut helium = make_browser(tmp.path().join("helium"));
+        helium.name = "Helium".into();
+        let mut thorium = make_browser(tmp.path().join("thorium"));
+        thorium.name = "Thorium".into();
+        for browser in [&helium, &thorium] {
+            fs::create_dir_all(browser.install_path()).expect("mkdir install");
+            fs::write(browser.install_path().join("seed"), b"x").expect("seed");
+        }
+        let browsers = vec![helium, thorium];
+        let selected = select_browsers(&browsers, Some("hELIum"));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name(), "Helium");
+
+        let cdm = make_cached_cdm(&tmp.path().join("widevine"), "4.10.2934.0");
+        let patcher = MockPatcher::default();
+        let options = PatchOptions {
+            force_while_running: true,
+            lock_path: Some(tmp.path().join("patch.lock")),
+            backups_dir: Some(tmp.path().join("backups")),
+            ..Default::default()
+        };
+        let resolver_calls = Cell::new(0);
+        let reports = PatchBatch::new(&patcher, &options).execute(&selected, || {
+            resolver_calls.set(resolver_calls.get() + 1);
+            Ok(cdm.clone())
+        });
+
+        assert_eq!(resolver_calls.get(), 1);
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].success);
+        assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn patch_batch_refreshes_processes_before_each_browser() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut helium = make_browser(tmp.path().join("helium"));
+        helium.name = "Helium".into();
+        let mut thorium = make_browser(tmp.path().join("thorium"));
+        thorium.name = "Thorium".into();
+        for browser in [&helium, &thorium] {
+            fs::create_dir_all(browser.install_path()).expect("mkdir install");
+            fs::write(browser.install_path().join("seed"), b"x").expect("seed");
+        }
+        let cdm = make_cached_cdm(&tmp.path().join("widevine"), "4.10.2934.0");
+        let patcher = MockPatcher {
+            transactional: true,
+            ..Default::default()
+        };
+        let options = PatchOptions::default();
+        let captures = Cell::new(0);
+
+        let reports =
+            run_batch_with_processes(&[&helium, &thorium], &cdm, &patcher, &options, || {
+                let capture = captures.get();
+                captures.set(capture + 1);
+                if capture == 0 {
+                    discovery::ProcessSnapshot::from_executables([])
+                } else {
+                    discovery::ProcessSnapshot::from_executables([thorium
+                        .install_path()
+                        .join("thorium")])
+                }
+            });
+
+        assert_eq!(captures.get(), 2);
+        assert!(reports[0].success);
+        assert!(!reports[1].success);
+        assert!(reports[1]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("currently running")));
+        assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn transactional_patcher_skips_full_bundle_snapshot() {
+        let tmp = TempDir::new().expect("tempdir");
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).expect("mkdir install");
+        fs::write(install.join("seed"), b"x").expect("seed");
+        let browser = make_browser(install);
+        let cdm = make_cached_cdm(&tmp.path().join("widevine"), "1.0");
+        let unusable_backups = tmp.path().join("not-a-directory");
+        fs::write(&unusable_backups, b"x").expect("create file");
+        let patcher = MockPatcher {
+            transactional: true,
+            ..Default::default()
+        };
+        let options = PatchOptions {
+            force_while_running: true,
+            lock_path: Some(tmp.path().join("patch.lock")),
+            backups_dir: Some(unusable_backups),
+            ..Default::default()
+        };
+
+        let outcome = patch_browser(&browser, &cdm, &patcher, &options).expect("patch");
+
+        assert!(!outcome.dry_run);
+        assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(patcher.verify_calls.load(Ordering::SeqCst), 1);
     }
 }

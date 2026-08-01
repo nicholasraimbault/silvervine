@@ -146,7 +146,7 @@ fn shell_quote(arg: &str) -> String {
 pub(super) fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
     if !dst.exists() {
         std::fs::rename(src, dst).map_err(|e| {
-            Error::from(e).message_or(format!(
+            Error::from(e).with_context(format!(
                 "rename({} -> {}) failed",
                 src.display(),
                 dst.display()
@@ -156,7 +156,7 @@ pub(super) fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
     }
     match swap_renameatx_np(src, dst) {
         Ok(()) => Ok(()),
-        Err(e) if e.is_unsupported() => fallback_two_step_rename(src, dst),
+        Err(e) if e.is_unsupported() => super::fallback_exchange(src, dst),
         Err(e) => Err(e.into_error(src, dst)),
     }
 }
@@ -175,7 +175,7 @@ impl SwapError {
             Self::Unsupported => std::io::Error::from(std::io::ErrorKind::Unsupported),
             Self::Other(e) => e,
         };
-        Error::from(io_err).message_or(format!(
+        Error::from(io_err).with_context(format!(
             "atomic_rename({} <-> {}) failed",
             src.display(),
             dst.display()
@@ -228,52 +228,6 @@ const RENAME_SWAP: libc::c_uint = 2;
 
 fn io_invalid(e: std::ffi::NulError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-}
-
-/// Fallback when `RENAME_SWAP` is unsupported: rename `dst` aside,
-/// move `src` into place, then remove the saved `dst`.
-fn fallback_two_step_rename(src: &Path, dst: &Path) -> Result<()> {
-    let backup = dst.with_extension("silvervine-tmp");
-    std::fs::rename(dst, &backup).map_err(|e| {
-        Error::from(e).message_or(format!(
-            "fallback rename: could not move {} aside",
-            dst.display()
-        ))
-    })?;
-    if let Err(e) = std::fs::rename(src, dst) {
-        let _ = std::fs::rename(&backup, dst);
-        return Err(Error::from(e).message_or(format!(
-            "fallback rename: could not move {} into {}",
-            src.display(),
-            dst.display()
-        )));
-    }
-    let _ = remove_path(&backup);
-    Ok(())
-}
-
-fn remove_path(p: &Path) -> std::io::Result<()> {
-    let meta = std::fs::symlink_metadata(p)?;
-    if meta.file_type().is_dir() {
-        std::fs::remove_dir_all(p)
-    } else {
-        std::fs::remove_file(p)
-    }
-}
-
-trait MessageOr {
-    fn message_or(self, fallback: String) -> Self;
-}
-
-impl MessageOr for Error {
-    fn message_or(mut self, fallback: String) -> Self {
-        if self.message.is_empty() {
-            self.message = fallback;
-        } else {
-            self.message = format!("{fallback}: {}", self.message);
-        }
-        self
-    }
 }
 
 #[cfg(test)]
@@ -351,15 +305,8 @@ mod tests {
         atomic_rename(&a, &b).expect("rename ok");
         let a_after = fs::read(&a).unwrap();
         let b_after = fs::read(&b).unwrap();
-        // Either the swap succeeded (both files exist with swapped
-        // content) or the fallback ran (only `b` exists with `a`'s
-        // content).
-        let swapped = a_after == b"BBB" && b_after == b"AAA";
-        let fell_back = !a.exists() && b_after == b"AAA";
-        assert!(
-            swapped || fell_back,
-            "neither swap nor fallback worked: a={a_after:?}, b={b_after:?}"
-        );
+        assert_eq!(a_after, b"BBB");
+        assert_eq!(b_after, b"AAA");
     }
 
     #[test]
@@ -380,8 +327,8 @@ mod tests {
         let dst = tmp.path().join("dst");
         fs::write(&src, b"new").unwrap();
         fs::write(&dst, b"old").unwrap();
-        fallback_two_step_rename(&src, &dst).expect("fallback ok");
-        assert!(!src.exists());
+        super::super::fallback_exchange(&src, &dst).expect("fallback ok");
+        assert_eq!(fs::read(&src).unwrap(), b"old");
         assert_eq!(fs::read(&dst).unwrap(), b"new");
     }
 
@@ -391,16 +338,8 @@ mod tests {
         let src = tmp.path().join("nonexistent");
         let dst = tmp.path().join("dst");
         fs::write(&dst, b"old").unwrap();
-        let r = fallback_two_step_rename(&src, &dst);
+        let r = super::super::fallback_exchange(&src, &dst);
         assert!(r.is_err());
         assert!(dst.exists());
-    }
-
-    #[test]
-    fn message_or_appends_or_replaces() {
-        let err1 = Error::other("boom").message_or("ctx".into());
-        assert_eq!(err1.message, "ctx: boom");
-        let err2 = Error::other("").message_or("ctx".into());
-        assert_eq!(err2.message, "ctx");
     }
 }

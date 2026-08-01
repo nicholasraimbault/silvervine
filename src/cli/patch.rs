@@ -16,12 +16,11 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
-
 use crate::browsers::{self, Browser};
 use crate::cli::OutputOptions;
 use crate::error::{Error, Result};
-use crate::patch::{self, PatchOptions, PatchOutcome, PlatformPatcher};
+pub use crate::patch::PatchReport;
+use crate::patch::{self, PatchOptions, PlatformPatcher};
 use crate::widevine::{self, CachedCdm};
 
 /// Args for `silvervine patch`.
@@ -59,68 +58,10 @@ pub struct PrivilegedArgs {
     pub force: bool,
 }
 
-/// JSON-friendly outcome record.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PatchReport {
-    /// Display name of the browser.
-    pub browser: String,
-    /// `true` when the patch succeeded (or dry-run completed).
-    pub success: bool,
-    /// CDM version that was written (or would have been, in dry-run).
-    pub cdm_version: Option<String>,
-    /// Browser version detected before patching.
-    pub version_before: Option<String>,
-    /// Browser version detected after patching.
-    pub version_after: Option<String>,
-    /// `true` if dry-run mode was used.
-    pub dry_run: bool,
-    /// Error message if `success == false`.
-    pub error: Option<String>,
-}
-
-impl PatchReport {
-    fn success(outcome: &PatchOutcome) -> Self {
-        Self {
-            browser: outcome.browser_name.clone(),
-            success: true,
-            cdm_version: Some(outcome.cdm_version.clone()),
-            version_before: outcome.version_before.clone(),
-            version_after: outcome.version_after.clone(),
-            dry_run: outcome.dry_run,
-            error: None,
-        }
-    }
-
-    fn failure(name: &str, dry_run: bool, error: &Error) -> Self {
-        Self {
-            browser: name.to_string(),
-            success: false,
-            cdm_version: None,
-            version_before: None,
-            version_after: None,
-            dry_run,
-            error: Some(error.to_string()),
-        }
-    }
-}
-
-/// Core patch loop, factored so it can be invoked by both the CLI
-/// runtime and (in Phase 4) the daemon's IPC handler.
+/// CLI boundary around the core [`patch::PatchBatch`] transaction.
 ///
-/// `browsers` is the list of detected browsers to consider. `name_filter`
-/// constrains it: when `Some(name)`, only the matching browser is
-/// patched; otherwise every entry is patched.
-///
-/// `cdm_resolver` is a closure that returns a [`CachedCdm`] — tests inject a
-/// synthetic CDM so they don't trigger downloads.
-///
-/// `patcher` is the [`PlatformPatcher`] (a mock in tests, the host
-/// impl in production via [`patch::host_patcher`]).
-///
-/// # Errors
-///
-/// Returns an aggregated error if **all** patches failed. Per-browser
-/// failures show up in the returned [`Vec<PatchReport>`] regardless.
+/// Browser selection and patch execution stay in the core module. This
+/// wrapper only emits user hooks after non-dry-run, non-privileged attempts.
 pub fn run_patch_flow<F>(
     browsers: &[Browser],
     name_filter: Option<&str>,
@@ -131,42 +72,9 @@ pub fn run_patch_flow<F>(
 where
     F: FnOnce() -> Result<CachedCdm>,
 {
-    let candidates: Vec<&Browser> = browsers
-        .iter()
-        .filter(|b| name_filter.is_none_or(|n| n.eq_ignore_ascii_case(b.name())))
-        .collect();
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-    // Lazily resolve the CDM only after we've confirmed we have at
-    // least one candidate. If CDM resolution fails, we still return a
-    // failure report per candidate rather than erroring out — the user
-    // sees what would have happened.
-    let cdm = match cdm_resolver() {
-        Ok(c) => c,
-        Err(e) => {
-            let reports: Vec<_> = candidates
-                .into_iter()
-                .map(|b| PatchReport::failure(b.name(), options.dry_run, &e))
-                .collect();
-            if should_emit_hooks(options) {
-                for report in &reports {
-                    crate::hooks::emit_post_patch(report);
-                }
-            }
-            return reports;
-        }
-    };
-    let reports: Vec<_> = candidates
-        .into_iter()
-        .map(|b| match patch::patch_browser(b, &cdm, patcher, options) {
-            Ok(outcome) => PatchReport::success(&outcome),
-            Err(e) => PatchReport::failure(b.name(), options.dry_run, &e),
-        })
-        .collect();
-    // The elevated child is intentionally filesystem-only: the normal parent
-    // owns user configuration and hook execution. Dry runs do not emit a
-    // post-patch event because no patch happened.
+    let candidates = patch::select_browsers(browsers, name_filter);
+    let reports = patch::PatchBatch::new(patcher, options).execute(&candidates, cdm_resolver);
+
     if should_emit_hooks(options) {
         for report in &reports {
             crate::hooks::emit_post_patch(report);
@@ -220,9 +128,7 @@ fn render_text(reports: &[PatchReport], dry_run: bool, out: &mut dyn Write) -> s
 
 /// Render reports as a pretty-printed JSON array.
 fn render_json(reports: &[PatchReport], out: &mut dyn Write) -> Result<()> {
-    let s = serde_json::to_string_pretty(reports)?;
-    writeln!(out, "{s}").map_err(Error::from)?;
-    Ok(())
+    super::write_json(out, reports)
 }
 
 /// CLI entry point.

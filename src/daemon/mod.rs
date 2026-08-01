@@ -80,7 +80,7 @@ use watcher::{Watcher, WatcherCallback};
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 60;
 
 /// Weekly tick interval for the CDM integrity check. The daemon recomputes
-/// the cached CDM's hash against the manifest and notifies on mismatch.
+/// the cached library hash against its persisted installation metadata.
 pub const INTEGRITY_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 
 /// Filename of the heartbeat artifact under `cache_dir/silvervine/`.
@@ -118,8 +118,8 @@ pub struct RunOptions {
     pub single_iteration: bool,
 }
 
-/// Entry point for the daemon. Production callers in
-/// [`crate::main`] invoke this when `silvervine` is run with no arguments.
+/// Entry point for the daemon. The Silvervine binary invokes this when run
+/// with no arguments.
 ///
 /// Returns once the user / system requests shutdown.
 ///
@@ -444,60 +444,17 @@ fn spawn_integrity_check(interval: Duration, stop: Arc<AtomicBool>) -> Option<Jo
 /// Run the integrity check once. Best-effort: failures are logged but
 /// don't abort the daemon.
 fn check_cdm_integrity() {
-    // Resolve the manifest from on-disk cache (no network — we don't want
-    // to hammer Mozilla weekly). If the manifest cache is empty or
-    // unparseable, we skip the check.
-    use crate::widevine::cache::verify_integrity;
-    use crate::widevine::manifest::{cached_manifest_path, parse_manifest};
-    let Some(cache_path) = cached_manifest_path() else {
-        tracing::info!(
-            target: "silvervine::daemon",
-            "integrity check: no resolvable manifest cache path; skipping"
-        );
-        return;
-    };
-    let bytes = match std::fs::read(&cache_path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!(
-                target: "silvervine::daemon",
-                "integrity check: no cached manifest at {}; skipping",
-                cache_path.display()
-            );
-            return;
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: "silvervine::daemon",
-                error = %e,
-                path = %cache_path.display(),
-                "integrity check: failed to read cached manifest"
-            );
-            return;
-        }
-    };
-    let manifest = match parse_manifest(&bytes) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(
-                target: "silvervine::daemon",
-                error = %e,
-                "integrity check: failed to parse cached manifest"
-            );
-            return;
-        }
-    };
-    match verify_integrity(&manifest) {
+    match crate::widevine::cache::verify_current_integrity() {
         Ok(()) => {
             tracing::debug!(target: "silvervine::daemon", "integrity check passed");
         }
-        Err(e) => {
+        Err(error) => {
             tracing::warn!(
                 target: "silvervine::daemon",
-                error = %e,
+                error = %error,
                 "integrity check failed; CDM may need redownload"
             );
-            notify_user::notify_failure(e.category, &e.message);
+            notify_user::notify_failure(error.category, &error.message);
         }
     }
 }
@@ -658,58 +615,56 @@ fn drive_patch_flow_with_cdm(
     force: bool,
     fresh_cdm: Option<crate::widevine::CachedCdm>,
 ) -> Vec<(String, bool)> {
+    let candidates = crate::patch::select_browsers(browsers, name_filter);
     if daemon_patch_noop() {
-        return browsers
-            .iter()
-            .filter(|b| name_filter.is_none_or(|n| n == b.name()))
-            .map(|b| (b.name().to_string(), false))
+        return candidates
+            .into_iter()
+            .map(|browser| (browser.name().to_string(), false))
             .collect();
     }
     let Ok(patcher) = crate::patch::host_patcher() else {
-        return browsers
-            .iter()
-            .filter(|b| name_filter.is_none_or(|n| n == b.name()))
-            .map(|b| (b.name().to_string(), false))
+        return candidates
+            .into_iter()
+            .map(|browser| (browser.name().to_string(), false))
             .collect();
     };
+
     // Retain the selected CDM so repair does not fetch a manifest when the
     // verified current cache is already usable.
     let cached_cdm =
         fresh_cdm.or_else(|| crate::widevine::cache::validated_current().ok().flatten());
     let cached_version = cached_cdm.as_ref().map(|cdm| cdm.version().to_string());
-    let candidates: Vec<&Browser> = browsers
-        .iter()
-        .filter(|b| name_filter.is_none_or(|n| n == b.name()))
-        .collect();
     let (needs, skip): (Vec<&Browser>, Vec<&Browser>) = candidates
         .into_iter()
-        .partition(|b| needs_patch(b, cached_version.as_deref(), force));
-    let mut results: Vec<(String, bool)> =
-        skip.iter().map(|b| (b.name().to_string(), true)).collect();
+        .partition(|browser| needs_patch(browser, cached_version.as_deref(), force));
+    let mut results: Vec<(String, bool)> = skip
+        .into_iter()
+        .map(|browser| (browser.name().to_string(), true))
+        .collect();
     if needs.is_empty() {
         return results;
     }
-    let cdm_resolver = move || {
+
+    let options = crate::patch::PatchOptions {
+        force_while_running: force,
+        dry_run: false,
+        ..Default::default()
+    };
+    let reports = crate::patch::PatchBatch::new(patcher.as_ref(), &options).execute(&needs, || {
         if let Some(cdm) = cached_cdm {
             return Ok(cdm);
         }
         let manifest = crate::widevine::fetch_manifest()?;
         crate::widevine::cache::ensure_cdm_for(&manifest)
-    };
-    let opts = crate::patch::PatchOptions {
-        force_while_running: force,
-        dry_run: false,
-        ..Default::default()
-    };
-    let needs_owned: Vec<Browser> = needs.into_iter().cloned().collect();
-    let reports = crate::cli::patch::run_patch_flow(
-        &needs_owned,
-        None,
-        cdm_resolver,
-        patcher.as_ref(),
-        &opts,
+    });
+    for report in &reports {
+        crate::hooks::emit_post_patch(report);
+    }
+    results.extend(
+        reports
+            .into_iter()
+            .map(|report| (report.browser, report.success)),
     );
-    results.extend(reports.into_iter().map(|r| (r.browser, r.success)));
     results
 }
 

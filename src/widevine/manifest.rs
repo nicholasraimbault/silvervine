@@ -68,6 +68,34 @@ pub const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// don't want any single step to hang for too long.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Minimal schema for a CDM bundle's installed `manifest.json`.
+///
+/// Chromium extension manifests contain many fields, but Silvervine only
+/// needs the version. Serde ignores all other fields without allocating a
+/// dynamic JSON tree.
+#[derive(Debug, Deserialize)]
+struct InstalledCdmManifest {
+    version: String,
+}
+
+/// Stream an installed CDM manifest and return its version.
+pub(crate) fn read_installed_cdm_version(path: &Path) -> Result<String> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        Error::from(error).with_context(format!(
+            "could not open installed Widevine manifest {}",
+            path.display()
+        ))
+    })?;
+    let manifest: InstalledCdmManifest = serde_json::from_reader(std::io::BufReader::new(file))
+        .map_err(|error| {
+            Error::from(error).with_context(format!(
+                "could not parse installed Widevine manifest {}",
+                path.display()
+            ))
+        })?;
+    Ok(manifest.version)
+}
+
 /// Top-level manifest shape.
 ///
 /// We deserialize the small subset we use; unknown fields (e.g.
@@ -378,14 +406,10 @@ fn try_fetch_one(client: &reqwest::blocking::Client, url: &Url) -> Result<Vec<u8
     Ok(bytes.to_vec())
 }
 
-/// Write cached manifest bytes to disk, creating the parent directory if
-/// missing. Best-effort — caller ignores failures.
+/// Atomically cache manifest bytes, creating the parent directory if needed.
+/// Best-effort — callers intentionally ignore failures.
 fn write_cache(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, bytes)?;
-    Ok(())
+    crate::platform::atomic_write(path, bytes)
 }
 
 /// Read cached manifest bytes if the file exists AND was modified within
@@ -614,7 +638,7 @@ mod tests {
         // by virtue of being just written).
         let one_year_ago = SystemTime::now() - Duration::from_secs(365 * 86_400);
         if let Ok(file) = fs::OpenOptions::new().write(true).open(&cache_path) {
-            // `set_modified` exists on Rust 1.75 (our MSRV).
+            // `set_modified` is available well below Silvervine's MSRV.
             let _ = file.set_modified(one_year_ago);
         }
         let bad_url = Url::parse("http://127.0.0.1:1/nope").expect("url parse");

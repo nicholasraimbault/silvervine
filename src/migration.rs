@@ -1125,7 +1125,7 @@ fn unload_and_remove_user(plist: &Path, out: &mut MigrationOutcome) -> Result<()
         .args(["unload", "-w", plist_str])
         .output();
     remove_path(plist).map_err(|e| {
-        Error::from(e).with_path_context(format!("could not remove {}", plist.display()))
+        Error::from(e).with_context(format!("could not remove {}", plist.display()))
     })?;
     out.removed.push(plist.to_path_buf());
     Ok(())
@@ -1133,9 +1133,8 @@ fn unload_and_remove_user(plist: &Path, out: &mut MigrationOutcome) -> Result<()
 
 /// Remove a user-owned file or directory.
 fn remove_user_path(path: &Path, out: &mut MigrationOutcome) -> Result<()> {
-    remove_path(path).map_err(|e| {
-        Error::from(e).with_path_context(format!("could not remove {}", path.display()))
-    })?;
+    remove_path(path)
+        .map_err(|e| Error::from(e).with_context(format!("could not remove {}", path.display())))?;
     out.removed.push(path.to_path_buf());
     Ok(())
 }
@@ -1148,7 +1147,7 @@ fn remove_user_path(path: &Path, out: &mut MigrationOutcome) -> Result<()> {
 fn migrate_legacy_cdm(legacy: &Path, destination: &Path, out: &mut MigrationOutcome) -> Result<()> {
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
-            Error::from(e).with_path_context(format!(
+            Error::from(e).with_context(format!(
                 "could not create parent of {}",
                 destination.display()
             ))
@@ -1157,7 +1156,7 @@ fn migrate_legacy_cdm(legacy: &Path, destination: &Path, out: &mut MigrationOutc
     if destination.exists() {
         // V2 cache already present — drop the legacy copy.
         remove_path(legacy).map_err(|e| {
-            Error::from(e).with_path_context(format!(
+            Error::from(e).with_context(format!(
                 "could not remove legacy cache {}",
                 legacy.display()
             ))
@@ -1169,7 +1168,7 @@ fn migrate_legacy_cdm(legacy: &Path, destination: &Path, out: &mut MigrationOutc
         return Ok(());
     }
     std::fs::rename(legacy, destination).map_err(|e| {
-        Error::from(e).with_path_context(format!(
+        Error::from(e).with_context(format!(
             "could not move {} to {}",
             legacy.display(),
             destination.display()
@@ -1189,22 +1188,6 @@ fn remove_path(path: &Path) -> std::io::Result<()> {
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
-    }
-}
-
-trait WithPathContext {
-    fn with_path_context(self, ctx: String) -> Self;
-}
-
-impl WithPathContext for Error {
-    /// Prepend `ctx` to the inner message.
-    fn with_path_context(mut self, ctx: String) -> Self {
-        if self.message.is_empty() {
-            self.message = ctx;
-        } else {
-            self.message = format!("{ctx}: {}", self.message);
-        }
-        self
     }
 }
 
@@ -1603,14 +1586,6 @@ mod tests {
         assert!(dest.exists());
         assert!(dest.join("file").exists());
         assert_eq!(out.migrated.len(), 1);
-    }
-
-    #[test]
-    fn with_path_context_replaces_or_prepends() {
-        let e1 = Error::other("inner").with_path_context("ctx".into());
-        assert_eq!(e1.message, "ctx: inner");
-        let e2 = Error::other("").with_path_context("ctx".into());
-        assert_eq!(e2.message, "ctx");
     }
 
     /// `detect_legacy_install()` (public host-tied entry) must not panic

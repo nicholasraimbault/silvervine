@@ -244,42 +244,67 @@ pub fn discover_processes() -> Vec<Browser> {
     Vec::new()
 }
 
-/// Returns `true` if at least one running process's executable path
-/// lives under `browser.install_path()`.
+/// Point-in-time executable paths from one process-table refresh.
 ///
-/// We use [`sysinfo`] to enumerate processes; for each we compare the
-/// process's executable path against the browser's install path. The
-/// comparison uses [`std::path::Path::starts_with`] so a process at
-/// `/opt/helium-browser-bin/helium` matches a browser whose
-/// `install_path` is `/opt/helium-browser-bin`.
-///
-/// Best-effort: process paths can be unreadable (permission denied for
-/// processes owned by other users). Those are skipped silently.
-///
-/// # Performance
-///
-/// Refreshing the process table is non-trivial (a few ms). The patch
-/// flow calls this once per patch — that's fine. Daemon code that
-/// needs frequent polling should cache and refresh on file-watch events
-/// instead.
-#[must_use]
-pub fn is_running(browser: &Browser) -> bool {
-    is_running_under(browser.install_path())
+/// Capturing the process table is substantially more expensive than testing
+/// one browser path against it. Batch and daemon paths should capture once,
+/// then reuse the snapshot for every browser in that decision cycle.
+#[derive(Debug, Default)]
+pub(crate) struct ProcessSnapshot {
+    executables: Vec<PathBuf>,
 }
 
-/// Test- and injection-friendly variant of [`is_running`]: caller passes
-/// the directory under which to consider any executable as "the browser."
-#[must_use]
-pub(crate) fn is_running_under(install: &Path) -> bool {
-    let mut system = sysinfo::System::new();
-    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    for proc in system.processes().values() {
-        let Some(exe) = proc.exe() else { continue };
-        if exe.starts_with(install) {
-            return true;
+impl ProcessSnapshot {
+    /// Refresh the host process table once and retain readable executable
+    /// paths. Processes whose executable is hidden by the OS are skipped.
+    #[must_use]
+    pub(crate) fn capture() -> Self {
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let executables = system
+            .processes()
+            .values()
+            .filter_map(sysinfo::Process::exe)
+            .map(Path::to_path_buf)
+            .collect();
+        Self { executables }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_executables(executables: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self {
+            executables: executables.into_iter().collect(),
         }
     }
-    false
+
+    /// Returns `true` when this snapshot contains an executable below the
+    /// browser installation root.
+    #[must_use]
+    pub(crate) fn is_running(&self, browser: &Browser) -> bool {
+        self.is_running_under(browser.install_path())
+    }
+
+    #[must_use]
+    fn is_running_under(&self, install: &Path) -> bool {
+        self.executables.iter().any(|exe| exe.starts_with(install))
+    }
+}
+
+/// Returns `true` if at least one running process's executable path lives
+/// under `browser.install_path()`.
+///
+/// This one-shot path scans borrowed process paths and stops at the first
+/// match, avoiding the allocation cost of `ProcessSnapshot`. Batch callers
+/// should still capture reusable snapshots.
+#[must_use]
+pub fn is_running(browser: &Browser) -> bool {
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    system
+        .processes()
+        .values()
+        .filter_map(sysinfo::Process::exe)
+        .any(|executable| executable.starts_with(browser.install_path()))
 }
 
 #[cfg(test)]
@@ -496,6 +521,29 @@ mod tests {
     fn process_only_discovery_returns_empty_without_install_metadata() {
         let processes = discover_processes();
         assert!(processes.is_empty());
+    }
+
+    #[test]
+    fn process_snapshot_answers_multiple_browser_queries() {
+        let snapshot = ProcessSnapshot::from_executables([
+            PathBuf::from("/opt/helium/helium"),
+            PathBuf::from("/usr/bin/silvervine"),
+        ]);
+        let helium = Browser {
+            name: "Helium".into(),
+            install_path: PathBuf::from("/opt/helium"),
+            kind: BrowserKind::Detected,
+            framework_name: None,
+        };
+        let thorium = Browser {
+            name: "Thorium".into(),
+            install_path: PathBuf::from("/opt/thorium"),
+            kind: BrowserKind::Detected,
+            framework_name: None,
+        };
+
+        assert!(snapshot.is_running(&helium));
+        assert!(!snapshot.is_running(&thorium));
     }
 
     #[test]

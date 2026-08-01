@@ -9,7 +9,7 @@
 //! The actual browser launch is gated behind a runtime path that is
 //! **only triggered when the user invokes `silvervine test` from the
 //! command line** — never from tests. Inside `cargo test`, every
-//! [`Plan::execute`] short-circuits via `SILVERVINE_TEST_BROWSER_TEST_NOOP=1`
+//! [`Plan::execute_real_browser`] short-circuits via `SILVERVINE_TEST_BROWSER_TEST_NOOP=1`
 //! (set by the test harness when it doesn't want the real browser
 //! launched).
 //!
@@ -18,7 +18,7 @@
 //! method to verify the orchestration logic.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::browsers::{self, Browser};
 use crate::cli::OutputOptions;
@@ -51,14 +51,23 @@ pub struct Args {
 /// Tests build a [`Plan`] from synthetic input and assert against its
 /// fields directly. Production code calls [`Plan::execute_real_browser`]
 /// to actually run the browser.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Plan {
+    #[serde(rename = "browser")]
     /// Browser to launch.
     pub browser_name: String,
     /// Absolute path to the browser binary that would be spawned.
+    #[serde(rename = "executable", serialize_with = "serialize_path_lossy")]
     pub browser_executable: PathBuf,
     /// URL to navigate to.
     pub url: String,
+}
+
+fn serialize_path_lossy<S>(path: &Path, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(path.to_string_lossy().as_ref())
 }
 
 impl Plan {
@@ -184,12 +193,7 @@ pub fn run(args: &Args) -> Result<()> {
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
     if args.output.json {
-        let body = serde_json::json!({
-            "browser": plan.browser_name,
-            "executable": plan.browser_executable.display().to_string(),
-            "url": plan.url,
-        });
-        writeln!(handle, "{}", serde_json::to_string_pretty(&body)?).map_err(Error::from)?;
+        super::write_json(&mut handle, &plan)?;
     } else {
         writeln!(handle, "{}", plan.dry_run()).map_err(Error::from)?;
         writeln!(
@@ -243,8 +247,6 @@ mod tests {
             framework_name: None,
         }
     }
-
-    use std::path::Path;
 
     #[test]
     fn plan_build_with_no_browsers_errors() {
@@ -356,6 +358,24 @@ mod tests {
         unsafe { std::env::set_var(NOOP_ENV, "1") };
         plan.execute_real_browser().expect("noop short-circuits");
         unsafe { std::env::remove_var(NOOP_ENV) };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_serializes_non_utf8_executable_as_lossy_text() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let executable = PathBuf::from(std::ffi::OsString::from_vec(vec![
+            b'/', b't', b'm', b'p', b'/', 0xff,
+        ]));
+        let plan = Plan {
+            browser_name: "NonUtf8".into(),
+            browser_executable: executable,
+            url: DEFAULT_TEST_URL.into(),
+        };
+
+        let value = serde_json::to_value(plan).expect("path should serialize lossily");
+        assert_eq!(value["executable"], "/tmp/\u{fffd}");
     }
 
     #[test]

@@ -6,7 +6,8 @@ Thanks for your interest. Silvervine is a small, focused project — a DRM helpe
 
 ### Prerequisites
 
-- **Rust 1.85+** (current MSRV; pinned in [`rust-toolchain.toml`](rust-toolchain.toml)). Install via [rustup.rs](https://rustup.rs/).
+- **Rust 1.88+** (current MSRV; declared in [`Cargo.toml`](Cargo.toml) and
+  enforced in CI). Install via [rustup.rs](https://rustup.rs/).
 - **macOS** (x86_64 or aarch64) or **Linux** (x86_64). Other platforms compile with restrictions; see [ROADMAP.md](ROADMAP.md) for supported-platform plans.
 
 ### Clone + build

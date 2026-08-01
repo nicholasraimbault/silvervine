@@ -11,11 +11,10 @@
 //! * [`run_as_root`] — execute an arbitrary command with elevated privileges.
 //!   Returns the captured [`Output`] regardless of exit status; callers
 //!   inspect `status.success()` and the stderr text for diagnostics.
-//! * [`atomic_rename`] — APFS / ext4-aware swap (uses the `nix` crate
-//!   internally; falls back to two-step rename on filesystems that don't
-//!   support `RENAME_EXCHANGE` / `RENAME_SWAP`). This is the helper that
-//!   `core-engine`'s `patch::backup` uses; living here keeps the syscall
-//!   gating out of cross-cutting modules.
+//! * [`atomic_rename`] — APFS / ext4-aware directory swap with a two-step
+//!   fallback on filesystems without native exchange support.
+//! * `atomic_write` — same-directory temporary-file replacement for internal
+//!   state and registration files.
 //!
 //! ## What does NOT live here
 //!
@@ -33,7 +32,8 @@
 //! (`SILVERVINE_TEST_ESCALATE_NOOP=1`) so CI never actually prompts for a
 //! password.
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use crate::error::{Error, Result};
@@ -51,8 +51,8 @@ use unsupported as imp;
 ///
 /// Implementations:
 ///
-/// * Linux ([`linux::LinuxPaths`](self::linux::LinuxPaths)): XDG-compliant.
-/// * macOS ([`macos::MacosPaths`](self::macos::MacosPaths)): `~/Library/...`.
+/// * Linux (`LinuxPaths`): XDG-compliant.
+/// * macOS (`MacosPaths`): `~/Library/...`.
 ///
 /// Tests that need to assert against the trait without a real `$HOME` use
 /// the per-platform impl directly, since the methods are pure (no I/O).
@@ -181,25 +181,21 @@ pub fn run_as_root_script(script: &str) -> Result<Output> {
     imp::run_as_root(&["sh", "-c", script])
 }
 
-/// Atomic rename helper used by [`crate::patch`] (via core-engine's
-/// `patch::backup`).
+/// Exchange two existing filesystem entries.
 ///
-/// On Linux this uses `renameat2(RENAME_EXCHANGE)`; on macOS it uses
-/// `renameatx_np(RENAME_SWAP)`. If the underlying syscall returns
-/// `EINVAL` (i.e. the filesystem doesn't support atomic swap, e.g.
-/// non-APFS macOS volumes) the function falls back to a two-step
-/// `rename` sequence:
+/// Linux uses `renameat2(RENAME_EXCHANGE)` and macOS uses
+/// `renameatx_np(RENAME_SWAP)`. On filesystems without native exchange support,
+/// a recoverable three-rename fallback preserves the same successful result:
 ///
-/// 1. `rename(dst, dst.tmp)`
-/// 2. `rename(src, dst)`
-/// 3. remove `dst.tmp`
+/// 1. `dst` moves to an exclusively-created sibling scratch directory.
+/// 2. `src` moves to `dst`.
+/// 3. the saved destination moves to `src`.
 ///
-/// The fallback is atomic in the typical case but not perfectly
-/// crash-safe — documented as a known limitation in the spec.
+/// The fallback is not crash-atomic. Errors trigger best-effort restoration;
+/// if restoration itself fails, the returned error identifies the preserved
+/// scratch path.
 ///
-/// Both `src` and `dst` must already exist for the atomic-swap path. The
-/// fallback path requires `dst` to exist; if it doesn't, the function
-/// performs a plain `rename(src, dst)`.
+/// If `dst` does not exist, this performs a plain `rename(src, dst)`.
 ///
 /// # Errors
 ///
@@ -208,6 +204,139 @@ pub fn run_as_root_script(script: &str) -> Result<Output> {
 /// * [`crate::ErrorCategory::Other`] for any other I/O failure.
 pub fn atomic_rename(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     imp::atomic_rename(src, dst)
+}
+
+fn fallback_exchange(src: &Path, dst: &Path) -> Result<()> {
+    let parent = dst
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let scratch = tempfile::Builder::new()
+        .prefix(".silvervine-swap-")
+        .tempdir_in(parent)
+        .map_err(|error| {
+            Error::from(error).with_context(format!(
+                "could not create exchange scratch directory beside {}",
+                dst.display()
+            ))
+        })?
+        .keep();
+    let backup = scratch.join("destination");
+
+    if let Err(error) = std::fs::rename(dst, &backup) {
+        cleanup_exchange_scratch(&scratch);
+        return Err(Error::from(error).with_context(format!(
+            "fallback exchange could not move {} aside",
+            dst.display()
+        )));
+    }
+
+    if let Err(exchange_error) = std::fs::rename(src, dst) {
+        return match std::fs::rename(&backup, dst) {
+            Ok(()) => {
+                cleanup_exchange_scratch(&scratch);
+                Err(Error::from(exchange_error).with_context(format!(
+                    "fallback exchange could not move {} into {}",
+                    src.display(),
+                    dst.display()
+                )))
+            }
+            Err(restore_error) => Err(Error::from(restore_error)
+                .with_context(format!(
+                    "fallback exchange failed and could not restore {}; the original remains at {}",
+                    dst.display(),
+                    backup.display()
+                ))
+                .with_source(exchange_error)),
+        };
+    }
+
+    if let Err(finish_error) = std::fs::rename(&backup, src) {
+        if let Err(rollback_error) = std::fs::rename(dst, src) {
+            return Err(Error::from(rollback_error)
+                .with_context(format!(
+                    "fallback exchange could not roll back; the original destination remains at {} and the new destination at {}",
+                    backup.display(),
+                    dst.display()
+                ))
+                .with_source(finish_error));
+        }
+
+        return match std::fs::rename(&backup, dst) {
+            Ok(()) => {
+                cleanup_exchange_scratch(&scratch);
+                Err(Error::from(finish_error).with_context(format!(
+                    "fallback exchange could not move the original destination into {}; original paths were restored",
+                    src.display()
+                )))
+            }
+            Err(restore_error) => {
+                if let Err(republish_error) = std::fs::rename(src, dst) {
+                    return Err(Error::from(republish_error)
+                        .with_context(format!(
+                            "fallback exchange recovery failed; the original destination remains at {}, the new source at {}, and {} is missing",
+                            backup.display(),
+                            src.display(),
+                            dst.display()
+                        ))
+                        .with_source(restore_error));
+                }
+                Err(Error::from(restore_error)
+                    .with_context(format!(
+                        "fallback exchange could not restore the original destination; it remains at {}, while the new destination is valid at {}",
+                        backup.display(),
+                        dst.display()
+                    ))
+                    .with_source(finish_error))
+            }
+        };
+    }
+
+    cleanup_exchange_scratch(&scratch);
+    Ok(())
+}
+
+fn cleanup_exchange_scratch(path: &Path) {
+    if let Err(error) = std::fs::remove_dir(path) {
+        tracing::warn!(
+            target: "silvervine::platform",
+            path = %path.display(),
+            error = %error,
+            "could not remove empty exchange scratch directory"
+        );
+    }
+}
+
+/// Replace a file from a same-directory temporary file.
+///
+/// The parent directory is created when needed. Writing and syncing happen
+/// before the atomic rename, so readers never observe a partially written
+/// state file.
+pub(crate) fn atomic_write(path: &Path, body: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|error| {
+        Error::from(error).with_context(format!("could not create {}", parent.display()))
+    })?;
+
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+        Error::from(error).with_context(format!(
+            "could not create temporary file beside {}",
+            path.display()
+        ))
+    })?;
+    temporary.write_all(body).map_err(|error| {
+        Error::from(error).with_context(format!("could not write {}", path.display()))
+    })?;
+    temporary.as_file_mut().sync_all().map_err(|error| {
+        Error::from(error).with_context(format!("could not sync {}", path.display()))
+    })?;
+    temporary.persist(path).map_err(|error| {
+        Error::from(error.error).with_context(format!("could not replace {}", path.display()))
+    })?;
+    Ok(())
 }
 
 /// Whether the current process is already running with effective UID 0

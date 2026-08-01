@@ -53,14 +53,15 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use notify::{EventKind, RecursiveMode};
+use parking_lot::Mutex;
 
-use crate::browsers::Browser;
+use crate::browsers::{discovery::ProcessSnapshot, Browser};
 use crate::error::{Error, Result};
 
 /// Default debounce window in milliseconds. Matches the existing Swift
@@ -83,6 +84,35 @@ pub type WatcherCallback = Arc<dyn Fn(&Browser) + Send + Sync + 'static>;
 /// inject a stub.
 pub type RunningPredicate = Arc<dyn Fn(&Browser) -> bool + Send + Sync + 'static>;
 
+#[derive(Clone)]
+enum RunningSource {
+    Host,
+    Custom(RunningPredicate),
+}
+
+enum RunningSnapshot<'a> {
+    Host(ProcessSnapshot),
+    Custom(&'a RunningPredicate),
+}
+
+impl RunningSource {
+    fn snapshot(&self) -> RunningSnapshot<'_> {
+        match self {
+            Self::Host => RunningSnapshot::Host(ProcessSnapshot::capture()),
+            Self::Custom(predicate) => RunningSnapshot::Custom(predicate),
+        }
+    }
+}
+
+impl RunningSnapshot<'_> {
+    fn is_running(&self, browser: &Browser) -> bool {
+        match self {
+            Self::Host(snapshot) => snapshot.is_running(browser),
+            Self::Custom(predicate) => predicate(browser),
+        }
+    }
+}
+
 /// Public watcher handle. Drops gracefully (joins thread + tears down
 /// the inner `notify::Watcher`).
 #[allow(clippy::struct_field_names)]
@@ -102,16 +132,37 @@ pub struct Watcher {
 /// mutate it (register/unregister).
 #[derive(Default)]
 struct WatcherState {
-    /// Browsers we're watching, keyed by install path.
-    /// Multiple browsers can share an install root; we store the first.
-    browsers: HashMap<PathBuf, Browser>,
-    /// Per-install-path debounce timers: when the next callback dispatch
-    /// is allowed.
-    next_dispatch_at: HashMap<PathBuf, Instant>,
-    /// Browsers whose initial event came in while the browser was running.
-    /// We track them so the polling thread can fire the callback once
-    /// the bundle stabilizes.
-    deferred: HashMap<PathBuf, DeferredState>,
+    /// Watched browsers and all per-browser scheduling state, keyed by the
+    /// configured install path. Keeping one entry prevents parallel maps from
+    /// drifting apart during watch/unwatch and debounce transitions.
+    entries: HashMap<PathBuf, WatchedEntry>,
+}
+
+struct WatchedEntry {
+    browser: Browser,
+    canonical_root: Option<PathBuf>,
+    dispatch_at: Option<Instant>,
+    deferred: Option<DeferredState>,
+}
+
+impl WatchedEntry {
+    fn new(browser: Browser) -> Self {
+        let canonical_root = std::fs::canonicalize(browser.install_path()).ok();
+        Self {
+            browser,
+            canonical_root,
+            dispatch_at: None,
+            deferred: None,
+        }
+    }
+
+    fn owns_event(&self, event_path: &Path) -> bool {
+        event_path.starts_with(self.browser.install_path())
+            || self
+                .canonical_root
+                .as_deref()
+                .is_some_and(|root| event_path.starts_with(root))
+    }
 }
 
 /// State for a deferred (because-running) callback dispatch.
@@ -124,14 +175,12 @@ struct DeferredState {
     first_seen: Instant,
 }
 
-/// Internal event types passed to the dispatch thread.
+/// Internal events passed to the dispatch thread.
 enum WatcherEvent {
-    /// A filesystem event arrived for some path. We resolve which
-    /// browser it affects and apply the debounce / deferred logic in
-    /// the dispatch thread.
+    /// A filesystem event arrived for a path below a watched browser.
     FsEvent(PathBuf),
-    /// Periodic tick — drives the deferred-state polling.
-    Tick,
+    /// Wake the receiver during shutdown so it can observe `stop`.
+    Wake,
 }
 
 impl Watcher {
@@ -143,9 +192,9 @@ impl Watcher {
     /// * [`crate::ErrorCategory::Other`] if the underlying `notify::Watcher`
     ///   fails to initialize (rare — typically a kernel resource limit).
     pub fn new(callback: WatcherCallback) -> Result<Self> {
-        Self::with_options(
+        Self::with_running_source(
             callback,
-            default_running_predicate(),
+            RunningSource::Host,
             Duration::from_millis(DEFAULT_DEBOUNCE_MS),
         )
     }
@@ -161,9 +210,21 @@ impl Watcher {
         is_running: RunningPredicate,
         debounce: Duration,
     ) -> Result<Self> {
+        Self::with_running_source(callback, RunningSource::Custom(is_running), debounce)
+    }
+
+    fn with_running_source(
+        callback: WatcherCallback,
+        running_source: RunningSource,
+        debounce: Duration,
+    ) -> Result<Self> {
         let (event_tx, event_rx) = channel::<WatcherEvent>();
         let stop = Arc::new(AtomicBool::new(false));
         let inner = Arc::new(Mutex::new(WatcherState::default()));
+        let is_running: RunningPredicate = match &running_source {
+            RunningSource::Host => Arc::new(crate::browsers::discovery::is_running),
+            RunningSource::Custom(predicate) => Arc::clone(predicate),
+        };
 
         // The fs watcher's event handler forwards every fs event into our
         // dispatch channel. We use the recommended watcher (inotify on
@@ -197,20 +258,18 @@ impl Watcher {
         let inner_for_thread = Arc::clone(&inner);
         let stop_for_thread = Arc::clone(&stop);
         let callback_for_thread = Arc::clone(&callback);
-        let predicate_for_thread = Arc::clone(&is_running);
-        let event_tx_for_tick = event_tx.clone();
+        let running_source_for_thread = running_source;
 
         let dispatch_thread = std::thread::Builder::new()
             .name("silvervine-watcher".to_string())
             .spawn(move || {
                 run_dispatch(
-                    event_rx,
-                    inner_for_thread,
-                    stop_for_thread,
-                    callback_for_thread,
-                    predicate_for_thread,
+                    &event_rx,
+                    &inner_for_thread,
+                    &stop_for_thread,
+                    &callback_for_thread,
+                    &running_source_for_thread,
                     debounce,
-                    event_tx_for_tick,
                 );
             })
             .map_err(|e| Error::other(format!("watcher dispatch thread spawn: {e}")))?;
@@ -249,7 +308,10 @@ impl Watcher {
                 Error::other(format!("watch {} failed: {e}", install.display())).with_source(e)
             })?;
         }
-        self.inner.lock().unwrap().browsers.insert(install, browser);
+        self.inner
+            .lock()
+            .entries
+            .insert(install, WatchedEntry::new(browser));
         Ok(())
     }
 
@@ -269,10 +331,7 @@ impl Watcher {
             // Best-effort: ignore unwatch-already-unwatched errors.
             let _ = w.unwatch(browser.install_path());
         }
-        let mut state = self.inner.lock().unwrap();
-        state.browsers.remove(browser.install_path());
-        state.next_dispatch_at.remove(browser.install_path());
-        state.deferred.remove(browser.install_path());
+        self.inner.lock().entries.remove(browser.install_path());
         Ok(())
     }
 
@@ -287,11 +346,8 @@ impl Watcher {
 
     fn shutdown(&mut self) {
         if !self.stop.swap(true, Ordering::SeqCst) {
-            // Drop the fs watcher first so it stops emitting events.
             self.fs_watcher.take();
-            // Send a final tick so the dispatch loop wakes up and observes
-            // the stop flag.
-            let _ = self.event_tx.send(WatcherEvent::Tick);
+            let _ = self.event_tx.send(WatcherEvent::Wake);
         }
         if let Some(handle) = self.dispatch_thread.take() {
             let _ = handle.join();
@@ -305,31 +361,18 @@ impl Watcher {
     }
 
     /// Number of currently-watched browsers.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal state mutex is poisoned.
     #[must_use]
     pub fn watched_count(&self) -> usize {
-        self.inner.lock().unwrap().browsers.len()
+        self.inner.lock().entries.len()
     }
 
     /// `true` if the given install path is currently watched.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal state mutex is poisoned.
     #[must_use]
     pub fn is_watching(&self, install_path: &Path) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .browsers
-            .contains_key(install_path)
+        self.inner.lock().entries.contains_key(install_path)
     }
 
-    /// Expose the running predicate for callers (read-only). Used by the
-    /// daemon orchestrator's tests.
+    /// Expose the configured running predicate for callers.
     #[must_use]
     pub fn running_predicate(&self) -> &RunningPredicate {
         &self.is_running
@@ -361,52 +404,39 @@ fn interesting_event(kind: EventKind) -> bool {
     }
 }
 
-/// Dispatch loop body. Runs on the watcher's dedicated thread. All
-/// arguments are intentionally moved by value: the function owns them
-/// for the lifetime of the loop, and the spawned tick thread captures
-/// `tick_tx` + a clone of `stop`.
-#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+/// Dispatch loop body. Runs on the watcher's dedicated thread. A fixed
+/// receive deadline drives periodic work without a second ticker thread, and
+/// filesystem-event traffic cannot postpone that deadline.
 fn run_dispatch(
-    event_rx: Receiver<WatcherEvent>,
-    inner: Arc<Mutex<WatcherState>>,
-    stop: Arc<AtomicBool>,
-    callback: WatcherCallback,
-    is_running: RunningPredicate,
+    event_rx: &Receiver<WatcherEvent>,
+    inner: &Arc<Mutex<WatcherState>>,
+    stop: &Arc<AtomicBool>,
+    callback: &WatcherCallback,
+    running_source: &RunningSource,
     debounce: Duration,
-    tick_tx: Sender<WatcherEvent>,
 ) {
-    // Periodic tick generator — drives the deferred-state polling.
-    // We use a separate thread so the main dispatch thread can block on
-    // `event_rx.recv` without polling.
-    let tick_stop = Arc::clone(&stop);
-    let tick_handle = std::thread::Builder::new()
-        .name("silvervine-watcher-tick".to_string())
-        .spawn(move || loop {
-            if tick_stop.load(Ordering::SeqCst) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(500));
-            if tick_tx.send(WatcherEvent::Tick).is_err() {
-                return;
-            }
-        })
-        .ok();
+    const TICK_INTERVAL: Duration = Duration::from_millis(500);
+    let mut next_tick = Instant::now() + TICK_INTERVAL;
 
-    while let Ok(event) = event_rx.recv() {
+    loop {
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        match event {
-            WatcherEvent::FsEvent(path) => {
-                handle_fs_event(&path, &inner, &callback, &is_running, debounce);
-            }
-            WatcherEvent::Tick => {
-                handle_tick(&inner, &callback, &is_running);
+        let timeout = next_tick.saturating_duration_since(Instant::now());
+        match event_rx.recv_timeout(timeout) {
+            Ok(WatcherEvent::FsEvent(path)) => handle_fs_event(&path, inner, debounce),
+            Ok(WatcherEvent::Wake) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+
+        let now = Instant::now();
+        if now >= next_tick {
+            let running = running_source.snapshot();
+            handle_tick_with_snapshot(inner, callback, &running);
+            while next_tick <= now {
+                next_tick += TICK_INTERVAL;
             }
         }
-    }
-    if let Some(h) = tick_handle {
-        let _ = h.join();
     }
 }
 
@@ -419,117 +449,101 @@ fn run_dispatch(
 /// browser update (the prior leading-edge behavior fired on the very
 /// first event of a 30-event update storm, before the browser bundle
 /// finished writing).
-fn handle_fs_event(
-    path: &Path,
-    inner: &Arc<Mutex<WatcherState>>,
-    _callback: &WatcherCallback,
-    _is_running: &RunningPredicate,
-    debounce: Duration,
-) {
+fn handle_fs_event(path: &Path, inner: &Arc<Mutex<WatcherState>>, debounce: Duration) {
     let now = Instant::now();
-    let mut state = inner.lock().unwrap();
-    let Some((install_root, _)) = find_owning_browser(&state.browsers, path) else {
+    let mut state = inner.lock();
+    let Some(entry) = state
+        .entries
+        .values_mut()
+        .find(|entry| entry.owns_event(path))
+    else {
         return;
     };
-    let install_root = install_root.clone();
     // Every event resets the timer — the path needs `debounce` of quiet
     // before the tick loop will fire the callback.
-    state.next_dispatch_at.insert(install_root, now + debounce);
+    entry.dispatch_at = Some(now + debounce);
 }
 
 /// Periodic tick: walk deferred entries, fire any whose bundle's mtime
 /// has been stable for [`POST_QUIT_STABLE_S`] seconds and the browser is
 /// no longer running.
-fn handle_tick(
+fn handle_tick_with_snapshot(
     inner: &Arc<Mutex<WatcherState>>,
     callback: &WatcherCallback,
-    is_running: &RunningPredicate,
+    running: &RunningSnapshot<'_>,
 ) {
     let stable_for = Duration::from_secs(POST_QUIT_STABLE_S);
     let now = Instant::now();
     let mut to_fire: Vec<Browser> = Vec::new();
     {
-        let mut state = inner.lock().unwrap();
+        let mut state = inner.lock();
 
-        // Step 1: drain expired debounce timers from `next_dispatch_at`.
-        // An entry whose dispatch instant has been reached means the
-        // install path has been quiet for `debounce`. Promote it: fire
-        // the callback now if the browser isn't running, or move it to
-        // `deferred` to wait out the running browser.
-        let expired: Vec<PathBuf> = state
-            .next_dispatch_at
-            .iter()
-            .filter(|(_, t)| now >= **t)
-            .map(|(p, _)| p.clone())
-            .collect();
-        for install in expired {
-            state.next_dispatch_at.remove(&install);
-            let Some(browser) = state.browsers.get(&install).cloned() else {
+        // Promote quiet debounce entries to either a callback or deferred
+        // state. Iterating entries directly avoids cloning every path key.
+        for entry in state.entries.values_mut() {
+            if entry.dispatch_at.is_none_or(|deadline| now < deadline) {
                 continue;
-            };
-            if is_running(&browser) {
+            }
+            entry.dispatch_at = None;
+            if running.is_running(&entry.browser) {
                 tracing::info!(
                     target: "silvervine::watcher",
-                    browser = %browser.name(),
+                    browser = %entry.browser.name(),
                     "debounce window elapsed but browser is running; deferring until quit"
                 );
-                state.deferred.insert(
-                    install,
-                    DeferredState {
-                        last_mtime: mtime_of(browser.install_path()),
-                        last_check: now,
-                        first_seen: now,
-                    },
-                );
+                entry.deferred = Some(DeferredState {
+                    last_mtime: mtime_of(entry.browser.install_path()),
+                    last_check: now,
+                    first_seen: now,
+                });
             } else {
-                to_fire.push(browser);
+                to_fire.push(entry.browser.clone());
             }
         }
 
-        // Step 2: walk deferred entries (browsers that were running when
-        // their debounce timer expired). Fire when mtime has stabilized
-        // for [`POST_QUIT_STABLE_S`] and the browser has quit.
-        let install_paths: Vec<PathBuf> = state.deferred.keys().cloned().collect();
-        for install in install_paths {
-            let Some(browser) = state.browsers.get(&install).cloned() else {
-                state.deferred.remove(&install);
+        // Fire deferred entries once their installation has stayed unchanged
+        // for the stability window and their browser has exited.
+        for (install, entry) in &mut state.entries {
+            let Some(deferred) = entry.deferred.as_mut() else {
                 continue;
             };
-            let current_mtime = mtime_of(&install);
-            let Some(entry) = state.deferred.get_mut(&install) else {
-                continue;
-            };
-            // If mtime changed, reset the stable-since timer.
-            if entry.last_mtime != current_mtime {
-                entry.last_mtime = current_mtime;
-                entry.last_check = now;
+            let current_mtime = mtime_of(install);
+            if deferred.last_mtime != current_mtime {
+                deferred.last_mtime = current_mtime;
+                deferred.last_check = now;
                 continue;
             }
-            // mtime stable. If long enough AND browser no longer running,
-            // fire the callback.
-            if now.duration_since(entry.last_check) >= stable_for && !is_running(&browser) {
-                to_fire.push(browser);
-                state.deferred.remove(&install);
-            } else if now.duration_since(entry.first_seen) > Duration::from_secs(60 * 60) {
-                // Hard cap: don't keep deferring forever. After an hour,
-                // give up — log it and fire anyway. The patch flow's own
-                // running-detection will refuse if the browser truly is
-                // still running, which is a more actionable error than an
-                // indefinitely-deferred state.
-                let entry = state.deferred.remove(&install);
+
+            let stable = now.duration_since(deferred.last_check) >= stable_for;
+            let expired = now.duration_since(deferred.first_seen) > Duration::from_secs(60 * 60);
+            if stable && !running.is_running(&entry.browser) {
+                entry.deferred = None;
+                to_fire.push(entry.browser.clone());
+            } else if expired {
+                let deferred_for = deferred.first_seen.elapsed();
+                entry.deferred = None;
                 tracing::warn!(
                     target: "silvervine::watcher",
                     install = %install.display(),
-                    deferred_for_s = ?entry.map(|e| e.first_seen.elapsed()),
+                    deferred_for_s = ?deferred_for,
                     "giving up on deferred state and firing anyway"
                 );
-                to_fire.push(browser);
+                to_fire.push(entry.browser.clone());
             }
         }
     }
-    for b in to_fire {
-        callback(&b);
+    for browser in to_fire {
+        callback(&browser);
     }
+}
+
+#[cfg(test)]
+fn handle_tick(
+    inner: &Arc<Mutex<WatcherState>>,
+    callback: &WatcherCallback,
+    is_running: &RunningPredicate,
+) {
+    handle_tick_with_snapshot(inner, callback, &RunningSnapshot::Custom(is_running));
 }
 
 /// Read the install dir's mtime; returns `None` on stat failure.
@@ -537,29 +551,17 @@ fn mtime_of(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
-/// Search `browsers` for the entry whose install path is a prefix of
-/// `event_path`. Returns `(install_path, &Browser)` of the matching entry.
-///
-/// macOS FSEvents reports canonical paths (for example, `/private/var/...`)
-/// even when the registered path used an alias (`/var/...`). Compare both the
-/// configured path and its canonical form so those events still resolve to
-/// the browser that owns them. The original key remains unchanged so unwatch
-/// and deletion handling keep working when the target later disappears.
+/// Search the watched entries for the browser whose configured or canonical
+/// install path prefixes `event_path`.
+#[cfg(test)]
 fn find_owning_browser<'a>(
-    browsers: &'a HashMap<PathBuf, Browser>,
+    entries: &'a HashMap<PathBuf, WatchedEntry>,
     event_path: &Path,
 ) -> Option<(&'a PathBuf, &'a Browser)> {
-    browsers.iter().find(|(install, _)| {
-        event_path.starts_with(install)
-            || std::fs::canonicalize(install)
-                .is_ok_and(|canonical| event_path.starts_with(canonical))
-    })
-}
-
-/// Default running predicate: delegates to
-/// [`crate::browsers::discovery::is_running`].
-fn default_running_predicate() -> RunningPredicate {
-    Arc::new(|browser: &Browser| crate::browsers::discovery::is_running(browser))
+    entries
+        .iter()
+        .find(|(_, entry)| entry.owns_event(event_path))
+        .map(|(install, entry)| (install, &entry.browser))
 }
 
 #[cfg(test)]
@@ -585,14 +587,16 @@ mod tests {
     fn state_with(browser: Browser) -> Arc<Mutex<WatcherState>> {
         let install = browser.install_path().to_path_buf();
         let mut state = WatcherState::default();
-        state.browsers.insert(install, browser);
+        state.entries.insert(install, WatchedEntry::new(browser));
         Arc::new(Mutex::new(state))
     }
 
     /// Force all armed debounce timers to be eligible for the next tick.
     fn expire_debounce(inner: &Arc<Mutex<WatcherState>>) {
-        for deadline in inner.lock().unwrap().next_dispatch_at.values_mut() {
-            *deadline = Instant::now();
+        for entry in inner.lock().entries.values_mut() {
+            if entry.dispatch_at.is_some() {
+                entry.dispatch_at = Some(Instant::now());
+            }
         }
     }
 
@@ -613,13 +617,7 @@ mod tests {
         });
         let not_running: RunningPredicate = Arc::new(|_| false);
 
-        handle_fs_event(
-            &install.join("touch"),
-            &inner,
-            &cb,
-            &not_running,
-            Duration::from_millis(100),
-        );
+        handle_fs_event(&install.join("touch"), &inner, Duration::from_millis(100));
         handle_tick(&inner, &cb, &not_running);
         assert_eq!(count.load(Ordering::SeqCst), 0);
 
@@ -648,12 +646,18 @@ mod tests {
             handle_fs_event(
                 &install.join(format!("touch_{i}")),
                 &inner,
-                &cb,
-                &not_running,
                 Duration::from_millis(200),
             );
         }
-        assert_eq!(inner.lock().unwrap().next_dispatch_at.len(), 1);
+        assert_eq!(
+            inner
+                .lock()
+                .entries
+                .values()
+                .filter(|entry| entry.dispatch_at.is_some())
+                .count(),
+            1
+        );
 
         expire_debounce(&inner);
         handle_tick(&inner, &cb, &not_running);
@@ -682,8 +686,6 @@ mod tests {
             handle_fs_event(
                 &install.join(format!("touch_{i}")),
                 &inner,
-                &cb,
-                &not_running,
                 Duration::from_millis(500),
             );
             handle_tick(&inner, &cb, &not_running);
@@ -775,14 +777,17 @@ mod tests {
     /// when the path is inside a registered install root.
     #[test]
     fn find_owning_browser_matches_prefix() {
-        let mut map: HashMap<PathBuf, Browser> = HashMap::new();
+        let mut map: HashMap<PathBuf, WatchedEntry> = HashMap::new();
         map.insert(
             PathBuf::from("/opt/helium-browser-bin"),
-            fake_browser("Helium", PathBuf::from("/opt/helium-browser-bin")),
+            WatchedEntry::new(fake_browser(
+                "Helium",
+                PathBuf::from("/opt/helium-browser-bin"),
+            )),
         );
         map.insert(
             PathBuf::from("/opt/thorium"),
-            fake_browser("Thorium", PathBuf::from("/opt/thorium")),
+            WatchedEntry::new(fake_browser("Thorium", PathBuf::from("/opt/thorium"))),
         );
         let resolved =
             find_owning_browser(&map, Path::new("/opt/helium-browser-bin/chrome/VERSION")).unwrap();
@@ -802,7 +807,7 @@ mod tests {
 
         let browser = fake_browser("Alias", alias.clone());
         let mut map = HashMap::new();
-        map.insert(alias.clone(), browser);
+        map.insert(alias.clone(), WatchedEntry::new(browser));
         let event = fs::canonicalize(&real)
             .unwrap()
             .join("chrome")
@@ -813,14 +818,36 @@ mod tests {
         assert_eq!(owner.name(), "Alias");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn watched_entry_keeps_canonical_alias_after_alias_disappears() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real-install");
+        let alias = tmp.path().join("install-alias");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let entry = WatchedEntry::new(fake_browser("Alias", alias.clone()));
+        let event = fs::canonicalize(&real)
+            .unwrap()
+            .join("chrome")
+            .join("VERSION");
+
+        fs::remove_file(alias).unwrap();
+
+        assert!(entry.owns_event(&event));
+    }
+
     /// `find_owning_browser` returns `None` when no install root prefixes
     /// the event path.
     #[test]
     fn find_owning_browser_returns_none_for_unrelated_path() {
-        let mut map: HashMap<PathBuf, Browser> = HashMap::new();
+        let mut map: HashMap<PathBuf, WatchedEntry> = HashMap::new();
         map.insert(
             PathBuf::from("/opt/helium-browser-bin"),
-            fake_browser("Helium", PathBuf::from("/opt/helium-browser-bin")),
+            WatchedEntry::new(fake_browser(
+                "Helium",
+                PathBuf::from("/opt/helium-browser-bin"),
+            )),
         );
         assert!(find_owning_browser(&map, Path::new("/etc/passwd")).is_none());
     }
@@ -842,14 +869,16 @@ mod tests {
         assert!(mtime_of(&path).is_some());
     }
 
-    /// `default_running_predicate()` produces a callable predicate.
+    /// A host running source captures a process snapshot that can answer
+    /// multiple browser queries without another process-table refresh.
     #[test]
-    fn default_running_predicate_callable() {
-        let p = default_running_predicate();
-        let b = fake_browser("X", PathBuf::from("/no/such/path"));
-        // The default predicate scans real processes; we don't assert
-        // its return value, only that it doesn't panic.
-        let _ = p(&b);
+    fn host_running_source_is_reusable() {
+        let source = RunningSource::Host;
+        let running = source.snapshot();
+        let first = fake_browser("X", PathBuf::from("/no/such/path"));
+        let second = fake_browser("Y", PathBuf::from("/also/missing"));
+        assert!(!running.is_running(&first));
+        assert!(!running.is_running(&second));
     }
 
     /// `Watcher::new` (production constructor) builds a watcher with the
@@ -862,6 +891,20 @@ mod tests {
             watcher.debounce(),
             Duration::from_millis(DEFAULT_DEBOUNCE_MS)
         );
+        watcher.close();
+    }
+
+    #[test]
+    fn running_predicate_preserves_configured_public_accessor() {
+        let callback: WatcherCallback = Arc::new(|_| {});
+        let predicate: RunningPredicate = Arc::new(|_| true);
+        let watcher =
+            Watcher::with_options(callback, predicate, Duration::from_millis(100)).unwrap();
+
+        assert!((watcher.running_predicate())(&fake_browser(
+            "Test",
+            PathBuf::from("/missing")
+        )));
         watcher.close();
     }
 

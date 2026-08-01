@@ -1,9 +1,9 @@
 //! macOS implementation of [`crate::patch::PlatformPatcher`].
 //!
-//! Per the spec ("macOS → Atomic patch protocol"):
-//!
-//! > Bundle write into `<app>/Contents/Frameworks/<fw>/Versions/<n>/Libraries/WidevineCdm/`;
-//! > `xattr -cr`; ad-hoc codesign.
+//! The patcher clones the application into a sibling staging directory,
+//! writes the CDM into that clone, clears extended attributes, ad-hoc signs
+//! and verifies the clone, then exchanges it with the live bundle. The live
+//! application is not modified before publication.
 //!
 //! ## Bundle layout
 //!
@@ -20,7 +20,7 @@
 //!             └── Versions/
 //!                 └── 128.0.6613.119/
 //!                     └── Libraries/
-//!                         └── WidevineCdm/  ← we write here
+//!                         └── WidevineCdm/  ← final live location
 //! ```
 //!
 //! The `<n>` (version) directory under `Versions/` is the active version
@@ -30,13 +30,12 @@
 //!
 //! ## xattr clearing
 //!
-//! Writes from a non-Apple-signed source (i.e. our `cp -R`) get the
-//! `com.apple.quarantine` extended attribute. Browsers refuse to load
-//! quarantined libraries, so we clear xattrs recursively after the
-//! copy:
+//! The staged clone may carry quarantine or other extended attributes that
+//! prevent Chromium from loading the inserted library. Before publication we
+//! clear attributes recursively on the clone:
 //!
 //! ```sh
-//! xattr -cr <bundle>
+//! xattr -cr <staged-bundle>
 //! ```
 //!
 //! Verified during design that `xattr -r` exists on macOS — the previous
@@ -45,12 +44,11 @@
 //!
 //! ## Codesign
 //!
-//! Modifying any file inside an `.app` invalidates the bundle's signature.
-//! Browsers refuse to launch with a broken signature on Gatekeeper-
-//! enforced macOS, so we re-sign ad-hoc:
+//! Updating the staged clone invalidates its copied application signature.
+//! Before publication we re-sign that clone ad hoc:
 //!
 //! ```sh
-//! codesign --force --deep -s - <bundle>
+//! codesign --force --deep -s - <staged-bundle>
 //! ```
 //!
 //! The `-s -` (sign with the ad-hoc identity) is what produces an
@@ -71,6 +69,10 @@ use std::process::Command;
 
 use crate::error::{Error, Result};
 use crate::patch::PlatformPatcher;
+use crate::widevine::{
+    platform_directory, platform_library, Platform, CDM_BUNDLE_DIRECTORY,
+    PLATFORM_SPECIFIC_DIRECTORY,
+};
 
 /// macOS platform patcher.
 ///
@@ -107,12 +109,20 @@ impl PlatformPatcher for MacosPatcher {
             self.framework_name.as_deref(),
             self.framework_version.as_deref(),
         )?;
-        write_cdm_into(&layout, cdm_source)?;
-        // Order matters: clear xattrs FIRST (codesign cares about them),
-        // then re-sign.
-        run_xattr_clear(target)?;
-        run_codesign_adhoc(target)?;
-        Ok(())
+        let framework_name = framework_name_from_path(&layout.framework)?;
+        let framework_version = layout.version;
+
+        replace_bundle_transactionally(target, |staged_bundle| {
+            let staged_layout = resolve_bundle_layout_for(
+                staged_bundle,
+                Some(&framework_name),
+                Some(&framework_version),
+            )?;
+            write_cdm_into(&staged_layout, cdm_source)?;
+            run_xattr_clear(staged_bundle)?;
+            run_codesign_adhoc(staged_bundle)?;
+            verify_cdm_at(&staged_layout)
+        })
     }
 
     fn verify_post_patch(&self, target: &Path) -> Result<()> {
@@ -126,6 +136,14 @@ impl PlatformPatcher for MacosPatcher {
 
     fn read_browser_version(&self, target: &Path) -> Option<String> {
         read_browser_version_at(target)
+    }
+
+    fn write_access_root<'a>(&self, target: &'a Path) -> &'a Path {
+        target.parent().unwrap_or(target)
+    }
+
+    fn writes_transactionally(&self) -> bool {
+        true
     }
 }
 
@@ -257,7 +275,7 @@ fn resolve_bundle_layout_for(
     let libraries = version_dir.join("Libraries");
     checked_directory(&libraries, "framework Libraries")?;
     ensure_contained(&version_dir, &libraries, "framework Libraries")?;
-    let cdm_target = libraries.join("WidevineCdm");
+    let cdm_target = libraries.join(CDM_BUNDLE_DIRECTORY);
     Ok(BundleLayout {
         bundle: target.to_path_buf(),
         framework,
@@ -387,6 +405,111 @@ fn active_version_dir(versions: &Path) -> Result<PathBuf> {
     }
 }
 
+fn replace_bundle_transactionally<F>(bundle: &Path, prepare: F) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let parent = bundle.parent().ok_or_else(|| {
+        Error::unknown_bundle_structure(format!(
+            "browser bundle has no parent: {}",
+            bundle.display()
+        ))
+    })?;
+    let bundle_name = bundle.file_name().ok_or_else(|| {
+        Error::unknown_bundle_structure(format!(
+            "browser bundle has no filename: {}",
+            bundle.display()
+        ))
+    })?;
+    let staging = tempfile::Builder::new()
+        .prefix(".silvervine-bundle-")
+        .tempdir_in(parent)
+        .map_err(|error| {
+            ctx_err(
+                error,
+                format!("create bundle staging directory in {}", parent.display()),
+            )
+        })?;
+    let staged_bundle = staging.path().join(bundle_name);
+    clone_bundle(bundle, &staged_bundle)?;
+    prepare(&staged_bundle)?;
+    crate::platform::atomic_rename(&staged_bundle, bundle)?;
+
+    if let Err(error) = staging.close() {
+        tracing::warn!(
+            path = %bundle.display(),
+            error = %error,
+            "could not remove retired macOS bundle staging directory"
+        );
+    }
+    Ok(())
+}
+
+fn clone_bundle(source: &Path, destination: &Path) -> Result<()> {
+    if std::env::var_os("SILVERVINE_TEST_PATCH_NOOP").is_some() {
+        fs::create_dir(destination).map_err(|error| {
+            ctx_err(
+                error,
+                format!("create test bundle clone {}", destination.display()),
+            )
+        })?;
+        return copy_recursive(source, destination);
+    }
+    clone_bundle_native(source, destination)
+}
+
+fn clone_bundle_native(source: &Path, destination: &Path) -> Result<()> {
+    let clone_attempt = Command::new("/bin/cp")
+        .arg("-cRp")
+        .arg(source)
+        .arg(destination)
+        .output();
+    if clone_attempt
+        .as_ref()
+        .is_ok_and(|output| output.status.success())
+    {
+        return Ok(());
+    }
+
+    if destination.exists() {
+        fs::remove_dir_all(destination).map_err(|error| {
+            ctx_err(
+                error,
+                format!("remove partial bundle clone {}", destination.display()),
+            )
+        })?;
+    }
+    let copy_attempt = Command::new("/usr/bin/ditto")
+        .args(["--rsrc", "--extattr", "--acl"])
+        .arg(source)
+        .arg(destination)
+        .output();
+    if copy_attempt
+        .as_ref()
+        .is_ok_and(|output| output.status.success())
+    {
+        return Ok(());
+    }
+
+    Err(Error::other(format!(
+        "could not stage macOS bundle {}: cp: {}; ditto: {}",
+        source.display(),
+        command_failure(&clone_attempt),
+        command_failure(&copy_attempt)
+    )))
+}
+
+fn command_failure(result: &std::io::Result<std::process::Output>) -> String {
+    match result {
+        Ok(output) => format!(
+            "{}: {}",
+            crate::platform::format_exit_status(output.status),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => error.to_string(),
+    }
+}
+
 fn write_cdm_into(layout: &BundleLayout, cdm_source: &Path) -> Result<()> {
     if !cdm_source.exists() {
         return Err(Error::unknown_bundle_structure(format!(
@@ -441,14 +564,14 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
 fn verify_cdm_at(layout: &BundleLayout) -> Result<()> {
     let dylib = layout
         .cdm_target
-        .join("_platform_specific")
-        .join("mac_x64")
-        .join("libwidevinecdm.dylib");
+        .join(PLATFORM_SPECIFIC_DIRECTORY)
+        .join(platform_directory(Platform::DarwinX86_64))
+        .join(platform_library(Platform::DarwinX86_64));
     let dylib_arm = layout
         .cdm_target
-        .join("_platform_specific")
-        .join("mac_arm64")
-        .join("libwidevinecdm.dylib");
+        .join(PLATFORM_SPECIFIC_DIRECTORY)
+        .join(platform_directory(Platform::DarwinAarch64))
+        .join(platform_library(Platform::DarwinAarch64));
     let chosen = if dylib.exists() { &dylib } else { &dylib_arm };
     if !chosen.exists() {
         return Err(Error::unknown_bundle_structure(format!(
@@ -727,6 +850,7 @@ mod tests {
         let app = make_app_bundle(tmp.path(), "Thorium", "Thorium Framework", "128.0.6613.119");
         let cdm = make_cdm_source(tmp.path());
         // SAFETY: env var mutation in serial test thread.
+        let _guard = crate::test_support::env_lock();
         unsafe { std::env::set_var("SILVERVINE_TEST_PATCH_NOOP", "1") };
         let p = MacosPatcher::new();
         p.write_cdm(&app, &cdm).expect("write ok");
@@ -749,6 +873,7 @@ mod tests {
         fs::create_dir_all(&layout.cdm_target).unwrap();
         fs::write(layout.cdm_target.join("stale.txt"), b"old").unwrap();
 
+        let _guard = crate::test_support::env_lock();
         unsafe { std::env::set_var("SILVERVINE_TEST_PATCH_NOOP", "1") };
         let p = MacosPatcher::new();
         p.write_cdm(&app, &cdm).expect("write ok");
@@ -759,15 +884,43 @@ mod tests {
     }
 
     #[test]
+    fn staged_bundle_failure_preserves_live_application() {
+        let tmp = TempDir::new().unwrap();
+        let app = make_app_bundle(tmp.path(), "Helium", "Helium Framework", "1.0.0.0");
+        fs::write(app.join("live-marker"), b"original").unwrap();
+
+        let _guard = crate::test_support::env_lock();
+        unsafe { std::env::set_var("SILVERVINE_TEST_PATCH_NOOP", "1") };
+        let result = replace_bundle_transactionally(&app, |staged| {
+            fs::write(staged.join("live-marker"), b"modified").unwrap();
+            Err(Error::other("injected bundle staging failure"))
+        });
+        unsafe { std::env::remove_var("SILVERVINE_TEST_PATCH_NOOP") };
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(app.join("live-marker")).unwrap(), b"original");
+    }
+
+    #[test]
     fn verify_post_patch_passes_after_write() {
         let tmp = TempDir::new().unwrap();
         let app = make_app_bundle(tmp.path(), "Helium", "Helium Framework", "1.0.0.0");
         let cdm = make_cdm_source(tmp.path());
+        let _guard = crate::test_support::env_lock();
         unsafe { std::env::set_var("SILVERVINE_TEST_PATCH_NOOP", "1") };
         let p = MacosPatcher::new();
         p.write_cdm(&app, &cdm).unwrap();
         p.verify_post_patch(&app).expect("verify ok");
         unsafe { std::env::remove_var("SILVERVINE_TEST_PATCH_NOOP") };
+    }
+
+    #[test]
+    fn write_access_root_is_bundle_parent() {
+        let tmp = TempDir::new().unwrap();
+        let app = tmp.path().join("Helium.app");
+        let patcher = MacosPatcher::new();
+
+        assert_eq!(patcher.write_access_root(&app), tmp.path());
     }
 
     #[test]
@@ -826,6 +979,7 @@ mod tests {
     fn write_cdm_errors_when_source_missing() {
         let tmp = TempDir::new().unwrap();
         let app = make_app_bundle(tmp.path(), "Helium", "Helium Framework", "1.0.0.0");
+        let _guard = crate::test_support::env_lock();
         unsafe { std::env::set_var("SILVERVINE_TEST_PATCH_NOOP", "1") };
         let p = MacosPatcher::new();
         let r = p.write_cdm(&app, &tmp.path().join("nope"));
@@ -853,6 +1007,7 @@ mod tests {
 
     #[test]
     fn run_xattr_clear_short_circuits_in_test_mode() {
+        let _guard = crate::test_support::env_lock();
         unsafe { std::env::set_var("SILVERVINE_TEST_PATCH_NOOP", "1") };
         let r = run_xattr_clear(std::path::Path::new("/Applications/whatever"));
         assert!(r.is_ok());
@@ -861,6 +1016,7 @@ mod tests {
 
     #[test]
     fn run_codesign_adhoc_short_circuits_in_test_mode() {
+        let _guard = crate::test_support::env_lock();
         unsafe { std::env::set_var("SILVERVINE_TEST_PATCH_NOOP", "1") };
         let r = run_codesign_adhoc(std::path::Path::new("/Applications/whatever"));
         assert!(r.is_ok());

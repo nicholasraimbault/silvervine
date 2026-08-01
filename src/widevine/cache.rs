@@ -15,13 +15,13 @@
 //!
 //! ## API surface (per spec)
 //!
-//! * [`ensure_cdm_for`] — make sure the CDM at the manifest's version is
-//!   present, downloading + extracting if necessary; advance `current`.
-//! * [`current`] — return the CDM the active `current` symlink points at.
-//! * [`rollback`] — flip `current` back to `previous`.
-//! * [`prune`] — keep the latest N versions, delete older.
-//! * [`verify_integrity`] — recompute SHA-512 of cached `.so` files
-//!   against the manifest. Used by daemon's weekly integrity check.
+//! * [`CdmCache::ensure`] — make sure the manifest version is present,
+//!   downloading and extracting when needed, then advance `current`.
+//! * [`CdmCache::current`] — resolve the active `current` symlink.
+//! * [`CdmCache::rollback`] — atomically swap `current` and `previous`.
+//! * [`CdmCache::prune`] — keep the latest N versions and remove older data.
+//! * [`CdmCache::verify_integrity`] — recompute the library SHA-512 against
+//!   metadata persisted when the verified archive entered the cache.
 //!
 //! ## What this module does NOT do
 //!
@@ -30,9 +30,14 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{Error, Result};
 use crate::widevine::manifest::{Manifest, Platform};
-use crate::widevine::{download, extract};
+use crate::widevine::{
+    download, extract, platform_directory, platform_library, CDM_MANIFEST_FILENAME,
+    PLATFORM_SPECIFIC_DIRECTORY,
+};
 
 /// How many CDM versions to keep around by default ([`prune`] honors this).
 pub const DEFAULT_RETENTION: usize = 3;
@@ -77,6 +82,142 @@ impl CachedCdm {
     }
 }
 
+const CACHE_METADATA_FILENAME: &str = ".silvervine-integrity.json";
+const CACHE_METADATA_SCHEMA: u8 = 1;
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct CacheMetadata {
+    schema_version: u8,
+    version: String,
+    platform: String,
+    library_size: u64,
+    library_sha512: String,
+}
+
+/// One cache root and platform with serialized mutation operations.
+#[derive(Debug, Clone)]
+pub struct CdmCache {
+    root: PathBuf,
+    platform: Platform,
+}
+
+impl CdmCache {
+    /// Bind cache operations to an explicit root and supported platform.
+    #[must_use]
+    pub fn new(root: impl Into<PathBuf>, platform: Platform) -> Self {
+        Self {
+            root: root.into(),
+            platform,
+        }
+    }
+
+    /// Cache root containing version directories and active links.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Ensure the manifest's CDM is cached and active.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the platform is absent from the manifest, the cache
+    /// lock or filesystem cannot be used, or download, verification, or
+    /// extraction fails.
+    pub fn ensure(&self, manifest: &Manifest) -> Result<CachedCdm> {
+        std::fs::create_dir_all(&self.root).map_err(Error::from)?;
+        self.with_mutation_lock(|| ensure_unlocked(self, manifest))
+    }
+
+    /// Resolve the active CDM without performing integrity checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `current` link cannot be read or resolves to an
+    /// invalid cache entry.
+    pub fn current(&self) -> Result<Option<CachedCdm>> {
+        resolve_cache_link(&self.root, "current")
+    }
+
+    /// Resolve and validate the active CDM and its persisted metadata.
+    ///
+    /// A structurally valid cache created before integrity metadata existed is
+    /// migrated once under the mutation lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the active link, CDM layout, or persisted integrity
+    /// metadata is malformed or inconsistent, or migration cannot be written.
+    pub fn validated_current(&self) -> Result<Option<CachedCdm>> {
+        let Some(cdm) = self.current()? else {
+            return Ok(None);
+        };
+        if cache_metadata_missing(&cdm)? {
+            return self.with_mutation_lock(|| {
+                let Some(cdm) = self.current()? else {
+                    return Ok(None);
+                };
+                migrate_cache_metadata_if_missing(&cdm, self.platform)?;
+                validate_cached_cdm(&cdm, self.platform)?;
+                Ok(Some(cdm))
+            });
+        }
+        validate_cached_cdm(&cdm, self.platform)?;
+        Ok(Some(cdm))
+    }
+
+    /// Atomically swap the active and previous CDM links.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is no previous CDM, the previous entry fails
+    /// structural or integrity validation, or locking or exchanging either
+    /// cache link fails.
+    pub fn rollback(&self) -> Result<CachedCdm> {
+        self.with_mutation_lock(|| {
+            let previous = resolve_cache_link(&self.root, "previous")?.ok_or_else(|| {
+                Error::state_corrupted("no previous CDM cached — nothing to roll back to")
+            })?;
+            migrate_cache_metadata_if_missing(&previous, self.platform)?;
+            verify_cached_integrity(&previous, self.platform)?;
+            rollback_unlocked(&self.root)
+        })
+    }
+
+    /// Delete old versions and interrupted staging artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache cannot be locked, enumerated, or cleaned.
+    pub fn prune(&self, keep: usize) -> Result<usize> {
+        if !self.root.exists() {
+            return Ok(0);
+        }
+        self.with_mutation_lock(|| prune_unlocked(&self.root, keep))
+    }
+
+    /// Recompute the active library hash against persisted cache metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the active CDM or its integrity metadata cannot be
+    /// read, migrated, or locked, or if its library size or SHA-512 digest has
+    /// changed.
+    pub fn verify_integrity(&self) -> Result<()> {
+        self.with_mutation_lock(|| {
+            let Some(cdm) = self.current()? else {
+                return Ok(());
+            };
+            migrate_cache_metadata_if_missing(&cdm, self.platform)?;
+            verify_cached_integrity(&cdm, self.platform)
+        })
+    }
+
+    fn with_mutation_lock<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        crate::lockfile::with_lock(&self.root.join("download.lock"), operation)
+    }
+}
+
 /// Ensure the CDM described by `manifest` is present in the cache, then
 /// flip the `current` symlink to point at it.
 ///
@@ -86,10 +227,10 @@ impl CachedCdm {
 /// # Behavior
 ///
 /// 1. Resolve the platform entry from the manifest.
-/// 2. If `<cache_root>/<version>/` already exists and its extracted layout
-///    contains a non-empty Widevine library — short-circuit.
-/// 3. Otherwise: download the CRX3, verify SHA-512, extract into a
-///    staging directory, then atomically rename into place.
+/// 2. Reuse an existing structurally valid version with matching integrity
+///    metadata. A valid pre-metadata cache receives a one-time local baseline.
+/// 3. Otherwise, download and SHA-512-verify the CRX3, extract into a staging
+///    directory, remove an invalid prior version, and rename staging into place.
 /// 4. Advance the `current` symlink (and demote the previous one).
 /// 5. Return a [`CachedCdm`] handle for the new version.
 ///
@@ -120,42 +261,45 @@ pub fn ensure_cdm_for_with(
     platform: Platform,
     cache_root: &Path,
 ) -> Result<CachedCdm> {
+    CdmCache::new(cache_root, platform).ensure(manifest)
+}
+
+fn ensure_unlocked(cache: &CdmCache, manifest: &Manifest) -> Result<CachedCdm> {
     let vendor = manifest.widevine()?;
     let version = vendor.version.clone();
     validate_version(&version)?;
-    let entry = manifest.resolve_platform(platform)?;
-    std::fs::create_dir_all(cache_root).map_err(Error::from)?;
-    let target_dir = cache_root.join(&version);
-
-    // Serialize cache validation, repair, promotion, and current/previous link
-    // updates. The lock is separate from `patch.lock`, so patching does not
-    // block CDM refreshes and vice versa.
-    let lock_path = cache_root.join("download.lock");
-    crate::lockfile::with_lock(&lock_path, || {
-        let cached = CachedCdm::new(version.clone(), target_dir.clone());
-        if validate_cached_cdm(&cached, platform).is_ok() {
-            advance_current(cache_root, &version)?;
+    let entry = manifest.resolve_platform(cache.platform)?;
+    let target_dir = cache.root.join(&version);
+    let cached = CachedCdm::new(version.clone(), target_dir.clone());
+    if validate_extracted_cdm(&cached, cache.platform).is_ok() {
+        migrate_cache_metadata_if_missing(&cached, cache.platform)?;
+        if validate_cached_cdm(&cached, cache.platform).is_ok() {
+            advance_current(&cache.root, &version)?;
             return Ok(cached);
         }
-        remove_cache_entry(&target_dir)?;
+    }
 
-        // Extract into a sibling staging directory so promotion is atomic.
-        let staging = cache_root.join(format!(".staging-{version}"));
-        remove_cache_entry(&staging)?;
-        let crx_path = download::download_to(entry, &cache_root.join("downloads"))?;
-        extract::extract_crx3(&crx_path, &staging)?;
-        let staged = CachedCdm::new(version.clone(), staging.clone());
-        validate_cached_cdm(&staged, platform)?;
+    let staging = cache.root.join(format!(".staging-{version}"));
+    remove_cache_entry(&staging)?;
+    let crx_path = download::download_to(entry, &cache.root.join("downloads"))?;
+    extract::extract_crx3(&crx_path, &staging)?;
+    let staged = CachedCdm::new(version.clone(), staging.clone());
+    validate_extracted_cdm(&staged, cache.platform)?;
+    write_cache_metadata(&staged, cache.platform)?;
+    validate_cached_cdm(&staged, cache.platform)?;
 
-        remove_cache_entry(&target_dir)?;
-        std::fs::rename(&staging, &target_dir).map_err(Error::from)?;
+    remove_cache_entry(&target_dir)?;
+    std::fs::rename(&staging, &target_dir).map_err(Error::from)?;
+    if let Err(error) = std::fs::remove_file(&crx_path) {
+        tracing::debug!(
+            path = %crx_path.display(),
+            error = %error,
+            "could not remove promoted Widevine archive"
+        );
+    }
 
-        // The promoted bundle makes the downloaded archive redundant.
-        let _ = std::fs::remove_file(&crx_path);
-
-        advance_current(cache_root, &version)?;
-        Ok(CachedCdm::new(version.clone(), target_dir.clone()))
-    })
+    advance_current(&cache.root, &version)?;
+    Ok(CachedCdm::new(version, target_dir))
 }
 
 /// Resolve the currently-active CDM via the `current` symlink.
@@ -175,9 +319,9 @@ pub fn current() -> Result<Option<CachedCdm>> {
 
 /// Resolve and structurally validate the active CDM before patching from it.
 ///
-/// This avoids a network manifest lookup for a usable cache while rejecting
-/// truncated layouts and version mismatches. SHA-512 verification still occurs
-/// when the archive first enters the cache.
+/// This avoids a manifest lookup for a usable cache while rejecting truncated
+/// layouts and version or metadata mismatches. Valid legacy entries receive
+/// integrity metadata under the cache mutation lock.
 pub(crate) fn validated_current() -> Result<Option<CachedCdm>> {
     let Some(root) = default_cache_root() else {
         return Ok(None);
@@ -188,11 +332,7 @@ pub(crate) fn validated_current() -> Result<Option<CachedCdm>> {
 
 /// Test-friendly validated-current lookup under an explicit cache root.
 fn validated_current_in(cache_root: &Path, platform: Platform) -> Result<Option<CachedCdm>> {
-    let Some(cdm) = current_in(cache_root)? else {
-        return Ok(None);
-    };
-    validate_cached_cdm(&cdm, platform)?;
-    Ok(Some(cdm))
+    CdmCache::new(cache_root, platform).validated_current()
 }
 
 /// Test-friendly: resolve `current` under an arbitrary cache root.
@@ -217,8 +357,8 @@ pub fn rollback() -> Result<CachedCdm> {
     let root = default_cache_root().ok_or_else(|| {
         Error::state_corrupted("cannot resolve ~/.cache/silvervine/widevine cache root")
     })?;
-    let lock_path = root.join("download.lock");
-    crate::lockfile::with_lock(&lock_path, || rollback_in(&root))
+    let platform = crate::widevine::manifest::current_platform_key()?;
+    CdmCache::new(root, platform).rollback()
 }
 
 /// Test-friendly: rollback under an arbitrary cache root.
@@ -227,27 +367,23 @@ pub fn rollback() -> Result<CachedCdm> {
 ///
 /// See [`rollback`].
 pub fn rollback_in(cache_root: &Path) -> Result<CachedCdm> {
+    crate::lockfile::with_lock(&cache_root.join("download.lock"), || {
+        rollback_unlocked(cache_root)
+    })
+}
+
+fn rollback_unlocked(cache_root: &Path) -> Result<CachedCdm> {
     let previous = resolve_cache_link(cache_root, "previous")?.ok_or_else(|| {
         Error::state_corrupted("no previous CDM cached — nothing to roll back to")
     })?;
-    let prev_target_str = previous.version().to_string();
-    let current = resolve_cache_link(cache_root, "current")?;
-    let cur_target_name = current.as_ref().map(|cdm| cdm.version().to_string());
-    let prev = cache_root.join("previous");
-    let cur = cache_root.join("current");
-
-    // Replace `current` with what `previous` was pointing at.
-    remove_cache_link(&cur)?;
-    relative_symlink(&prev_target_str, &cur)?;
-
-    // Update `previous` to point at what `current` used to point at (if any).
-    remove_cache_link(&prev)?;
-    if let Some(name) = cur_target_name {
-        relative_symlink(&name, &prev)?;
+    let previous_link = cache_root.join("previous");
+    let current_link = cache_root.join("current");
+    if resolve_cache_link(cache_root, "current")?.is_some() {
+        crate::platform::atomic_rename(&previous_link, &current_link)?;
+    } else {
+        std::fs::rename(&previous_link, &current_link).map_err(Error::from)?;
     }
-
-    let resolved = cache_root.join(&prev_target_str);
-    Ok(CachedCdm::new(prev_target_str, resolved))
+    Ok(previous)
 }
 
 /// Keep the latest `keep` versions in the cache; remove older ones (and
@@ -262,7 +398,8 @@ pub fn prune(keep: usize) -> Result<usize> {
     let Some(root) = default_cache_root() else {
         return Ok(0);
     };
-    prune_in(&root, keep)
+    let platform = crate::widevine::manifest::current_platform_key()?;
+    CdmCache::new(root, platform).prune(keep)
 }
 
 /// Test-friendly: prune in an arbitrary cache root.
@@ -271,80 +408,90 @@ pub fn prune(keep: usize) -> Result<usize> {
 ///
 /// See [`prune`].
 pub fn prune_in(cache_root: &Path, keep: usize) -> Result<usize> {
-    let keep = keep.max(1);
     if !cache_root.exists() {
         return Ok(0);
     }
-    let mut versions = list_versions(cache_root)?;
-    // Sort newest-first by mtime; falls back to name.
-    versions.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.name.cmp(&a.name)));
-    let mut deleted = 0usize;
-    let active = current_in(cache_root)
-        .ok()
-        .flatten()
-        .map(|c| c.version().to_string());
-    let prev_target = std::fs::read_link(cache_root.join("previous"))
-        .ok()
-        .and_then(|p| p.file_name().and_then(|s| s.to_str().map(str::to_string)));
+    crate::lockfile::with_lock(&cache_root.join("download.lock"), || {
+        prune_unlocked(cache_root, keep)
+    })
+}
 
-    for (i, v) in versions.iter().enumerate() {
-        if i < keep {
-            continue;
-        }
-        // Never delete what `current` or `previous` resolves to, even if
-        // it falls outside the keep window — symlinks would dangle.
-        if active.as_deref() == Some(v.name.as_str())
-            || prev_target.as_deref() == Some(v.name.as_str())
+fn prune_unlocked(cache_root: &Path, keep: usize) -> Result<usize> {
+    let keep = keep.max(1);
+    let mut versions = list_versions(cache_root)?;
+    versions.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(b.name.cmp(&a.name)));
+    let active = resolve_cache_link(cache_root, "current")?.map(|cdm| cdm.version().to_string());
+    let previous = resolve_cache_link(cache_root, "previous")?.map(|cdm| cdm.version().to_string());
+    let mut deleted = 0;
+
+    for (index, version) in versions.iter().enumerate() {
+        if index < keep
+            || active.as_deref() == Some(version.name.as_str())
+            || previous.as_deref() == Some(version.name.as_str())
         {
             continue;
         }
-        if std::fs::remove_dir_all(&v.path).is_ok() {
-            deleted += 1;
+        std::fs::remove_dir_all(&version.path).map_err(Error::from)?;
+        deleted += 1;
+    }
+
+    for entry in std::fs::read_dir(cache_root).map_err(Error::from)? {
+        let entry = entry.map_err(Error::from)?;
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".staging-"))
+        {
+            remove_cache_entry(&path)?;
         }
     }
-    // Clean up orphan staging dirs regardless of `keep`.
-    if let Ok(entries) = std::fs::read_dir(cache_root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                if name.starts_with(".staging-") {
-                    let _ = std::fs::remove_dir_all(&path);
+
+    let downloads_dir = cache_root.join("downloads");
+    match std::fs::read_dir(&downloads_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry.map_err(Error::from)?.path();
+                if path.extension().and_then(|extension| extension.to_str()) == Some("crx3") {
+                    remove_cache_entry(&path)?;
                 }
             }
         }
-    }
-    // Sweep stale CRX3 archives left behind by earlier silvervine versions
-    // (pre-cleanup-on-success) under <cache_root>/downloads/. Each is
-    // ~5–7 MB and they accumulate per CDM upgrade.
-    let downloads_dir = cache_root.join("downloads");
-    if let Ok(entries) = std::fs::read_dir(&downloads_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("crx3") {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(Error::from(error)),
     }
     Ok(deleted)
 }
 
-/// Recompute SHA-512 of cached `libwidevinecdm.{so,dylib}` files for the
-/// platform key in `against` and confirm they match.
+/// Recompute the active library's SHA-512 against metadata persisted when the
+/// verified archive entered the cache.
 ///
-/// Used by the daemon's weekly integrity tick (Phase 3) and by the
-/// `silvervine doctor` command (Phase 4). On detection of a mismatch the
-/// caller is expected to redownload — this function only reports.
+/// `against` remains part of the stable API and confirms that the requested
+/// platform exists, but integrity no longer depends on a remote manifest.
 ///
 /// # Errors
 ///
-/// `HashMismatch` on detection of any cached file whose hash drifts from
-/// the manifest. `Other` for I/O failures.
+/// `HashMismatch` on content drift; `StateCorrupted` on invalid metadata.
 pub fn verify_integrity(against: &Manifest) -> Result<()> {
     let Some(root) = default_cache_root() else {
         return Ok(());
     };
     let platform = crate::widevine::manifest::current_platform_key()?;
-    verify_integrity_with(against, platform, &root)
+    let _ = against.resolve_platform(platform)?;
+    CdmCache::new(root, platform).verify_integrity()
+}
+
+/// Verify the active CDM using only its persisted local integrity metadata.
+///
+/// # Errors
+///
+/// `HashMismatch` on content drift; `StateCorrupted` on invalid metadata.
+pub fn verify_current_integrity() -> Result<()> {
+    let Some(root) = default_cache_root() else {
+        return Ok(());
+    };
+    let platform = crate::widevine::manifest::current_platform_key()?;
+    CdmCache::new(root, platform).verify_integrity()
 }
 
 /// Test-friendly variant: caller supplies the platform key and cache root.
@@ -358,32 +505,13 @@ pub fn verify_integrity_with(
     cache_root: &Path,
 ) -> Result<()> {
     let _ = manifest.resolve_platform(platform)?;
-    let Some(cdm) = current_in(cache_root)? else {
-        // Nothing cached → trivially integral.
-        return Ok(());
-    };
-    integrity_check_dir(cdm.cdm_dir(), platform)
+    CdmCache::new(cache_root, platform).verify_integrity()
 }
 
-/// Verify the Widevine `.so`/`.dylib` under `cdm_dir` matches the manifest
-/// hash. Walks `_platform_specific/*/libwidevinecdm.*` — this is the only
-/// file that has a stable manifest hash. The CRX3 hash applies to the
-/// whole `.crx3` file, so we don't try to recompute that for an extracted
-/// directory.
-///
-/// We treat the *manifest-level* SHA-512 as the source of truth for the
-/// CRX3 contents; for the extracted form, we settle for "the file exists
-/// and is non-empty." A future enhancement: ship a per-file hash table
-/// (Mozilla's manifest doesn't, but we could compute one at extract time
-/// and persist it alongside the CDM).
+/// Validate the platform directory and non-empty Widevine library.
 fn integrity_check_dir(cdm_dir: &Path, platform: Platform) -> Result<()> {
-    let (platform_name, library) = match platform {
-        Platform::LinuxX86_64 => ("linux_x64", "libwidevinecdm.so"),
-        Platform::DarwinAarch64 => ("mac_arm64", "libwidevinecdm.dylib"),
-        Platform::DarwinX86_64 => ("mac_x64", "libwidevinecdm.dylib"),
-    };
-    let platform_root = cdm_dir.join("_platform_specific");
-    let platform_dir = platform_root.join(platform_name);
+    let platform_root = cdm_dir.join(PLATFORM_SPECIFIC_DIRECTORY);
+    let platform_dir = platform_root.join(platform_directory(platform));
     for directory in [cdm_dir, platform_root.as_path(), platform_dir.as_path()] {
         let metadata = bundle_metadata(directory)?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -394,7 +522,7 @@ fn integrity_check_dir(cdm_dir: &Path, platform: Platform) -> Result<()> {
         }
     }
 
-    let library_path = platform_dir.join(library);
+    let library_path = widevine_library_path(cdm_dir, platform);
     let metadata = bundle_metadata(&library_path)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(Error::unknown_bundle_structure(format!(
@@ -411,10 +539,15 @@ fn integrity_check_dir(cdm_dir: &Path, platform: Platform) -> Result<()> {
     Ok(())
 }
 
-fn validate_cached_cdm(cdm: &CachedCdm, platform: Platform) -> Result<()> {
+fn validate_cached_cdm(cdm: &CachedCdm, platform: Platform) -> Result<CacheMetadata> {
+    validate_extracted_cdm(cdm, platform)?;
+    read_cache_metadata(cdm, platform)
+}
+
+fn validate_extracted_cdm(cdm: &CachedCdm, platform: Platform) -> Result<()> {
     validate_version(cdm.version())?;
     integrity_check_dir(cdm.cdm_dir(), platform)?;
-    let manifest_path = cdm.cdm_dir().join("manifest.json");
+    let manifest_path = cdm.cdm_dir().join(CDM_MANIFEST_FILENAME);
     let manifest_meta = bundle_metadata(&manifest_path)?;
     if !manifest_meta.is_file() || manifest_meta.file_type().is_symlink() {
         return Err(Error::unknown_bundle_structure(format!(
@@ -422,14 +555,7 @@ fn validate_cached_cdm(cdm: &CachedCdm, platform: Platform) -> Result<()> {
             manifest_path.display()
         )));
     }
-    let body = std::fs::read_to_string(&manifest_path).map_err(Error::from)?;
-    let manifest: serde_json::Value = serde_json::from_str(&body)?;
-    let Some(version) = manifest.get("version").and_then(serde_json::Value::as_str) else {
-        return Err(Error::state_corrupted(format!(
-            "{} has no string version field",
-            manifest_path.display()
-        )));
-    };
+    let version = crate::widevine::manifest::read_installed_cdm_version(&manifest_path)?;
     if version != cdm.version() {
         return Err(Error::state_corrupted(format!(
             "cached Widevine version {version} does not match cache directory {}",
@@ -437,6 +563,118 @@ fn validate_cached_cdm(cdm: &CachedCdm, platform: Platform) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn cache_metadata_missing(cdm: &CachedCdm) -> Result<bool> {
+    let path = cdm.cdm_dir().join(CACHE_METADATA_FILENAME);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => {
+            Err(Error::from(error).with_context(format!("could not inspect {}", path.display())))
+        }
+    }
+}
+
+/// Persist the baseline hash for a structurally valid pre-metadata cache.
+///
+/// Callers must hold the cache mutation lock. Existing metadata, including a
+/// malformed file or symlink, is never replaced by this migration.
+fn migrate_cache_metadata_if_missing(cdm: &CachedCdm, platform: Platform) -> Result<bool> {
+    if !cache_metadata_missing(cdm)? {
+        return Ok(false);
+    }
+    validate_extracted_cdm(cdm, platform)?;
+    write_cache_metadata(cdm, platform)?;
+    tracing::info!(
+        version = cdm.version(),
+        path = %cdm.cdm_dir().display(),
+        "created integrity metadata for existing Widevine cache"
+    );
+    Ok(true)
+}
+
+fn write_cache_metadata(cdm: &CachedCdm, platform: Platform) -> Result<()> {
+    let library_path = widevine_library_path(cdm.cdm_dir(), platform);
+    let library_size = bundle_metadata(&library_path)?.len();
+    let metadata = CacheMetadata {
+        schema_version: CACHE_METADATA_SCHEMA,
+        version: cdm.version().to_string(),
+        platform: platform_identifier(platform).to_string(),
+        library_size,
+        library_sha512: download::sha512_file(&library_path)?,
+    };
+    let path = cdm.cdm_dir().join(CACHE_METADATA_FILENAME);
+    let mut body = serde_json::to_vec_pretty(&metadata)?;
+    body.push(b'\n');
+    crate::platform::atomic_write(&path, &body)
+}
+
+fn read_cache_metadata(cdm: &CachedCdm, platform: Platform) -> Result<CacheMetadata> {
+    let path = cdm.cdm_dir().join(CACHE_METADATA_FILENAME);
+    let metadata = bundle_metadata(&path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(Error::state_corrupted(format!(
+            "{} is not a regular integrity metadata file",
+            path.display()
+        )));
+    }
+    let file = std::fs::File::open(&path).map_err(Error::from)?;
+    let metadata: CacheMetadata =
+        serde_json::from_reader(std::io::BufReader::new(file)).map_err(Error::from)?;
+    if metadata.schema_version != CACHE_METADATA_SCHEMA
+        || metadata.version != cdm.version()
+        || metadata.platform != platform_identifier(platform)
+        || metadata.library_size == 0
+        || metadata.library_sha512.len() != 128
+        || !metadata
+            .library_sha512
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(Error::state_corrupted(format!(
+            "{} contains invalid integrity metadata",
+            path.display()
+        )));
+    }
+    Ok(metadata)
+}
+
+fn verify_cached_integrity(cdm: &CachedCdm, platform: Platform) -> Result<()> {
+    let expected = validate_cached_cdm(cdm, platform)?;
+    let library_path = widevine_library_path(cdm.cdm_dir(), platform);
+    let actual_size = bundle_metadata(&library_path)?.len();
+    if actual_size != expected.library_size {
+        return Err(Error::hash_mismatch(format!(
+            "{} size changed from {} to {} bytes",
+            library_path.display(),
+            expected.library_size,
+            actual_size
+        )));
+    }
+    let actual_hash = download::sha512_file(&library_path)?;
+    if !actual_hash.eq_ignore_ascii_case(&expected.library_sha512) {
+        return Err(Error::hash_mismatch(format!(
+            "{} SHA-512 does not match persisted cache metadata",
+            library_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn widevine_library_path(cdm_dir: &Path, platform: Platform) -> PathBuf {
+    cdm_dir
+        .join(PLATFORM_SPECIFIC_DIRECTORY)
+        .join(platform_directory(platform))
+        .join(platform_library(platform))
+}
+
+fn platform_identifier(platform: Platform) -> &'static str {
+    match platform {
+        Platform::LinuxX86_64 => "linux-x86_64",
+        Platform::DarwinAarch64 => "darwin-aarch64",
+        Platform::DarwinX86_64 => "darwin-x86_64",
+    }
 }
 
 fn bundle_metadata(path: &Path) -> Result<std::fs::Metadata> {
@@ -565,25 +803,45 @@ fn list_versions(cache_root: &Path) -> Result<Vec<VersionEntry>> {
 /// * Both symlinks are *relative* to the cache root.
 fn advance_current(cache_root: &Path, new_version: &str) -> Result<()> {
     validate_version(new_version)?;
-    let cur_link = cache_root.join("current");
-    let prev_link = cache_root.join("previous");
-    let cur_target_name = resolve_cache_link(cache_root, "current")
-        .ok()
-        .flatten()
-        .map(|cdm| cdm.version().to_string());
-
-    if let Some(prev_name) = cur_target_name {
-        // Only demote if the previous current was a different version.
-        if prev_name != new_version {
-            remove_cache_link(&prev_link)?;
-            relative_symlink(&prev_name, &prev_link)?;
-        }
-    } else {
-        remove_cache_link(&prev_link)?;
+    let current = resolve_cache_link(cache_root, "current")?;
+    if current
+        .as_ref()
+        .is_some_and(|cdm| cdm.version() == new_version)
+    {
+        return Ok(());
     }
 
-    remove_cache_link(&cur_link)?;
-    relative_symlink(new_version, &cur_link)?;
+    if let Some(current) = current {
+        replace_cache_link(cache_root, "previous", current.version())?;
+    } else {
+        remove_cache_link(&cache_root.join("previous"))?;
+    }
+    replace_cache_link(cache_root, "current", new_version)
+}
+
+fn replace_cache_link(cache_root: &Path, name: &str, target: &str) -> Result<()> {
+    validate_version(target)?;
+    let link = cache_root.join(name);
+    if let Ok(metadata) = std::fs::symlink_metadata(&link) {
+        if !metadata.file_type().is_symlink() {
+            return Err(Error::state_corrupted(format!(
+                "{} is not a cache symlink",
+                link.display()
+            )));
+        }
+    }
+
+    let staged = cache_root.join(format!(".{name}.new"));
+    remove_cache_entry(&staged)?;
+    relative_symlink(target, &staged)?;
+    if let Err(error) = std::fs::rename(&staged, &link) {
+        let _ = remove_cache_entry(&staged);
+        return Err(Error::from(error).with_context(format!(
+            "replace cache symlink {} -> {}",
+            link.display(),
+            target
+        )));
+    }
     Ok(())
 }
 
@@ -599,24 +857,6 @@ fn relative_symlink(_target: &str, _link: &Path) -> Result<()> {
     Err(Error::unsupported_platform(
         "symlink creation is only supported on Unix",
     ))
-}
-
-/// Internal context-prepending error helper. Same shape as `lockfile`'s
-/// version — kept private so we don't create a third public version.
-trait ErrorContext {
-    fn with_context(self, ctx: impl Into<String>) -> Self;
-}
-
-impl ErrorContext for Error {
-    fn with_context(mut self, ctx: impl Into<String>) -> Self {
-        let ctx = ctx.into();
-        if self.message.is_empty() {
-            self.message = ctx;
-        } else {
-            self.message = format!("{ctx}: {}", self.message);
-        }
-        self
-    }
 }
 
 #[cfg(test)]
@@ -666,6 +906,8 @@ mod tests {
             format!(r#"{{"version":"{version}"}}"#),
         )
         .expect("write manifest");
+        let cdm = CachedCdm::new(version.to_string(), dir.clone());
+        write_cache_metadata(&cdm, Platform::LinuxX86_64).expect("write metadata");
         dir
     }
 
@@ -688,6 +930,36 @@ mod tests {
 
         assert_eq!(current.version(), "1.0.0");
         assert_eq!(current.cdm_dir(), expected);
+    }
+
+    #[test]
+    fn validated_current_migrates_missing_integrity_metadata() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cdm = make_cached_version(tmp.path(), "1.0.0");
+        let metadata_path = cdm.join(CACHE_METADATA_FILENAME);
+        fs::remove_file(&metadata_path).expect("remove metadata");
+        advance_current(tmp.path(), "1.0.0").expect("advance");
+
+        let current = validated_current_in(tmp.path(), Platform::LinuxX86_64)
+            .expect("legacy metadata migration")
+            .expect("current");
+
+        assert_eq!(current.version(), "1.0.0");
+        assert!(metadata_path.is_file());
+        read_cache_metadata(&current, Platform::LinuxX86_64).expect("valid migrated metadata");
+    }
+
+    #[test]
+    fn validated_current_rejects_malformed_integrity_metadata() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cdm = make_cached_version(tmp.path(), "1.0.0");
+        fs::write(cdm.join(CACHE_METADATA_FILENAME), b"{}").expect("corrupt metadata");
+        advance_current(tmp.path(), "1.0.0").expect("advance");
+
+        let error =
+            validated_current_in(tmp.path(), Platform::LinuxX86_64).expect_err("metadata invalid");
+
+        assert_eq!(error.category, crate::ErrorCategory::StateCorrupted);
     }
 
     #[test]
@@ -737,6 +1009,7 @@ mod tests {
             )
             .expect("manifest");
             let cached = CachedCdm::new(version.into(), cdm);
+            write_cache_metadata(&cached, platform).expect("metadata");
             validate_cached_cdm(&cached, platform).expect("platform cache");
         }
 
@@ -807,6 +1080,38 @@ mod tests {
         // After rollback, previous now points at 2.0.0.
         let prev = std::fs::read_link(tmp.path().join("previous")).expect("read");
         assert_eq!(prev.file_name().and_then(|s| s.to_str()), Some("2.0.0"));
+    }
+
+    #[test]
+    fn cache_rollback_rejects_tampered_previous_version() {
+        let tmp = TempDir::new().expect("tempdir");
+        let previous = make_cached_version(tmp.path(), "1.0.0");
+        make_cached_version(tmp.path(), "2.0.0");
+        advance_current(tmp.path(), "1.0.0").expect("first");
+        advance_current(tmp.path(), "2.0.0").expect("second");
+        fs::write(
+            previous.join("_platform_specific/linux_x64/libwidevinecdm.so"),
+            b"tampered",
+        )
+        .expect("tamper previous");
+
+        let error = CdmCache::new(tmp.path(), Platform::LinuxX86_64)
+            .rollback()
+            .expect_err("tampered rollback target must fail");
+
+        assert_eq!(error.category, crate::ErrorCategory::HashMismatch);
+        assert_eq!(
+            current_in(tmp.path())
+                .expect("read current")
+                .expect("current")
+                .version(),
+            "2.0.0"
+        );
+        let previous_link = fs::read_link(tmp.path().join("previous")).expect("read previous");
+        assert_eq!(
+            previous_link.file_name().and_then(|name| name.to_str()),
+            Some("1.0.0")
+        );
     }
 
     #[test]
@@ -928,6 +1233,25 @@ mod tests {
         advance_current(tmp.path(), "1.0").expect("advance");
         let manifest = synthetic_manifest(b"unused", "1.0");
         verify_integrity_with(&manifest, Platform::LinuxX86_64, tmp.path()).expect("integrity ok");
+    }
+
+    #[test]
+    fn persisted_integrity_hash_detects_nonempty_library_tampering() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = make_cached_version(tmp.path(), "1.0");
+        advance_current(tmp.path(), "1.0").expect("advance");
+        fs::write(
+            dir.join("_platform_specific/linux_x64/libwidevinecdm.so"),
+            b"different-but-non-empty",
+        )
+        .expect("tamper");
+
+        let cache = CdmCache::new(tmp.path(), Platform::LinuxX86_64);
+        let error = cache
+            .verify_integrity()
+            .expect_err("non-empty tampering must fail");
+
+        assert_eq!(error.category, crate::ErrorCategory::HashMismatch);
     }
 
     #[test]
@@ -1122,6 +1446,7 @@ mod tests {
         assert_eq!(cdm.version(), "1.2.3");
         assert!(cdm.cdm_dir().exists());
         assert!(cdm.cdm_dir().join("manifest.json").exists());
+        assert!(cdm.cdm_dir().join(CACHE_METADATA_FILENAME).exists());
         let so = cdm
             .cdm_dir()
             .join("_platform_specific")

@@ -123,6 +123,18 @@ impl Error {
         self
     }
 
+    /// Prepend operation context while preserving category and source chain.
+    #[must_use]
+    pub fn with_context(mut self, context: impl Into<String>) -> Self {
+        let context = context.into();
+        if self.message.is_empty() {
+            self.message = context;
+        } else {
+            self.message = format!("{context}: {}", self.message);
+        }
+        self
+    }
+
     /// Construct a [`ErrorCategory::PermissionDenied`] error.
     pub fn permission_denied(message: impl Into<String>) -> Self {
         Self::new(ErrorCategory::PermissionDenied, message)
@@ -332,6 +344,21 @@ mod tests {
         assert!(err.source.is_some());
         let chain = std::error::Error::source(&err);
         assert!(chain.is_some());
+    }
+
+    #[test]
+    fn with_context_prepends_message_without_losing_category_or_source() {
+        let error =
+            Error::from(std::io::Error::other("disk failed")).with_context("write state file");
+
+        assert_eq!(error.category, ErrorCategory::Other);
+        assert_eq!(error.message, "write state file: disk failed");
+        assert!(error.source.is_some());
+
+        assert_eq!(
+            Error::other("").with_context("read config").message,
+            "read config"
+        );
     }
 
     #[test]

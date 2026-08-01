@@ -128,9 +128,7 @@ fn render_text(entries: &[ListEntry], out: &mut dyn Write) -> std::io::Result<()
 
 /// Render entries as a JSON array.
 fn render_json(entries: &[ListEntry], out: &mut dyn Write) -> Result<()> {
-    let s = serde_json::to_string_pretty(entries)?;
-    writeln!(out, "{s}").map_err(crate::error::Error::from)?;
-    Ok(())
+    super::write_json(out, entries)
 }
 
 /// CLI entry point.

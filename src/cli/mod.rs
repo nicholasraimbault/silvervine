@@ -16,7 +16,7 @@
 //! | [`status`] | `silvervine status` |
 //! | [`list_browsers`] | `silvervine list-browsers` |
 //! | [`doctor`] | `silvervine doctor` |
-//! | [`test`] | `silvervine test` (EME health check) |
+//! | [`mod@test`] | `silvervine test` (EME health check) |
 //! | [`update`] | `silvervine update {widevine,self}` |
 //! | [`repair`] | `silvervine repair` |
 //! | [`launch`] | `silvervine launch <browser>` |
@@ -37,6 +37,12 @@
 //! * `SILVERVINE_TEST_ESCALATE_NOOP=1` — already honored at the platform
 //!   layer; CLI subcommands inherit the gate.
 
+use std::io::Write;
+
+use serde::Serialize;
+
+use crate::error::{Error, Result};
+
 pub mod completion;
 pub mod doctor;
 pub mod init;
@@ -50,6 +56,12 @@ pub mod status;
 pub mod test;
 pub mod uninstall;
 pub mod update;
+
+/// Stream pretty JSON directly to the destination and terminate the record.
+fn write_json<T: Serialize + ?Sized>(out: &mut dyn Write, value: &T) -> Result<()> {
+    serde_json::to_writer_pretty(&mut *out, value)?;
+    writeln!(out).map_err(Error::from)
+}
 
 /// Common output style flags that apply to every subcommand.
 ///

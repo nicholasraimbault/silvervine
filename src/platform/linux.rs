@@ -125,7 +125,7 @@ pub(super) fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
         // No exchange needed if the destination doesn't yet exist —
         // a plain rename is already atomic.
         std::fs::rename(src, dst).map_err(|e| {
-            Error::from(e).message_or(format!(
+            Error::from(e).with_context(format!(
                 "rename({} -> {}) failed",
                 src.display(),
                 dst.display()
@@ -135,7 +135,7 @@ pub(super) fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
     }
     match exchange_renameat2(src, dst) {
         Ok(()) => Ok(()),
-        Err(e) if e.is_invalid_argument() => fallback_two_step_rename(src, dst),
+        Err(e) if e.is_invalid_argument() => super::fallback_exchange(src, dst),
         Err(e) => Err(e.into_error(src, dst)),
     }
 }
@@ -158,7 +158,7 @@ impl ExchangeError {
             Self::InvalidArgument => std::io::Error::from(std::io::ErrorKind::InvalidInput),
             Self::Other(e) => e,
         };
-        Error::from(io_err).message_or(format!(
+        Error::from(io_err).with_context(format!(
             "atomic_rename({} <-> {}) failed",
             src.display(),
             dst.display()
@@ -215,73 +215,12 @@ fn exchange_renameat2(src: &Path, dst: &Path) -> std::result::Result<(), Exchang
     }
 }
 
-/// `RENAME_EXCHANGE` from `<linux/fs.h>`. Hardcoded to keep the libc
-/// dependency surface small (newer libc versions expose it as
-/// `libc::RENAME_EXCHANGE`, but our MSRV may target older).
+/// `RENAME_EXCHANGE` from `<linux/fs.h>`. `libc` does not expose this constant
+/// consistently across every Linux target we support.
 const RENAME_EXCHANGE: libc::c_uint = 2;
 
 fn io_invalid(e: std::ffi::NulError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-}
-
-/// Fallback when `RENAME_EXCHANGE` is unsupported: rename `dst` aside,
-/// move `src` into place, then remove the saved `dst`.
-///
-/// This is atomic in the common case (a `kill -9` between steps 2 and 3
-/// leaves `dst` correctly populated and `dst.silvervine-tmp` as orphan to
-/// clean up). It's not crash-safe in the strict sense — a power loss
-/// between step 1 and step 2 leaves `dst` missing.
-fn fallback_two_step_rename(src: &Path, dst: &Path) -> Result<()> {
-    let backup = dst.with_extension("silvervine-tmp");
-    std::fs::rename(dst, &backup).map_err(|e| {
-        Error::from(e).message_or(format!(
-            "fallback rename: could not move {} aside",
-            dst.display()
-        ))
-    })?;
-    if let Err(e) = std::fs::rename(src, dst) {
-        // Best-effort: try to restore the original from the backup so
-        // we don't leave the user with a missing browser bundle.
-        let _ = std::fs::rename(&backup, dst);
-        return Err(Error::from(e).message_or(format!(
-            "fallback rename: could not move {} into {}",
-            src.display(),
-            dst.display()
-        )));
-    }
-    // Step 3 is best-effort: orphaning `backup` is recoverable but not
-    // a hard error.
-    let _ = remove_path(&backup);
-    Ok(())
-}
-
-/// Recursively remove a file or directory at `p`.
-fn remove_path(p: &Path) -> std::io::Result<()> {
-    let meta = std::fs::symlink_metadata(p)?;
-    if meta.file_type().is_dir() {
-        std::fs::remove_dir_all(p)
-    } else {
-        std::fs::remove_file(p)
-    }
-}
-
-trait MessageOr {
-    fn message_or(self, fallback: String) -> Self;
-}
-
-impl MessageOr for Error {
-    /// Replace the inner message of an [`Error`] when the existing one
-    /// is empty (which happens when `From<io::Error>` produces only the
-    /// raw `io::Error` text). Useful for adding a path context without
-    /// losing the io error's `source`.
-    fn message_or(mut self, fallback: String) -> Self {
-        if self.message.is_empty() {
-            self.message = fallback;
-        } else {
-            self.message = format!("{fallback}: {}", self.message);
-        }
-        self
-    }
 }
 
 #[cfg(test)]
@@ -378,8 +317,8 @@ mod tests {
         let dst = tmp.path().join("dst");
         fs::write(&src, b"new").unwrap();
         fs::write(&dst, b"old").unwrap();
-        fallback_two_step_rename(&src, &dst).expect("fallback ok");
-        assert!(!src.exists(), "src consumed");
+        super::super::fallback_exchange(&src, &dst).expect("fallback ok");
+        assert_eq!(fs::read(&src).unwrap(), b"old");
         assert_eq!(fs::read(&dst).unwrap(), b"new");
     }
 
@@ -391,23 +330,9 @@ mod tests {
         fs::write(&dst, b"old").unwrap();
         // Step 1 succeeds (rename dst -> backup), step 2 fails because
         // src doesn't exist; the function must restore dst from backup.
-        let r = fallback_two_step_rename(&src, &dst);
+        let r = super::super::fallback_exchange(&src, &dst);
         assert!(r.is_err());
         assert!(dst.exists(), "dst must be restored on failure");
-    }
-
-    #[test]
-    fn message_or_appends_to_existing_message() {
-        let mut err = Error::other("boom");
-        err = err.message_or("context".into());
-        assert_eq!(err.message, "context: boom");
-    }
-
-    #[test]
-    fn message_or_replaces_empty_message() {
-        let mut err = Error::other("");
-        err = err.message_or("context".into());
-        assert_eq!(err.message, "context");
     }
 
     /// Direct test of the renameat2 wrapper: should succeed on tmpfs.
@@ -488,20 +413,5 @@ mod tests {
         let nul_err = std::ffi::CString::new("a\0b").unwrap_err();
         let io_err = super::io_invalid(nul_err);
         assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidInput);
-    }
-
-    /// `remove_path` removes both files and directories.
-    #[test]
-    fn remove_path_handles_files_and_dirs() {
-        let tmp = TempDir::new().expect("tempdir");
-        let f = tmp.path().join("file");
-        fs::write(&f, b"x").unwrap();
-        super::remove_path(&f).expect("remove file ok");
-        assert!(!f.exists());
-        let d = tmp.path().join("d");
-        fs::create_dir_all(d.join("nested")).unwrap();
-        fs::write(d.join("nested/x"), b"x").unwrap();
-        super::remove_path(&d).expect("remove dir ok");
-        assert!(!d.exists());
     }
 }

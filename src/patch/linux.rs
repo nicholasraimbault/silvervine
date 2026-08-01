@@ -7,9 +7,10 @@
 //! No codesign, no `xattr -cr` — those are macOS concerns. The Linux
 //! patch is conceptually:
 //!
-//! 1. `mkdir -p <install_path>/WidevineCdm`
-//! 2. recursive copy from `<cdm_source>` into `<install_path>/WidevineCdm`
-//! 3. chmod each file to 0644 / each directory to 0755
+//! 1. Build and verify a complete `WidevineCdm` under a temporary directory
+//!    inside the install root.
+//! 2. Apply mode 0644 to files, 0755 to directories and the CDM library.
+//! 3. Atomically exchange the staged directory with the live `WidevineCdm`.
 //!
 //! ## Verification
 //!
@@ -35,6 +36,9 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::patch::PlatformPatcher;
+use crate::widevine::{
+    platform_directory, platform_library, Platform, PLATFORM_SPECIFIC_DIRECTORY,
+};
 
 /// Linux platform patcher.
 ///
@@ -64,13 +68,17 @@ impl PlatformPatcher for LinuxPatcher {
     fn read_browser_version(&self, target: &Path) -> Option<String> {
         read_browser_version_at(target)
     }
+
+    fn writes_transactionally(&self) -> bool {
+        true
+    }
 }
 
 /// Where the Linux patch puts the CDM, relative to the browser's install path.
 ///
 /// Exposed publicly so the daemon's "is patched" check (Phase 3) can
 /// look at the same location.
-pub const CDM_SUBDIR: &str = "WidevineCdm";
+pub const CDM_SUBDIR: &str = crate::widevine::CDM_BUNDLE_DIRECTORY;
 
 /// File mode for regular files inside `WidevineCdm/`.
 const FILE_MODE: u32 = 0o644;
@@ -94,19 +102,57 @@ fn write_cdm_into(target: &Path, cdm_source: &Path) -> Result<()> {
             target.display()
         )));
     }
-    let dest = target.join(CDM_SUBDIR);
-    // Idempotent: if `WidevineCdm/` already exists from a prior patch,
-    // remove it so the new copy starts fresh. We hold the patch lockfile
-    // (the orchestrator acquired it) so no other Silvervine invocation can be
-    // racing here.
-    if dest.exists() {
-        fs::remove_dir_all(&dest)
-            .map_err(|e| context_err(e, format!("could not clear {}", dest.display())))?;
+
+    replace_cdm_transactionally(target, |staged| copy_recursive(cdm_source, staged))
+}
+
+fn replace_cdm_transactionally<F>(target: &Path, populate: F) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let staging = tempfile::Builder::new()
+        .prefix(".silvervine-widevine-")
+        .tempdir_in(target)
+        .map_err(|error| {
+            context_err(
+                error,
+                format!("could not create staging directory in {}", target.display()),
+            )
+        })?;
+    let staged = staging.path().join(CDM_SUBDIR);
+    fs::create_dir(&staged)
+        .map_err(|error| context_err(error, format!("could not create {}", staged.display())))?;
+    set_permissions(&staged, DIR_MODE)?;
+    populate(&staged)?;
+    verify_cdm_at(staging.path())?;
+
+    let destination = target.join(CDM_SUBDIR);
+    let replaced_existing = destination.exists();
+    crate::platform::atomic_rename(&staged, &destination)?;
+    if let Err(verify_error) = verify_cdm_at(target) {
+        let rollback = if replaced_existing {
+            crate::platform::atomic_rename(&staged, &destination)
+        } else {
+            fs::remove_dir_all(&destination).map_err(Error::from)
+        };
+        if let Err(rollback_error) = rollback {
+            let category = verify_error.category;
+            let message = format!(
+                "{}; rollback also failed: {rollback_error}",
+                verify_error.message
+            );
+            return Err(Error::new(category, message).with_source(rollback_error));
+        }
+        return Err(verify_error);
     }
-    fs::create_dir_all(&dest)
-        .map_err(|e| context_err(e, format!("could not create {}", dest.display())))?;
-    set_permissions(&dest, DIR_MODE)?;
-    copy_recursive(cdm_source, &dest)?;
+
+    if let Err(error) = staging.close() {
+        tracing::warn!(
+            path = %target.display(),
+            error = %error,
+            "could not remove retired Linux CDM staging directory"
+        );
+    }
     Ok(())
 }
 
@@ -146,7 +192,7 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
             })?;
             // The CDM library itself needs to be executable so the
             // browser can mmap it; everything else is plain data.
-            let mode = if name == "libwidevinecdm.so" {
+            let mode = if name == platform_library(Platform::LinuxX86_64) {
                 CDM_SO_MODE
             } else {
                 FILE_MODE
@@ -163,9 +209,9 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
 fn verify_cdm_at(target: &Path) -> Result<()> {
     let so = target
         .join(CDM_SUBDIR)
-        .join("_platform_specific")
-        .join("linux_x64")
-        .join("libwidevinecdm.so");
+        .join(PLATFORM_SPECIFIC_DIRECTORY)
+        .join(platform_directory(Platform::LinuxX86_64))
+        .join(platform_library(Platform::LinuxX86_64));
     if !so.exists() {
         return Err(Error::unknown_bundle_structure(format!(
             "post-patch verify: missing {}",
@@ -261,9 +307,9 @@ fn is_executable(p: &Path) -> bool {
 
 /// Best-effort spawn of `binary --version` with a `timeout`-style wait.
 ///
-/// Returns the trimmed first line of stdout on success. We can't use
-/// `Command::output()` directly with a timeout (stdlib doesn't ship that
-/// as of MSRV 1.85), so we use a simple thread-based wait pattern.
+/// Returns the trimmed first line of stdout on success. The standard library
+/// has no timeout-aware `Command::output`, so we use a simple thread-based
+/// wait pattern.
 fn run_with_timeout(binary: &Path, args: &[&str], timeout: Duration) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
@@ -385,6 +431,24 @@ mod tests {
         // Stale file is gone; new CDM is in place.
         assert!(!stale.exists());
         assert!(install.join("WidevineCdm/manifest.json").exists());
+    }
+
+    #[test]
+    fn staging_failure_preserves_existing_widevine_directory() {
+        let tmp = TempDir::new().unwrap();
+        let install = make_install(tmp.path());
+        let live = install.join(CDM_SUBDIR);
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("manifest.json"), b"old").unwrap();
+
+        let result = replace_cdm_transactionally(&install, |staged| {
+            fs::write(staged.join("partial"), b"incomplete").unwrap();
+            Err(Error::other("injected staging failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(live.join("manifest.json")).unwrap(), b"old");
+        assert!(!live.join("partial").exists());
     }
 
     #[test]

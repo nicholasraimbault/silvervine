@@ -162,9 +162,7 @@ fn render_text(report: &StatusReport, out: &mut dyn Write) -> std::io::Result<()
 
 /// Render as a JSON object.
 fn render_json(report: &StatusReport, out: &mut dyn Write) -> Result<()> {
-    let s = serde_json::to_string_pretty(report)?;
-    writeln!(out, "{s}").map_err(Error::from)?;
-    Ok(())
+    super::write_json(out, report)
 }
 
 /// CLI entry point.

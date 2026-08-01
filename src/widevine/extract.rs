@@ -39,6 +39,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::widevine::{
+    platform_library, Platform, CDM_MANIFEST_FILENAME, PLATFORM_SPECIFIC_DIRECTORY,
+};
 
 /// Magic bytes at the start of every CRX3 file (`"Cr24"`).
 pub const CRX3_MAGIC: &[u8; 4] = b"Cr24";
@@ -190,14 +193,14 @@ fn extract_zip_body(zip: &[u8], out_dir: &Path) -> Result<()> {
 ///
 /// [`crate::ErrorCategory::UnknownBundleStructure`] if the layout doesn't match.
 pub fn verify_widevine_layout(extracted: &Path) -> Result<PathBuf> {
-    let manifest = extracted.join("manifest.json");
+    let manifest = extracted.join(CDM_MANIFEST_FILENAME);
     if !manifest.exists() {
         return Err(Error::unknown_bundle_structure(format!(
             "extracted CRX3 is missing manifest.json at {}",
             manifest.display()
         )));
     }
-    let plat = extracted.join("_platform_specific");
+    let plat = extracted.join(PLATFORM_SPECIFIC_DIRECTORY);
     if !plat.is_dir() {
         return Err(Error::unknown_bundle_structure(format!(
             "extracted CRX3 is missing _platform_specific/ at {}",
@@ -222,9 +225,12 @@ pub fn verify_widevine_layout(extracted: &Path) -> Result<PathBuf> {
     )))
 }
 
-/// Returns `true` if `dir` contains a `libwidevinecdm.{so,dylib}`.
+/// Returns `true` if `dir` contains a supported Widevine shared library.
 fn has_widevine_so(dir: &Path) -> bool {
-    dir.join("libwidevinecdm.so").exists() || dir.join("libwidevinecdm.dylib").exists()
+    [Platform::LinuxX86_64, Platform::DarwinAarch64]
+        .into_iter()
+        .map(platform_library)
+        .any(|library| dir.join(library).exists())
 }
 
 #[cfg(test)]
