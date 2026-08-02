@@ -10,7 +10,7 @@ Future entries are generated from
 
 ## [Unreleased]
 
-## [2.1.0] - 2026-08-01
+## [2.1.0] - 2026-08-02
 
 ### Added
 
