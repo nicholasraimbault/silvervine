@@ -227,6 +227,10 @@ fn revalidate_privileged_install_identity(
     expected.revalidate(target, parent)
 }
 
+fn publication_exchanged(staged: &Path) -> bool {
+    staged.exists()
+}
+
 fn replace_cdm_transactionally<F, V>(target: &Path, populate: F, validate_live: V) -> Result<()>
 where
     F: FnOnce(&Path) -> Result<()>,
@@ -251,18 +255,18 @@ where
     verify_cdm_at(staging.path())?;
     revalidate_privileged_install_identity(target, privileged_identity)?;
     let destination = target.join(CDM_SUBDIR);
-    let replaced_existing = destination.exists();
     crate::platform::atomic_rename(&staged, &destination)?;
+    let exchanged = publication_exchanged(&staged);
     let live_validation = revalidate_privileged_install_identity(target, privileged_identity)
         .and_then(|()| validate_live(target));
     if let Err(verify_error) = live_validation {
-        let rollback = if replaced_existing {
+        let rollback = if exchanged {
             crate::platform::atomic_rename(&staged, &destination)
         } else {
             fs::remove_dir_all(&destination).map_err(Error::from)
         };
         if let Err(rollback_error) = rollback {
-            let recovery = if replaced_existing {
+            let recovery = if exchanged {
                 Some(staging.keep())
             } else {
                 None
@@ -566,6 +570,45 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(fs::read(live.join("manifest.json")).unwrap(), b"old");
         assert!(!live.join("partial").exists());
+    }
+
+    #[test]
+    fn live_validation_failure_restores_existing_widevine_directory() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cdm = make_cdm_source(tmp.path());
+        let install = make_install(tmp.path());
+        let live = install.join(CDM_SUBDIR);
+        fs::create_dir(&live).expect("live CDM");
+        fs::write(live.join("retired"), b"old").expect("retired payload");
+
+        let error = replace_cdm_transactionally(
+            &install,
+            |staged| copy_recursive(&cdm, staged),
+            |_| Err(Error::other("injected live validation failure")),
+        )
+        .expect_err("live validation must fail");
+
+        assert_eq!(error.message, "injected live validation failure");
+        assert_eq!(fs::read(live.join("retired")).unwrap(), b"old");
+        assert!(!live.join("manifest.json").exists());
+    }
+
+    #[test]
+    fn publication_exchange_state_comes_from_post_publish_path() {
+        let tmp = TempDir::new().expect("tempdir");
+        let staged = tmp.path().join(CDM_SUBDIR);
+        fs::create_dir(&staged).expect("retired payload");
+
+        assert!(
+            publication_exchanged(&staged),
+            "a remaining staged path proves the publish exchanged payloads"
+        );
+
+        fs::remove_dir(&staged).expect("remove retired payload");
+        assert!(
+            !publication_exchanged(&staged),
+            "a consumed staged path proves the publish was a plain move"
+        );
     }
 
     #[test]

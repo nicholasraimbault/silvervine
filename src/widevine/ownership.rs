@@ -63,15 +63,19 @@ impl ValidatedInstalledCdm {
     pub fn library_path(&self) -> &Path {
         &self.library_path
     }
-    /// Whether this verified install is the same CDM release selected by a
-    /// cached candidate. The library digest may differ after a trusted
-    /// platform transformation such as macOS code signing, but the root
-    /// manifest digest must still match the parent-selected payload.
+    /// Whether this verified install matches the selected candidate identity.
+    /// macOS code signing may transform the library bytes after selection, so
+    /// macOS binds the release through version, platform, and root manifest.
+    /// Platforms without that trusted finalization require the library digest
+    /// to match as well.
     #[must_use]
     pub fn matches_candidate(&self, candidate: &ManagedMarker) -> bool {
+        let library_matches =
+            cfg!(target_os = "macos") || self.marker.library_sha512 == candidate.library_sha512;
         self.marker.cdm_version == candidate.cdm_version
             && self.marker.platform == candidate.platform
             && self.marker.manifest_sha512 == candidate.manifest_sha512
+            && library_matches
     }
 }
 
@@ -1234,7 +1238,7 @@ mod tests {
         assert_eq!(validate_installed_marker(&target).expect("valid"), marker);
     }
     #[test]
-    fn finalized_digest_still_matches_the_same_candidate_release() {
+    fn candidate_match_applies_platform_library_digest_rules() {
         let tmp = TempDir::new().expect("tempdir");
         let candidate = cached(tmp.path(), "4.10.1", b"unsigned candidate");
         let candidate_marker = marker_for_cached(&candidate).expect("candidate marker");
@@ -1250,7 +1254,10 @@ mod tests {
             installed.marker().library_sha512,
             candidate_marker.library_sha512
         );
+        #[cfg(target_os = "macos")]
         assert!(installed.matches_candidate(&candidate_marker));
+        #[cfg(not(target_os = "macos"))]
+        assert!(!installed.matches_candidate(&candidate_marker));
         let newer = cached(tmp.path(), "4.10.2", b"newer");
         assert!(!installed.matches_candidate(&marker_for_cached(&newer).unwrap()));
     }
