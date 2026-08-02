@@ -99,7 +99,7 @@ jobs:
         with:
           key: tarpaulin
       - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.5
         with:
           tool: cargo-tarpaulin
       - run: cargo tarpaulin --out Xml --workspace --skip-clean --timeout 300
