@@ -774,6 +774,7 @@ mod tests {
             );
             let accept = thread::spawn(move || {
                 let (mut inbound, _) = server.listener.accept().expect("accept");
+                inbound.set_nonblocking(false).expect("blocking");
                 let outcome = server.handle(&mut inbound).expect("handle");
                 (server, outcome)
             });
@@ -796,6 +797,7 @@ mod tests {
             );
             let accept = thread::spawn(move || {
                 let (mut inbound, _) = server.listener.accept().expect("accept2");
+                inbound.set_nonblocking(false).expect("blocking2");
                 server.handle(&mut inbound).expect("handle2")
             });
             stream.write_all(request.as_bytes()).expect("write2");
