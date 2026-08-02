@@ -1061,6 +1061,8 @@ mod tests {
     }
 
     fn cached(root: &Path, version: &str, library: &[u8]) -> CachedCdm {
+        fs::create_dir_all(root).expect("cache root");
+        let root = fs::canonicalize(root).expect("canonical cache root");
         let cdm = root.join("cache").join(version);
         write_payload(&cdm, version, library);
         let manifest_body = format!(r#"{{"name":"WidevineCdm","version":"{version}"}}"#);

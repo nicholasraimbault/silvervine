@@ -1160,8 +1160,14 @@ mod tests {
     use super::*;
     use crate::browsers::BrowserKind;
 
+    fn canonical_fixture_root(root: &Path) -> PathBuf {
+        fs::create_dir_all(root).expect("create fixture root");
+        fs::canonicalize(root).expect("canonical fixture root")
+    }
+
     /// Build a minimum [`CachedCdm`] on disk for tests.
     fn make_cached_cdm(root: &Path, version: &str) -> CachedCdm {
+        let root = canonical_fixture_root(root);
         let dir = root.join(version);
         let cdm = dir.join("_platform_specific").join(test_platform_dir());
         fs::create_dir_all(&cdm).expect("mkdir cdm");
@@ -1839,9 +1845,10 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let tmp = TempDir::new().unwrap();
-        let install = tmp.path().join("install");
-        let real_parent = tmp.path().join("trusted");
-        let linked_parent = tmp.path().join("linked");
+        let root = canonical_fixture_root(tmp.path());
+        let install = root.join("install");
+        let real_parent = root.join("trusted");
+        let linked_parent = root.join("linked");
         fs::create_dir_all(&install).unwrap();
         fs::create_dir_all(&real_parent).unwrap();
         symlink(&real_parent, &linked_parent).unwrap();
@@ -1936,11 +1943,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = TempDir::new().expect("tempdir");
-        let install = tmp.path().join("install");
+        let root = canonical_fixture_root(tmp.path());
+        let install = root.join("install");
         fs::create_dir(&install).expect("install");
-        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
 
-        let error = validate_privileged_snapshot_parent(&install, tmp.path())
+        let error = validate_privileged_snapshot_parent(&install, &root)
             .expect_err("writable parent must not be trusted across elevation");
 
         assert_eq!(error.category, crate::ErrorCategory::PermissionDenied);
@@ -1950,11 +1958,12 @@ mod tests {
     #[test]
     fn privileged_snapshot_parent_must_be_install_direct_parent() {
         let tmp = TempDir::new().expect("tempdir");
-        let direct_parent = tmp.path().join("browser-root");
+        let root = canonical_fixture_root(tmp.path());
+        let direct_parent = root.join("browser-root");
         let install = direct_parent.join("install");
         fs::create_dir_all(&install).expect("install");
 
-        let error = validate_privileged_snapshot_parent(&install, tmp.path())
+        let error = validate_privileged_snapshot_parent(&install, &root)
             .expect_err("an ancestor leaves intermediate components swappable");
 
         assert_eq!(error.category, crate::ErrorCategory::PermissionDenied);
@@ -1966,11 +1975,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = TempDir::new().expect("tempdir");
-        let install = tmp.path().join("install");
+        let root = canonical_fixture_root(tmp.path());
+        let install = root.join("install");
         fs::create_dir(&install).expect("install");
         fs::set_permissions(&install, fs::Permissions::from_mode(0o777)).expect("chmod install");
 
-        let error = validate_privileged_snapshot_parent(&install, tmp.path())
+        let error = validate_privileged_snapshot_parent(&install, &root)
             .expect_err("a writable install can be swapped below its trusted parent");
 
         assert_eq!(error.category, crate::ErrorCategory::PermissionDenied);
@@ -2030,7 +2040,8 @@ mod tests {
         let _guard = crate::test_support::env_lock();
 
         let tmp = TempDir::new().expect("tempdir");
-        let install = tmp.path().join("install");
+        let root = canonical_fixture_root(tmp.path());
+        let install = root.join("install");
         fs::create_dir_all(&install).expect("mkdir install");
         #[cfg(target_os = "macos")]
         fs::create_dir_all(
@@ -2042,7 +2053,7 @@ mod tests {
         fs::set_permissions(&install, perms).expect("chmod ro");
 
         let browser = make_browser(install.clone());
-        let cache = tmp.path().join("widevine");
+        let cache = root.join("widevine");
         let cdm = make_cached_cdm(&cache, "1.0");
         let patcher = MockPatcher::with_version("v1");
 
@@ -2091,8 +2102,9 @@ mod tests {
     #[test]
     fn privileged_handoff_carries_exact_parent_selection() {
         let tmp = TempDir::new().unwrap();
-        let install = tmp.path().join("exact custom install");
-        let cdm_root = tmp.path().join("exact cache");
+        let root = canonical_fixture_root(tmp.path());
+        let install = root.join("exact custom install");
+        let cdm_root = root.join("exact cache");
         fs::create_dir_all(&install).unwrap();
         #[cfg(target_os = "macos")]
         fs::create_dir_all(
@@ -2150,12 +2162,13 @@ mod tests {
     #[test]
     fn privileged_handoff_resolves_missing_custom_framework_in_parent() {
         let tmp = TempDir::new().unwrap();
-        let install = tmp.path().join("Custom.app");
+        let root = canonical_fixture_root(tmp.path());
+        let install = root.join("Custom.app");
         fs::create_dir_all(
             install.join("Contents/Frameworks/Selected Framework.framework/Versions/1.0/Libraries"),
         )
         .unwrap();
-        let cdm = make_cached_cdm(&tmp.path().join("cache"), "1.0");
+        let cdm = make_cached_cdm(&root.join("cache"), "1.0");
         let mut browser = make_browser(install);
         browser.framework_name = None;
 
@@ -2179,9 +2192,15 @@ mod tests {
     #[test]
     fn privileged_handoff_preserves_known_browser_kind_token() {
         let tmp = TempDir::new().unwrap();
-        let install = tmp.path().join("helium");
+        let root = canonical_fixture_root(tmp.path());
+        let install = root.join("helium");
         fs::create_dir_all(&install).unwrap();
-        let cdm = make_cached_cdm(&tmp.path().join("cache"), "1.2.3");
+        #[cfg(target_os = "macos")]
+        fs::create_dir_all(
+            install.join("Contents/Frameworks/Test Framework.framework/Versions/1.0/Libraries"),
+        )
+        .unwrap();
+        let cdm = make_cached_cdm(&root.join("cache"), "1.2.3");
         let mut browser = make_browser(install);
         browser.kind = BrowserKind::Known;
 

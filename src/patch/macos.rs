@@ -688,12 +688,16 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cdm_library_path(layout: &BundleLayout) -> PathBuf {
-    let platform = if cfg!(target_arch = "aarch64") {
+const fn cdm_platform_dir() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
         "mac_arm64"
     } else {
         "mac_x64"
-    };
+    }
+}
+
+fn cdm_library_path(layout: &BundleLayout) -> PathBuf {
+    let platform = cdm_platform_dir();
     layout
         .cdm_target
         .join("_platform_specific")
@@ -861,7 +865,7 @@ mod tests {
     /// Build a fake CDM source matching `extract::extract_crx3` output.
     fn make_cdm_source(root: &Path) -> PathBuf {
         let dir = root.join("source");
-        let mac = dir.join("_platform_specific").join("mac_x64");
+        let mac = dir.join("_platform_specific").join(cdm_platform_dir());
         fs::create_dir_all(&mac).unwrap();
         fs::write(mac.join("libwidevinecdm.dylib"), b"fake-mac-dylib").unwrap();
         fs::write(dir.join("manifest.json"), br#"{"version":"4.10.0.0"}"#).unwrap();
@@ -992,9 +996,8 @@ mod tests {
         p.write_cdm(&app, &cdm).expect("write ok");
         unsafe { std::env::remove_var("SILVERVINE_TEST_PATCH_NOOP") };
 
-        let dylib = app
-            .join("Contents/Frameworks/Thorium Framework.framework/Versions/128.0.6613.119")
-            .join("Libraries/WidevineCdm/_platform_specific/mac_x64/libwidevinecdm.dylib");
+        let layout = resolve_bundle_layout(&app).unwrap();
+        let dylib = cdm_library_path(&layout);
         assert!(dylib.exists());
         assert_eq!(fs::read(&dylib).unwrap(), b"fake-mac-dylib");
     }

@@ -241,12 +241,9 @@ mod tests {
 
     #[test]
     fn run_output_with_timeout_kills_slow_child() {
-        let output = run_output_with_timeout(
-            Path::new("/usr/bin/sleep"),
-            &["2"],
-            Duration::from_millis(40),
-        )
-        .expect("command");
+        let output =
+            run_output_with_timeout(Path::new("/bin/sleep"), &["2"], Duration::from_millis(40))
+                .expect("command");
 
         assert!(output.timed_out);
         assert!(!output.status.success());
