@@ -1,6 +1,8 @@
 //! Browser executable and passive version resolution.
 
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
@@ -84,6 +86,7 @@ pub fn passive_version(browser: &Browser) -> Option<String> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn read_nonempty(path: &Path) -> Option<String> {
     let value = std::fs::read_to_string(path).ok()?;
     let value = value.trim();
@@ -163,7 +166,7 @@ fn plist_string_value(plist: &str, key: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
@@ -171,15 +174,12 @@ fn is_executable_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
-#[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
-    path.is_file()
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::{Path, PathBuf};
+    #[cfg(target_os = "linux")]
+    use std::path::Path;
+    use std::path::PathBuf;
 
     use tempfile::TempDir;
 
@@ -293,7 +293,7 @@ mod tests {
         fs::create_dir_all(app.join("Contents/MacOS")).expect("bundle");
         fs::write(
             app.join("Contents/Info.plist"),
-            r#"<plist><dict><key>CFBundleShortVersionString</key><string>150.0.1</string></dict></plist>"#,
+            r"<plist><dict><key>CFBundleShortVersionString</key><string>150.0.1</string></dict></plist>",
         )
         .expect("plist");
 

@@ -195,37 +195,23 @@ fn videotoolbox_checks() -> Vec<DiagnosticCheck> {
 }
 
 fn videotoolbox_codec_check(id: &str, fourcc: &str, label: &str) -> DiagnosticCheck {
-    match query_videotoolbox_support(fourcc) {
-        VideoToolboxQuery::Supported(supported) => DiagnosticCheck {
-            id: format!("host.videotoolbox.{id}"),
-            status: videotoolbox_status(supported),
-            source: EvidenceSource::HostProbe,
-            failure_domain: FailureDomain::BrowserMediaStack,
-            summary: if supported {
-                format!("VideoToolbox reports hardware decode support for {label}.")
-            } else {
-                format!("VideoToolbox reports no hardware decode support for {label}.")
-            },
-            action: None,
-            details: BTreeMap::from([
-                ("codec".into(), label.into()),
-                ("fourcc".into(), fourcc.into()),
-                ("hardware_decode".into(), supported.to_string()),
-            ]),
+    let supported = query_videotoolbox_support(fourcc);
+    DiagnosticCheck {
+        id: format!("host.videotoolbox.{id}"),
+        status: videotoolbox_status(supported),
+        source: EvidenceSource::HostProbe,
+        failure_domain: FailureDomain::BrowserMediaStack,
+        summary: if supported {
+            format!("VideoToolbox reports hardware decode support for {label}.")
+        } else {
+            format!("VideoToolbox reports no hardware decode support for {label}.")
         },
-        VideoToolboxQuery::Unavailable(reason) => DiagnosticCheck {
-            id: format!("host.videotoolbox.{id}"),
-            status: DiagnosticStatus::Unavailable,
-            source: EvidenceSource::HostProbe,
-            failure_domain: FailureDomain::BrowserMediaStack,
-            summary: format!("VideoToolbox {label} query unavailable."),
-            action: None,
-            details: BTreeMap::from([
-                ("codec".into(), label.into()),
-                ("fourcc".into(), fourcc.into()),
-                ("reason".into(), reason),
-            ]),
-        },
+        action: None,
+        details: BTreeMap::from([
+            ("codec".into(), label.into()),
+            ("fourcc".into(), fourcc.into()),
+            ("hardware_decode".into(), supported.to_string()),
+        ]),
     }
 }
 
@@ -237,29 +223,12 @@ const fn videotoolbox_status(supported: bool) -> DiagnosticStatus {
     }
 }
 
-enum VideoToolboxQuery {
-    Supported(bool),
-    Unavailable(String),
-}
-
-fn query_videotoolbox_support(fourcc: &str) -> VideoToolboxQuery {
-    // Prefer the public VTIsHardwareDecodeSupported symbol when linked.
-    // On non-macOS cfg this module is not compiled. When the symbol cannot be
-    // resolved at runtime we mark the check unavailable instead of fabricating
-    // a failure.
-    #[cfg(target_os = "macos")]
-    {
-        let code = fourcc_code(fourcc);
-        // Safety: public VideoToolbox C API, no pointers exchanged.
-        let supported = unsafe { VTIsHardwareDecodeSupported(code) };
-        // Apple documents the function as Boolean; treat non-zero as true.
-        return VideoToolboxQuery::Supported(supported != 0);
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = fourcc;
-        VideoToolboxQuery::Unavailable("VideoToolbox is only available on macOS".into())
-    }
+fn query_videotoolbox_support(fourcc: &str) -> bool {
+    let code = fourcc_code(fourcc);
+    // Safety: public VideoToolbox C API, no pointers exchanged.
+    let supported = unsafe { VTIsHardwareDecodeSupported(code) };
+    // Apple documents the function as Boolean; treat non-zero as true.
+    supported != 0
 }
 
 #[cfg(target_os = "macos")]
@@ -289,7 +258,7 @@ struct ProfilerSummary {
 
 /// Parse `system_profiler SPDisplaysDataType -json` into bounded details.
 #[must_use]
-pub fn parse_system_profiler_summary(json: &str) -> ProfilerSummary {
+fn parse_system_profiler_summary(json: &str) -> ProfilerSummary {
     let mut details = BTreeMap::new();
     let mut chipset = None;
     let mut metal = None;
@@ -402,7 +371,9 @@ pub fn classify_codesign_status(success: bool, timed_out: bool) -> DiagnosticSta
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_codesign_status, fourcc_label, parse_system_profiler_summary};
+    use super::{
+        classify_codesign_status, fourcc_label, parse_system_profiler_summary, videotoolbox_status,
+    };
     use crate::diagnostics::DiagnosticStatus;
 
     #[test]

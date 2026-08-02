@@ -1819,7 +1819,7 @@ mod tests {
             provenance.failure_domain,
             crate::diagnostics::FailureDomain::BrowserMediaStack
         );
-        assert!(ownership_kind_name(diagnostics.ownership.kind) == "external");
+        assert_eq!(ownership_kind_name(diagnostics.ownership.kind), "external");
     }
 
     #[test]
