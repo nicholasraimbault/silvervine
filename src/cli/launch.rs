@@ -11,10 +11,11 @@
 //! invoked from `cargo test`.
 
 use std::io::Write;
+#[cfg(test)]
 use std::path::PathBuf;
 use std::process::Stdio;
 
-use crate::browsers::{self, Browser};
+use crate::browsers::{self, runtime::executable_path, Browser};
 use crate::cli::OutputOptions;
 use crate::error::{Error, Result};
 
@@ -52,47 +53,6 @@ pub fn decide(browser: &Browser) -> LaunchDecision {
         LaunchDecision::AlreadyPatched
     } else {
         LaunchDecision::PatchAndSpawn
-    }
-}
-
-/// Resolve the browser executable path. Mirrors `cli::test`'s logic
-/// — kept here as well so a `Plan`/`launch` round-trip doesn't require
-/// importing across submodules.
-fn browser_executable_path(browser: &Browser) -> Result<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        let app = browser.install_path();
-        let stem = app.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
-            Error::unknown_bundle_structure(format!("no bundle name for {}", app.display()))
-        })?;
-        Ok(app.join("Contents").join("MacOS").join(stem))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let install = browser.install_path();
-        let candidates = [
-            browser.name().to_lowercase(),
-            "chrome".into(),
-            "chromium".into(),
-            "chromium-browser".into(),
-        ];
-        for name in &candidates {
-            let p = install.join(name);
-            if p.is_file() {
-                return Ok(p);
-            }
-        }
-        Err(Error::unknown_bundle_structure(format!(
-            "could not locate browser executable in {}",
-            install.display()
-        )))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = browser;
-        Err(Error::unsupported_platform(
-            "browser launch is only implemented on Linux and macOS",
-        ))
     }
 }
 
@@ -151,7 +111,7 @@ pub fn run(args: &Args) -> Result<()> {
             &crate::patch::PatchOptions::default(),
         )?;
     }
-    let exe = browser_executable_path(&browser)?;
+    let exe = executable_path(&browser)?;
     writeln!(handle, "Launching {} ({})", browser.name(), exe.display()).map_err(Error::from)?;
     spawn_detached(&exe)
 }
@@ -170,6 +130,16 @@ mod tests {
             kind: BrowserKind::Detected,
             framework_name: None,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, "").unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
     }
 
     #[test]
@@ -197,9 +167,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let install = tmp.path().join("Helium");
         fs::create_dir_all(&install).unwrap();
-        fs::write(install.join("helium"), "").unwrap();
+        create_executable(&install.join("helium"));
         let b = fake_browser("Helium", install);
-        let p = browser_executable_path(&b).expect("ok");
+        let p = executable_path(&b).expect("ok");
         assert!(p.ends_with("helium"));
     }
 
@@ -209,9 +179,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let install = tmp.path().join("Helium");
         fs::create_dir_all(&install).unwrap();
-        fs::write(install.join("chrome"), "").unwrap();
+        create_executable(&install.join("chrome"));
         let b = fake_browser("Helium", install);
-        let p = browser_executable_path(&b).expect("ok");
+        let p = executable_path(&b).expect("ok");
         assert!(p.ends_with("chrome"));
     }
 
@@ -222,7 +192,7 @@ mod tests {
         let install = tmp.path().join("Helium");
         fs::create_dir_all(&install).unwrap();
         let b = fake_browser("Helium", install);
-        let r = browser_executable_path(&b);
+        let r = executable_path(&b);
         assert!(r.is_err());
     }
 
@@ -234,7 +204,7 @@ mod tests {
         fs::create_dir_all(app.join("Contents").join("MacOS")).unwrap();
         fs::write(app.join("Contents").join("MacOS").join("Helium"), "").unwrap();
         let b = fake_browser("Helium", app);
-        let p = browser_executable_path(&b).expect("ok");
+        let p = executable_path(&b).expect("ok");
         assert!(p.ends_with("MacOS/Helium"));
     }
 

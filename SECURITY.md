@@ -57,11 +57,22 @@ Silvervine V2 runs **entirely in the user session** — the daemon is a LaunchAg
 - `osascript -e "do shell script ... with administrator privileges"` on macOS — system password prompt.
 - `pkexec` (preferred) → `sudo` (fallback) on Linux — system password prompt.
 
-Both prompt the user. Both require user consent each time (Silvervine does not cache credentials). The escalated child runs only the hidden filesystem-only privileged patch operation — never discovery, configuration, network, cache, logging, hooks, or an arbitrary command. Its auditable arguments carry the parent's exact browser path, verified CDM directory/version, trusted same-filesystem backup parent, browser display name, and force decision; on macOS they also carry the exact parent-selected framework and framework version.
+Both prompt the user. Both require user consent each time (Silvervine does not cache credentials). The escalated child runs only the hidden filesystem-only privileged patch operation — never discovery, configuration, network, cache, logging, migration, or hooks. Its auditable arguments carry the parent's exact browser path, bounded parent-authenticated CDM staging payload/version, trusted same-filesystem backup parent, browser display name, and force decision; on macOS they also carry the exact parent-selected framework and framework version.
 
 User-installed browsers in `~/Applications` (macOS) or `~/.local/...` (Linux) don't require escalation. Custom-path browsers configured in `~/.config/silvervine/config.toml` follow the path's actual permissions.
 
-Silvervine ships **no** telemetry or error-reporting endpoint. The binary never POSTs failure metadata anywhere — bug reports go through GitHub Issues, full stop.
+Executable CDM trust requires a fresh manifest from one of Silvervine's fixed
+Mozilla HTTPS origins (or an explicit user-supplied source) and the manifest's
+SHA-512. Mutable manifest snapshots are write-only. Cached archives are bounded,
+opened without following symlinks, and extracted from the exact verified bytes;
+colocated cache metadata alone never authorizes a privileged patch.
+
+Silvervine ships **no telemetry or remote error-reporting endpoint**. The
+explicit `silvervine test` command POSTs its browser capability result only to
+an ephemeral server bound to `127.0.0.1`; the endpoint requires a random
+single-use URL token and same-origin request, caps request size and count, and
+expires after a fixed timeout. No probe result is sent off-device. Bug reports
+go through GitHub Issues only when the user chooses to share them.
 
 ## Known limitations
 

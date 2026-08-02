@@ -20,7 +20,7 @@
 //!   During 2.x, matching deprecated `NEON_*` aliases are exported as well.
 //!   If callers explicitly provide both names, neither value is overwritten.
 //!
-//!   Callers populate the [`HashMap`](std::collections::HashMap) passed to
+//!   Callers populate the [`HashMap`] passed to
 //!   [`run_hook`] with whichever keys apply to the event; missing keys are
 //!   simply not exported.
 //! * Standard out / standard error are captured into [`HookOutcome::Ran`]
@@ -52,9 +52,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::cli::patch::PatchReport;
 use crate::config::{load_config, Config};
 use crate::error::{Error, Result};
+use crate::patch::PatchReport;
 
 /// Outcome of a [`run_hook`] / [`run_hook_at`] call.
 #[derive(Debug)]
@@ -369,6 +369,7 @@ mod tests {
             version_after: Some("128".into()),
             dry_run: false,
             error: None,
+            error_category: None,
         };
         let context = post_patch_context(&success);
         assert_eq!(context["SILVERVINE_BROWSER"], "Helium");
@@ -384,6 +385,7 @@ mod tests {
             version_after: None,
             dry_run: false,
             error: Some("failed".into()),
+            error_category: Some(crate::ErrorCategory::Other),
         };
         let context = post_patch_context(&failure);
         assert_eq!(context["SILVERVINE_OUTCOME"], "failure");

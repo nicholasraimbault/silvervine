@@ -33,7 +33,7 @@
 //! ```
 //!
 //! `registration_path` returns where the plist / service file lives — used
-//! by `silvervine doctor` to surface "your daemon registration is at <path>".
+//! by `silvervine doctor` to surface "your daemon registration is at `<path>`".
 
 use std::path::PathBuf;
 

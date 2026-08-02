@@ -36,11 +36,8 @@
 //!   on ext4/btrfs/xfs/f2fs.
 //! * **macOS:** `renameatx_np(..., RENAME_SWAP)` — single syscall, atomic
 //!   on APFS.
-//! * **Fallback** (older filesystems, non-APFS, or syscall ENOSYS): the
-//!   platform helper falls back to a two-step
-//!   `rename(orig, orig.tmp); rename(staging, orig); rm orig.tmp` —
-//!   atomic in the typical case but not crash-safe across the two
-//!   `rename` calls. Documented limitation.
+//! * **Unsupported filesystems:** fail closed before either path moves; no
+//!   crash-vulnerable multi-rename fallback is attempted.
 //!
 //! We intentionally delegate the syscall to `platform` so the patch logic
 //! here stays platform-agnostic — only one place in the codebase has to
@@ -125,9 +122,9 @@ impl BackupHandle {
     ///
     /// Delegates the syscall to [`crate::platform::atomic_rename`]
     /// (Linux: `renameat2(RENAME_EXCHANGE)`; macOS:
-    /// `renameatx_np(RENAME_SWAP)`; with two-step fallback). After a
-    /// successful swap the *previous* `original` content sits at
-    /// `snapshot` — we delete it so the backups directory is clean again.
+    /// `renameatx_np(RENAME_SWAP)`). Filesystems without native exchange
+    /// support fail closed. After a successful swap the *previous* `original`
+    /// content sits at `snapshot` — we delete it so the backups directory is clean again.
     ///
     /// If the original path no longer exists (e.g. someone `rm -rf`'d it
     /// between snapshot and restore) we fall through to a plain
@@ -243,7 +240,7 @@ pub fn snapshot_for_browser(browser: &Browser, version: Option<&str>) -> Result<
 ///
 /// * [`crate::ErrorCategory::UnknownBundleStructure`] — `install_path` has
 ///   no parent (i.e. is `/`).
-/// * Other categories — propagated from [`snapshot_into`].
+/// * Other categories — propagated from the internal snapshot operation.
 pub fn snapshot_into_sibling(
     install_path: &Path,
     label: &str,
@@ -467,26 +464,6 @@ pub(crate) fn prune_backups_in(backups_root: &Path) -> Result<usize> {
         }
     }
     Ok(deleted)
-}
-
-/// Internal helper trait — same shape as in [`crate::lockfile`] but kept
-/// private to this module so we don't leak it across modules. Lifted
-/// here so both the snapshot/restore branches can prepend rich context
-/// without losing the category routing.
-trait ErrorContext {
-    fn with_context(self, context: impl Into<String>) -> Self;
-}
-
-impl ErrorContext for Error {
-    fn with_context(mut self, context: impl Into<String>) -> Self {
-        let ctx = context.into();
-        if self.message.is_empty() {
-            self.message = ctx;
-        } else {
-            self.message = format!("{ctx}: {}", self.message);
-        }
-        self
-    }
 }
 
 #[cfg(test)]

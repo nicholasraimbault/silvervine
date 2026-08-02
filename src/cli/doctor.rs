@@ -10,6 +10,7 @@
 //!    error code via [`crate::eme::translate_error_code`] into
 //!    actionable advice.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,9 @@ use serde::{Deserialize, Serialize};
 use crate::browsers;
 use crate::cli::OutputOptions;
 use crate::daemon::tray::{detect_tray_availability, TrayAvailability};
+use crate::diagnostics::collect::{collect_browser, collect_host_media_checks, BrowserDiagnostics};
+use crate::diagnostics::store::{load_default, CacheLookup, ProbeFingerprint, StoredProbeReport};
+use crate::diagnostics::{DiagnosticCheck, DiagnosticStatus, EvidenceSource, FailureDomain};
 use crate::eme;
 use crate::error::{Error, Result};
 
@@ -28,6 +32,10 @@ pub struct Args {
     pub error_code: Option<String>,
     /// `--share`: emit an issue-template URL prefilled with the report.
     pub share: bool,
+    /// `--media-stack`: collect passive browser, CDM, codec, and graphics evidence.
+    pub media_stack: bool,
+    /// Optional browser filter for `--media-stack`.
+    pub browser: Option<String>,
     /// Output flags.
     pub output: OutputOptions,
 }
@@ -53,6 +61,30 @@ pub struct Diagnostics {
     /// no session D-Bus is reachable) so users don't have to grep
     /// journalctl to figure out why their tray icon is missing.
     pub tray: TrayAvailability,
+    /// Optional passive media evidence and exact-fingerprint cached live probes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_stack: Option<MediaDiagnostics>,
+}
+
+/// Passive media evidence plus exact-fingerprint cached browser results.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaDiagnostics {
+    /// Per-browser passive and cached live evidence.
+    pub browsers: Vec<BrowserMediaDiagnostics>,
+    /// Optional fixed platform utility checks.
+    pub host_checks: Vec<DiagnosticCheck>,
+}
+
+/// Media evidence associated with one detected browser.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserMediaDiagnostics {
+    /// Passive browser, binary, and CDM evidence.
+    pub passive: BrowserDiagnostics,
+    /// Live browser evidence only when the complete fingerprint matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_probe: Option<StoredProbeReport>,
+    /// Explicit hit, stale, missing, or malformed cache observation.
+    pub cache_check: DiagnosticCheck,
 }
 
 /// Heartbeat staleness threshold (per spec: 5 minutes).
@@ -87,6 +119,7 @@ pub fn build_diagnostics(
         browsers: browsers_snapshot,
         legacy_install_present,
         tray,
+        media_stack: None,
     }
 }
 
@@ -138,6 +171,9 @@ pub fn render_text(d: &Diagnostics, out: &mut dyn Write) -> std::io::Result<()> 
             write_browser_line(out, b, d.current_cdm_version.as_deref())?;
         }
     }
+    if let Some(media) = &d.media_stack {
+        render_media(media, out)?;
+    }
     Ok(())
 }
 
@@ -178,6 +214,209 @@ fn write_browser_line(
     }
 }
 
+fn render_media(media: &MediaDiagnostics, out: &mut dyn Write) -> std::io::Result<()> {
+    writeln!(out)?;
+    writeln!(out, "Passive media diagnostics (did not launch a browser):")?;
+    for browser in &media.browsers {
+        writeln!(out, "  {}:", browser.passive.browser)?;
+        for check in &browser.passive.checks {
+            render_media_check(check, out)?;
+        }
+        render_media_check(&browser.cache_check, out)?;
+        if let Some(report) = &browser.cached_probe {
+            writeln!(
+                out,
+                "    Cached live baseline: [{}] {}",
+                status_name(report.assessment.status),
+                report.assessment.summary
+            )?;
+            for check in &report.assessment.checks {
+                render_media_check(check, out)?;
+            }
+        }
+    }
+    if !media.host_checks.is_empty() {
+        writeln!(out, "  Host media utilities:")?;
+        for check in &media.host_checks {
+            render_media_check(check, out)?;
+        }
+    }
+    writeln!(
+        out,
+        "  Boundary: browser-reported evidence is not certified L1 or service entitlement."
+    )
+}
+
+fn render_media_check(check: &DiagnosticCheck, out: &mut dyn Write) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "    [{}] {} ({:?}/{:?})",
+        status_name(check.status),
+        check.summary,
+        check.source,
+        check.failure_domain
+    )?;
+    if let Some(action) = &check.action {
+        writeln!(out, "        Action: {action}")?;
+    }
+    Ok(())
+}
+
+fn status_name(status: DiagnosticStatus) -> &'static str {
+    match status {
+        DiagnosticStatus::Pass => "PASS",
+        DiagnosticStatus::Warn => "WARN",
+        DiagnosticStatus::Fail => "FAIL",
+        DiagnosticStatus::Unavailable => "UNAVAILABLE",
+    }
+}
+
+fn collect_media(detected: &[&crate::browsers::Browser]) -> MediaDiagnostics {
+    let browsers = detected
+        .iter()
+        .copied()
+        .map(|browser| {
+            let passive = collect_browser(browser);
+            let (cached_probe, cache_check) = cached_probe(
+                browser.name(),
+                passive.fingerprint.as_ref(),
+                &passive.ownership,
+            );
+            BrowserMediaDiagnostics {
+                passive,
+                cached_probe,
+                cache_check,
+            }
+        })
+        .collect();
+    MediaDiagnostics {
+        browsers,
+        host_checks: collect_host_media_checks(),
+    }
+}
+
+fn cached_probe(
+    browser: &str,
+    fingerprint: Option<&ProbeFingerprint>,
+    ownership: &crate::widevine::ownership::OwnershipAssessment,
+) -> (Option<StoredProbeReport>, DiagnosticCheck) {
+    let Some(fingerprint) = fingerprint else {
+        return (
+            None,
+            unavailable_cache_check(
+                browser,
+                "Exact browser executable fingerprint is unavailable.",
+                BTreeMap::new(),
+            ),
+        );
+    };
+    match load_default(fingerprint) {
+        Ok(CacheLookup::Hit(report)) => cache_hit(report, ownership),
+        Ok(CacheLookup::Stale(report)) => (
+            None,
+            unavailable_cache_check(
+                browser,
+                "Cached live EME evidence is stale because the browser or CDM changed.",
+                BTreeMap::from([
+                    (
+                        "cached_browser_version".into(),
+                        version_or_unavailable(report.fingerprint.browser_version.as_deref()),
+                    ),
+                    (
+                        "current_browser_version".into(),
+                        version_or_unavailable(fingerprint.browser_version.as_deref()),
+                    ),
+                    (
+                        "cached_cdm_version".into(),
+                        version_or_unavailable(report.fingerprint.primary_cdm_version()),
+                    ),
+                    (
+                        "current_cdm_version".into(),
+                        version_or_unavailable(fingerprint.primary_cdm_version()),
+                    ),
+                ]),
+            ),
+        ),
+        Ok(CacheLookup::Missing) => (
+            None,
+            unavailable_cache_check(
+                browser,
+                "No exact-fingerprint live EME evidence is cached.",
+                BTreeMap::new(),
+            ),
+        ),
+        Err(error) => (
+            None,
+            DiagnosticCheck {
+                id: "eme.cached_probe".into(),
+                status: DiagnosticStatus::Warn,
+                source: EvidenceSource::HostProbe,
+                failure_domain: FailureDomain::Silvervine,
+                summary: "The cached live EME report could not be read safely.".into(),
+                action: Some(cache_action(browser)),
+                details: BTreeMap::from([
+                    ("error_category".into(), error.category.as_str().into()),
+                    ("error".into(), error.message),
+                ]),
+            },
+        ),
+    }
+}
+
+fn cache_hit(
+    mut report: StoredProbeReport,
+    ownership: &crate::widevine::ownership::OwnershipAssessment,
+) -> (Option<StoredProbeReport>, DiagnosticCheck) {
+    report.assessment = crate::eme::probe::assess(&report.raw, ownership);
+    let check = DiagnosticCheck {
+        id: "eme.cached_probe".into(),
+        status: report.assessment.status,
+        source: EvidenceSource::LiveBrowser,
+        failure_domain: report.assessment.domain,
+        summary: format!(
+            "Exact-fingerprint live EME evidence was probed at Unix {}.",
+            report.probed_at
+        ),
+        action: report.assessment.action().map(str::to_owned),
+        details: BTreeMap::from([
+            ("probed_at".into(), report.probed_at.to_string()),
+            (
+                "browser_version".into(),
+                version_or_unavailable(report.fingerprint.browser_version.as_deref()),
+            ),
+            (
+                "cdm_version".into(),
+                version_or_unavailable(report.fingerprint.primary_cdm_version()),
+            ),
+        ]),
+    };
+    (Some(report), check)
+}
+
+fn unavailable_cache_check(
+    browser: &str,
+    summary: &str,
+    details: BTreeMap<String, String>,
+) -> DiagnosticCheck {
+    DiagnosticCheck {
+        id: "eme.cached_probe".into(),
+        status: DiagnosticStatus::Unavailable,
+        source: EvidenceSource::HostProbe,
+        failure_domain: FailureDomain::BrowserMediaStack,
+        summary: summary.into(),
+        action: Some(cache_action(browser)),
+        details,
+    }
+}
+
+fn cache_action(browser: &str) -> String {
+    format!("Run `silvervine test --browser {browser}`.")
+}
+
+fn version_or_unavailable(version: Option<&str>) -> String {
+    version.unwrap_or("unavailable").into()
+}
+
 /// Build the `?body=<urlencoded>` string for a GitHub issue template.
 ///
 /// The user's diagnostic bundle (rendered as text) is URL-encoded and
@@ -189,11 +428,87 @@ fn write_browser_line(
 #[must_use]
 pub fn share_url(diagnostics: &Diagnostics) -> String {
     let mut buf = Vec::new();
-    let _ = render_text(diagnostics, &mut buf);
+    let _ = render_text_compact(diagnostics, &mut buf);
     let text = String::from_utf8_lossy(&buf);
     let body = format!("```\n{text}\n```\n\n_Generated by `silvervine doctor --share`._");
     let encoded = urlencoding::encode(&body);
     format!("https://github.com/nicholasraimbault/silvervine/issues/new?template=bug.yml&body={encoded}")
+}
+
+fn render_text_compact(d: &Diagnostics, out: &mut dyn Write) -> std::io::Result<()> {
+    // Compact share body omits raw matrices while retaining domain-labeled outcomes.
+    writeln!(out, "Silvervine {} diagnostics", d.silvervine_version)?;
+    writeln!(
+        out,
+        "CDM cache: {}",
+        d.current_cdm_version.as_deref().unwrap_or("none")
+    )?;
+    writeln!(out, "Browsers: {}", d.browsers.len())?;
+    for browser in &d.browsers {
+        writeln!(
+            out,
+            "  {}: {}",
+            browser.name,
+            browser
+                .cdm_version
+                .as_deref()
+                .unwrap_or("no install-root CDM")
+        )?;
+    }
+    if let Some(media) = &d.media_stack {
+        writeln!(out, "Media stack (passive, no browser launch):")?;
+        for browser in &media.browsers {
+            writeln!(
+                out,
+                "  {} ownership: {}",
+                browser.passive.browser, browser.passive.ownership.summary
+            )?;
+            writeln!(
+                out,
+                "    cache: [{}] {}",
+                status_name(browser.cache_check.status),
+                browser.cache_check.summary
+            )?;
+            if let Some(report) = &browser.cached_probe {
+                writeln!(
+                    out,
+                    "    live baseline: [{}] {}",
+                    status_name(report.assessment.status),
+                    report.assessment.summary
+                )?;
+                for action in &report.assessment.actions {
+                    writeln!(out, "      action: {action}")?;
+                }
+            }
+        }
+        if !media.host_checks.is_empty() {
+            writeln!(out, "  Host checks: {}", media.host_checks.len())?;
+            for check in &media.host_checks {
+                writeln!(out, "    [{}] {}", status_name(check.status), check.summary)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn filter_browsers<'a>(
+    detected: &'a [crate::browsers::Browser],
+    browser: Option<&str>,
+) -> Result<Vec<&'a crate::browsers::Browser>> {
+    match browser {
+        None => Ok(detected.iter().collect()),
+        Some(name) => {
+            let matched: Vec<_> = detected
+                .iter()
+                .filter(|candidate| candidate.name().eq_ignore_ascii_case(name))
+                .collect();
+            if matched.is_empty() {
+                Err(Error::other(format!("no detected browser named '{name}'")))
+            } else {
+                Ok(matched)
+            }
+        }
+    }
 }
 
 /// CLI entry point.
@@ -204,6 +519,15 @@ pub fn share_url(diagnostics: &Diagnostics) -> String {
 pub fn run(args: &Args) -> Result<()> {
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
+
+    if args.media_stack && args.error_code.is_some() {
+        return Err(Error::other(
+            "`doctor --media-stack` conflicts with error-code translation",
+        ));
+    }
+    if args.browser.is_some() && !args.media_stack {
+        return Err(Error::other("`doctor --browser` requires `--media-stack`"));
+    }
 
     // Code-translation mode short-circuits the diagnostic bundle.
     if let Some(code) = &args.error_code {
@@ -218,7 +542,7 @@ pub fn run(args: &Args) -> Result<()> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let d = build_diagnostics(
+    let mut d = build_diagnostics(
         &detected,
         heartbeat_at,
         current_cdm,
@@ -226,14 +550,17 @@ pub fn run(args: &Args) -> Result<()> {
         tray,
         now,
     );
+    if args.media_stack {
+        let browsers = filter_browsers(&detected, args.browser.as_deref())?;
+        d.media_stack = Some(collect_media(&browsers));
+    }
 
     if args.share {
         writeln!(handle, "{}", share_url(&d)).map_err(Error::from)?;
         return Ok(());
     }
     if args.output.json {
-        let s = serde_json::to_string_pretty(&d)?;
-        writeln!(handle, "{s}").map_err(Error::from)?;
+        super::write_json(&mut handle, &d)?;
     } else {
         render_text(&d, &mut handle).map_err(Error::from)?;
     }
@@ -242,25 +569,17 @@ pub fn run(args: &Args) -> Result<()> {
 
 fn run_translate(code: &str, output: OutputOptions, out: &mut dyn Write) -> Result<()> {
     if let Some(d) = eme::translate_error_code(code) {
-        {
-            if output.json {
-                let body = serde_json::json!({
-                    "code": d.code,
-                    "service": d.service,
-                    "likely_cause": d.likely_cause,
-                    "suggested_command": d.suggested_command,
-                });
-                writeln!(out, "{}", serde_json::to_string_pretty(&body)?).map_err(Error::from)?;
+        if output.json {
+            super::write_json(out, &d)?;
+        } else {
+            writeln!(out, "Service: {}", d.service).map_err(Error::from)?;
+            writeln!(out, "Code: {}", d.code).map_err(Error::from)?;
+            writeln!(out, "Likely cause: {}", d.likely_cause).map_err(Error::from)?;
+            if let Some(cmd) = d.suggested_command {
+                writeln!(out, "Suggested: {cmd}").map_err(Error::from)?;
             } else {
-                writeln!(out, "Service: {}", d.service).map_err(Error::from)?;
-                writeln!(out, "Code: {}", d.code).map_err(Error::from)?;
-                writeln!(out, "Likely cause: {}", d.likely_cause).map_err(Error::from)?;
-                if let Some(cmd) = d.suggested_command {
-                    writeln!(out, "Suggested: {cmd}").map_err(Error::from)?;
-                } else {
-                    writeln!(out, "(silvervine cannot fix this code automatically)")
-                        .map_err(Error::from)?;
-                }
+                writeln!(out, "(silvervine cannot fix this code automatically)")
+                    .map_err(Error::from)?;
             }
         }
         Ok(())
@@ -571,5 +890,104 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         assert!(s.contains("Tray: unavailable"));
         assert!(s.contains("session D-Bus unavailable"));
+    }
+
+    #[test]
+    fn render_text_labels_passive_media_sources_and_claim_boundary() {
+        let mut diagnostics =
+            build_diagnostics(&[], None, None, false, TrayAvailability::Available, 0);
+        diagnostics.media_stack = Some(MediaDiagnostics {
+            browsers: vec![BrowserMediaDiagnostics {
+                passive: crate::diagnostics::collect::BrowserDiagnostics {
+                    browser: "Chromium".into(),
+                    browser_executable: None,
+                    browser_version: None,
+                    cdm_target: None,
+                    cdm_version: None,
+                    cdm_library: None,
+                    cdm_library_sha512: None,
+                    ownership: crate::widevine::ownership::OwnershipAssessment::default(),
+                    external_cdms: Vec::new(),
+                    fingerprint: None,
+                    checks: Vec::new(),
+                },
+                cached_probe: None,
+                cache_check: crate::diagnostics::DiagnosticCheck {
+                    id: "eme.cached_probe".into(),
+                    status: crate::diagnostics::DiagnosticStatus::Unavailable,
+                    source: crate::diagnostics::EvidenceSource::HostProbe,
+                    failure_domain: crate::diagnostics::FailureDomain::BrowserMediaStack,
+                    summary: "No exact-fingerprint live EME report is cached.".into(),
+                    action: Some("Run `silvervine test --browser Chromium`.".into()),
+                    details: std::collections::BTreeMap::new(),
+                },
+            }],
+            host_checks: Vec::new(),
+        });
+
+        let mut output = Vec::new();
+        render_text(&diagnostics, &mut output).expect("render");
+        let text = String::from_utf8(output).expect("UTF-8");
+
+        assert!(text.contains("Passive media diagnostics"));
+        assert!(text.contains("[UNAVAILABLE]"));
+        assert!(text.contains("HostProbe/BrowserMediaStack"));
+        assert!(text.contains("did not launch a browser"));
+        assert!(text.contains("not certified L1"));
+    }
+    #[test]
+    fn cache_hit_reassesses_raw_probe_with_current_ownership() {
+        let raw = crate::eme::probe::RawProbeResult {
+            schema_version: crate::eme::probe::PROBE_SCHEMA_VERSION,
+            user_agent: "Chromium/150".into(),
+            eme_api: false,
+            media_capabilities_api: false,
+            baseline: crate::eme::probe::CapabilityStatus::Unavailable,
+            baseline_error: None,
+            robustness: Vec::new(),
+            encryption_schemes: Vec::new(),
+            hdcp: Vec::new(),
+            codecs: Vec::new(),
+        };
+        let stale_ownership = crate::widevine::ownership::OwnershipAssessment::default();
+        let stale_assessment = crate::eme::probe::assess(&raw, &stale_ownership);
+        assert_eq!(
+            stale_assessment.domain,
+            crate::diagnostics::FailureDomain::Silvervine
+        );
+        let report = StoredProbeReport {
+            schema_version: crate::diagnostics::store::STORE_SCHEMA_VERSION,
+            probed_at: 123,
+            browser_name: "Chromium".into(),
+            fingerprint: ProbeFingerprint::new(
+                "/opt/chromium",
+                Some("150".into()),
+                1,
+                1,
+                "browser-digest",
+                Vec::new(),
+            ),
+            raw: raw.clone(),
+            assessment: stale_assessment,
+        };
+        let current_ownership = crate::widevine::ownership::OwnershipAssessment {
+            kind: crate::widevine::ownership::OwnershipKind::Managed,
+            summary: "Verified current Silvervine CDM.".into(),
+            action: None,
+            details: std::collections::BTreeMap::new(),
+        };
+
+        let (updated, check) = cache_hit(report, &current_ownership);
+        let updated = updated.expect("cached report");
+
+        assert_eq!(
+            updated.assessment,
+            crate::eme::probe::assess(&raw, &current_ownership)
+        );
+        assert_eq!(
+            updated.assessment.domain,
+            crate::diagnostics::FailureDomain::BrowserMediaStack
+        );
+        assert_eq!(check.failure_domain, updated.assessment.domain);
     }
 }

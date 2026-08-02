@@ -34,14 +34,14 @@ pub struct WidevineArgs {
 }
 
 /// Outcome record for `silvervine update widevine`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct WidevineUpdateOutcome {
     /// CDM version now active.
     pub current_version: String,
     /// `true` when a download happened (vs. a cache hit / rollback).
     pub downloaded: bool,
     /// Patch reports for each browser re-patched after the update.
-    pub patch_reports: Vec<crate::cli::patch::PatchReport>,
+    pub patch_reports: Vec<crate::patch::PatchReport>,
 }
 
 /// Run the `silvervine update widevine` flow.
@@ -87,12 +87,7 @@ pub fn run_widevine(args: &WidevineArgs) -> Result<()> {
 }
 
 fn render_json(outcome: &WidevineUpdateOutcome, out: &mut dyn Write) -> Result<()> {
-    let body = serde_json::json!({
-        "current_version": outcome.current_version,
-        "downloaded": outcome.downloaded,
-        "patch_reports": outcome.patch_reports,
-    });
-    writeln!(out, "{}", serde_json::to_string_pretty(&body)?).map_err(Error::from)
+    super::write_json(out, outcome)
 }
 
 fn run_widevine_install(args: &WidevineArgs, out: &mut dyn Write) -> Result<WidevineUpdateOutcome> {
@@ -146,7 +141,7 @@ fn fetch_from_custom(url: &str) -> Result<widevine::Manifest> {
     widevine::fetch_manifest_with(
         std::slice::from_ref(&parsed),
         widevine::cached_manifest_path().as_deref(),
-        std::time::Duration::from_secs(0), // no cache fallback for explicit overrides
+        std::time::Duration::ZERO, // retained signature; snapshots are write-only
     )
 }
 

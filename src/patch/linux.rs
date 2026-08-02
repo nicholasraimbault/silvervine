@@ -7,9 +7,10 @@
 //! No codesign, no `xattr -cr` — those are macOS concerns. The Linux
 //! patch is conceptually:
 //!
-//! 1. `mkdir -p <install_path>/WidevineCdm`
-//! 2. recursive copy from `<cdm_source>` into `<install_path>/WidevineCdm`
-//! 3. chmod each file to 0644 / each directory to 0755
+//! 1. Build and verify a complete `WidevineCdm` under a temporary directory
+//!    inside the install root.
+//! 2. Apply mode 0644 to files, 0755 to directories and the CDM library.
+//! 3. Atomically exchange the staged directory with the live `WidevineCdm`.
 //!
 //! ## Verification
 //!
@@ -34,7 +35,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::patch::PlatformPatcher;
+use crate::patch::{ManagedWrite, PlatformPatcher};
+use crate::platform::process::run_output_with_timeout;
+use crate::widevine::ownership::{self, ManagedMarker};
+use crate::widevine::{
+    platform_directory, platform_library, Platform, PLATFORM_SPECIFIC_DIRECTORY,
+};
 
 /// Linux platform patcher.
 ///
@@ -56,6 +62,15 @@ impl PlatformPatcher for LinuxPatcher {
     fn write_cdm(&self, target: &Path, cdm_source: &Path) -> Result<()> {
         write_cdm_into(target, cdm_source)
     }
+    fn write_managed_cdm(
+        &self,
+        target: &Path,
+        cdm_source: &Path,
+        parent_marker: &ManagedMarker,
+    ) -> Result<ManagedWrite> {
+        write_managed_cdm_into(target, cdm_source, parent_marker)?;
+        Ok(ManagedWrite::MarkerCommitted)
+    }
 
     fn verify_post_patch(&self, target: &Path) -> Result<()> {
         verify_cdm_at(target)
@@ -64,13 +79,17 @@ impl PlatformPatcher for LinuxPatcher {
     fn read_browser_version(&self, target: &Path) -> Option<String> {
         read_browser_version_at(target)
     }
+
+    fn writes_transactionally(&self) -> bool {
+        true
+    }
 }
 
 /// Where the Linux patch puts the CDM, relative to the browser's install path.
 ///
 /// Exposed publicly so the daemon's "is patched" check (Phase 3) can
 /// look at the same location.
-pub const CDM_SUBDIR: &str = "WidevineCdm";
+pub const CDM_SUBDIR: &str = crate::widevine::CDM_BUNDLE_DIRECTORY;
 
 /// File mode for regular files inside `WidevineCdm/`.
 const FILE_MODE: u32 = 0o644;
@@ -94,19 +113,185 @@ fn write_cdm_into(target: &Path, cdm_source: &Path) -> Result<()> {
             target.display()
         )));
     }
-    let dest = target.join(CDM_SUBDIR);
-    // Idempotent: if `WidevineCdm/` already exists from a prior patch,
-    // remove it so the new copy starts fresh. We hold the patch lockfile
-    // (the orchestrator acquired it) so no other Silvervine invocation can be
-    // racing here.
-    if dest.exists() {
-        fs::remove_dir_all(&dest)
-            .map_err(|e| context_err(e, format!("could not clear {}", dest.display())))?;
+
+    replace_cdm_transactionally(
+        target,
+        |staged| copy_recursive(cdm_source, staged),
+        verify_cdm_at,
+    )
+}
+fn write_managed_cdm_into(
+    target: &Path,
+    cdm_source: &Path,
+    parent_marker: &ManagedMarker,
+) -> Result<()> {
+    if !cdm_source.exists() {
+        return Err(Error::unknown_bundle_structure(format!(
+            "CDM source directory does not exist: {}",
+            cdm_source.display()
+        )));
     }
-    fs::create_dir_all(&dest)
-        .map_err(|e| context_err(e, format!("could not create {}", dest.display())))?;
-    set_permissions(&dest, DIR_MODE)?;
-    copy_recursive(cdm_source, &dest)?;
+    if !target.exists() {
+        return Err(Error::unknown_bundle_structure(format!(
+            "browser install path does not exist: {}",
+            target.display()
+        )));
+    }
+    replace_cdm_transactionally(
+        target,
+        |staged| {
+            copy_recursive(cdm_source, staged)?;
+            let copied = ownership::marker_for_finalized_payload(staged, parent_marker)?;
+            if &copied != parent_marker {
+                return Err(Error::invalid_marker(
+                    "Linux CDM copy changed the parent-selected payload",
+                ));
+            }
+            ownership::write_marker(staged, parent_marker)?;
+            let installed = ownership::validate_installed_cdm(staged)?;
+            if installed.marker() != parent_marker {
+                return Err(Error::invalid_marker(
+                    "Linux staging committed an unexpected ownership marker",
+                ));
+            }
+            Ok(())
+        },
+        |live_root| {
+            verify_cdm_at(live_root)?;
+            let installed = ownership::validate_installed_cdm(&live_root.join(CDM_SUBDIR))?;
+            if installed.marker() != parent_marker {
+                return Err(Error::invalid_marker(
+                    "Linux live publication committed an unexpected ownership marker",
+                ));
+            }
+            Ok(())
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstallPathIdentity {
+    install_device: u64,
+    install_inode: u64,
+    parent_device: u64,
+    parent_inode: u64,
+}
+
+impl InstallPathIdentity {
+    fn capture(install: &Path, parent: &Path) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let install_metadata = fs::symlink_metadata(install).map_err(Error::from)?;
+        let parent_metadata = fs::symlink_metadata(parent).map_err(Error::from)?;
+        Ok(Self {
+            install_device: install_metadata.dev(),
+            install_inode: install_metadata.ino(),
+            parent_device: parent_metadata.dev(),
+            parent_inode: parent_metadata.ino(),
+        })
+    }
+
+    fn revalidate(self, install: &Path, parent: &Path) -> Result<()> {
+        let current = Self::capture(install, parent)?;
+        if current != self {
+            return Err(Error::permission_denied(
+                "privileged browser install or parent identity changed before publication",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn capture_privileged_install_identity(target: &Path) -> Result<Option<InstallPathIdentity>> {
+    if !crate::platform::is_running_as_root() {
+        return Ok(None);
+    }
+    let parent = target.parent().ok_or_else(|| {
+        Error::unknown_bundle_structure("browser install has no parent for secure publication")
+    })?;
+    super::validate_privileged_snapshot_parent(target, parent)?;
+    InstallPathIdentity::capture(target, parent).map(Some)
+}
+
+fn revalidate_privileged_install_identity(
+    target: &Path,
+    expected: Option<InstallPathIdentity>,
+) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let parent = target.parent().ok_or_else(|| {
+        Error::unknown_bundle_structure("browser install has no parent for secure publication")
+    })?;
+    super::validate_privileged_snapshot_parent(target, parent)?;
+    expected.revalidate(target, parent)
+}
+
+fn publication_exchanged(staged: &Path) -> bool {
+    staged.exists()
+}
+
+fn replace_cdm_transactionally<F, V>(target: &Path, populate: F, validate_live: V) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+    V: FnOnce(&Path) -> Result<()>,
+{
+    let privileged_identity = capture_privileged_install_identity(target)?;
+    revalidate_privileged_install_identity(target, privileged_identity)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".silvervine-widevine-")
+        .tempdir_in(target)
+        .map_err(|error| {
+            context_err(
+                error,
+                format!("could not create staging directory in {}", target.display()),
+            )
+        })?;
+    let staged = staging.path().join(CDM_SUBDIR);
+    fs::create_dir(&staged)
+        .map_err(|error| context_err(error, format!("could not create {}", staged.display())))?;
+    set_permissions(&staged, DIR_MODE)?;
+    populate(&staged)?;
+    verify_cdm_at(staging.path())?;
+    revalidate_privileged_install_identity(target, privileged_identity)?;
+    let destination = target.join(CDM_SUBDIR);
+    crate::platform::atomic_rename(&staged, &destination)?;
+    let exchanged = publication_exchanged(&staged);
+    let live_validation = revalidate_privileged_install_identity(target, privileged_identity)
+        .and_then(|()| validate_live(target));
+    if let Err(verify_error) = live_validation {
+        let rollback = if exchanged {
+            crate::platform::atomic_rename(&staged, &destination)
+        } else {
+            fs::remove_dir_all(&destination).map_err(Error::from)
+        };
+        if let Err(rollback_error) = rollback {
+            let recovery = if exchanged {
+                Some(staging.keep())
+            } else {
+                None
+            };
+            let category = verify_error.category;
+            let recovery = recovery.map_or_else(
+                || "no retired payload was available".to_owned(),
+                |path| format!("the retired payload was preserved at {}", path.display()),
+            );
+            let message = format!(
+                "{}; rollback also failed and {recovery}",
+                verify_error.message
+            );
+            return Err(Error::new(category, message).with_source(rollback_error));
+        }
+        return Err(verify_error);
+    }
+
+    if let Err(error) = staging.close() {
+        tracing::warn!(
+            path = %target.display(),
+            error = %error,
+            "could not remove retired Linux CDM staging directory"
+        );
+    }
     Ok(())
 }
 
@@ -146,7 +331,7 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
             })?;
             // The CDM library itself needs to be executable so the
             // browser can mmap it; everything else is plain data.
-            let mode = if name == "libwidevinecdm.so" {
+            let mode = if name == platform_library(Platform::LinuxX86_64) {
                 CDM_SO_MODE
             } else {
                 FILE_MODE
@@ -163,9 +348,9 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
 fn verify_cdm_at(target: &Path) -> Result<()> {
     let so = target
         .join(CDM_SUBDIR)
-        .join("_platform_specific")
-        .join("linux_x64")
-        .join("libwidevinecdm.so");
+        .join(PLATFORM_SPECIFIC_DIRECTORY)
+        .join(platform_directory(Platform::LinuxX86_64))
+        .join(platform_library(Platform::LinuxX86_64));
     if !so.exists() {
         return Err(Error::unknown_bundle_structure(format!(
             "post-patch verify: missing {}",
@@ -259,41 +444,19 @@ fn is_executable(p: &Path) -> bool {
     fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
 }
 
-/// Best-effort spawn of `binary --version` with a `timeout`-style wait.
-///
-/// Returns the trimmed first line of stdout on success. We can't use
-/// `Command::output()` directly with a timeout (stdlib doesn't ship that
-/// as of MSRV 1.85), so we use a simple thread-based wait pattern.
+/// Best-effort spawn of `binary --version` with bounded output and a
+/// process-group timeout.
 fn run_with_timeout(binary: &Path, args: &[&str], timeout: Duration) -> Option<String> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::sync::mpsc;
-    use std::thread;
-
-    let mut child = Command::new(binary)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let stdout = child.stdout.take()?;
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut buf = String::new();
-        let mut handle = stdout;
-        let _ = handle.read_to_string(&mut buf);
-        let _ = tx.send(buf);
-    });
-
-    let result = rx.recv_timeout(timeout).ok()?;
-    let _ = child.kill();
-    let first_line = result.lines().next()?.trim();
+    let output = run_output_with_timeout(binary, args, timeout).ok()?;
+    if output.timed_out || !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first_line = stdout.lines().next()?.trim();
     if first_line.is_empty() {
         None
     } else {
-        Some(first_line.to_string())
+        Some(first_line.to_owned())
     }
 }
 
@@ -385,6 +548,83 @@ mod tests {
         // Stale file is gone; new CDM is in place.
         assert!(!stale.exists());
         assert!(install.join("WidevineCdm/manifest.json").exists());
+    }
+
+    #[test]
+    fn staging_failure_preserves_existing_widevine_directory() {
+        let tmp = TempDir::new().unwrap();
+        let install = make_install(tmp.path());
+        let live = install.join(CDM_SUBDIR);
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("manifest.json"), b"old").unwrap();
+
+        let result = replace_cdm_transactionally(
+            &install,
+            |staged| {
+                fs::write(staged.join("partial"), b"incomplete").unwrap();
+                Err(Error::other("injected staging failure"))
+            },
+            |_| Ok(()),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(live.join("manifest.json")).unwrap(), b"old");
+        assert!(!live.join("partial").exists());
+    }
+
+    #[test]
+    fn live_validation_failure_restores_existing_widevine_directory() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cdm = make_cdm_source(tmp.path());
+        let install = make_install(tmp.path());
+        let live = install.join(CDM_SUBDIR);
+        fs::create_dir(&live).expect("live CDM");
+        fs::write(live.join("retired"), b"old").expect("retired payload");
+
+        let error = replace_cdm_transactionally(
+            &install,
+            |staged| copy_recursive(&cdm, staged),
+            |_| Err(Error::other("injected live validation failure")),
+        )
+        .expect_err("live validation must fail");
+
+        assert_eq!(error.message, "injected live validation failure");
+        assert_eq!(fs::read(live.join("retired")).unwrap(), b"old");
+        assert!(!live.join("manifest.json").exists());
+    }
+
+    #[test]
+    fn publication_exchange_state_comes_from_post_publish_path() {
+        let tmp = TempDir::new().expect("tempdir");
+        let staged = tmp.path().join(CDM_SUBDIR);
+        fs::create_dir(&staged).expect("retired payload");
+
+        assert!(
+            publication_exchanged(&staged),
+            "a remaining staged path proves the publish exchanged payloads"
+        );
+
+        fs::remove_dir(&staged).expect("remove retired payload");
+        assert!(
+            !publication_exchanged(&staged),
+            "a consumed staged path proves the publish was a plain move"
+        );
+    }
+
+    #[test]
+    fn install_identity_rejects_a_replaced_directory() {
+        let tmp = TempDir::new().unwrap();
+        let install = make_install(tmp.path());
+        let identity =
+            InstallPathIdentity::capture(&install, tmp.path()).expect("capture identity");
+        let retired = tmp.path().join("retired");
+        fs::rename(&install, &retired).expect("retire install");
+        fs::create_dir(&install).expect("replacement install");
+
+        let error = identity
+            .revalidate(&install, tmp.path())
+            .expect_err("replacement must not retain the authorized identity");
+        assert_eq!(error.category, crate::ErrorCategory::PermissionDenied);
     }
 
     #[test]

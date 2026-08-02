@@ -10,6 +10,69 @@ Future entries are generated from
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-08-01
+
+### Added
+
+- Added `doctor --media-stack [--browser]` passive browser/CDM provenance,
+  binary architecture, codec, VA-API, and macOS VideoToolbox diagnostics
+  with stable JSON evidence sources and failure domains. The passive path
+  performs no migration, log initialization, network access, or browser launch.
+- Added an explicit `test --browser <name>` normal-profile EME probe for
+  temporary Widevine key-system access, SW/HW robustness, cenc/cbcs schemes,
+  AVC/HEVC/VP9/AV1 codec matrix (720p/1080p/4K), MSE/direct playback,
+  MediaCapabilities, and HDCP 1.4/2.2 policy evidence. Rust returns one
+  bounded assessment to the page and terminal. Automatic `test --json` emits
+  exactly one `StoredProbeReport`; cache write failures are warnings with a
+  null cache path. `test --url` remains a manual page launcher.
+- Added `BrowserProbeFailed` error category/exit code for live probe timeout,
+  malformed transport, and software-playback baseline failure.
+
+### Changed
+
+- Batched patching now resolves the CDM, acquires the patch lock, and snapshots
+  running processes once per operation; watcher scheduling uses one deadline
+  loop instead of a separate ticker thread.
+- Streamed CLI JSON directly to its destination, centralized platform CDM
+  layout constants, and aligned the macOS Objective-C dependency graph.
+- Raised the minimum supported Rust version from 1.85 to 1.88 so the locked
+  dependency graph can include current security fixes.
+- Browser patching now records and validates a Silvervine ownership marker
+  bound to the installed manifest, platform, version, and CDM library SHA-512.
+  Existing unmarked CDMs are preserved unless the user passes the explicit
+  `--replace-external-cdm` override.
+
+### Fixed
+
+- Published Linux CDM directories and macOS application bundles through
+  staged transactions, with verification before publication and rollback on
+  failed live verification.
+- Removed crash-vulnerable non-native filesystem-exchange fallbacks; filesystems
+  without native atomic exchange now fail closed before either path moves.
+- Added versioned cache-integrity metadata for corruption detection; reuse now
+  requires current library and root-manifest digests to match the exact payload
+  extracted from a manifest-authenticated CRX.
+
+### Security
+
+- Updated `time` to 0.3.54, resolving
+  [RUSTSEC-2026-0009](https://rustsec.org/advisories/RUSTSEC-2026-0009.html)
+  in the notification and rolling-log dependency graph.
+- The live EME probe uses an ephemeral IPv4 loopback server with a random
+  single-use token, strict same-origin POST validation, CSP, bounded request
+  size/count/output, and a fixed timeout. Probe data never leaves the device.
+- Privileged patch children now inherit the parent's exact CDM replacement
+  consent, and invalid ownership markers cannot bypass provenance checks.
+- Elevated patching now passes only a bounded, parent-authenticated payload,
+  rejects writable or symlinked install ancestry, and revalidates Linux
+  install/parent device and inode identities around publication.
+- Manifest retrieval now fails closed when both fixed Mozilla HTTPS origins
+  fail; mutable on-disk manifest snapshots are write-only and cannot authorize
+  executable content.
+- CRX downloads now enforce strict SHA-512 syntax and a 256 MiB bound, reject
+  symlink cache entries, and extract from the exact verified buffer rather than
+  reopening a mutable pathname.
+
 ## [2.0.1] - 2026-07-31
 
 ### Changed
@@ -253,7 +316,8 @@ rc.1 has a hard deadlock on the patch path.
   scripts. Both bugs are obsoleted by the rewrite, but the reports
   were on the money.
 
-[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.0-rc.2...v2.0.0
 [2.0.0-rc.2]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.0-rc.1...v2.0.0-rc.2

@@ -111,7 +111,7 @@ fn open_lockfile(path: &Path) -> Result<File> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                Error::from(e).attach(format!(
+                Error::from(e).with_context(format!(
                     "create lockfile parent directory {}",
                     parent.display()
                 ))
@@ -124,26 +124,7 @@ fn open_lockfile(path: &Path) -> Result<File> {
         .create(true)
         .truncate(false)
         .open(path)
-        .map_err(|e| Error::from(e).attach(format!("open lockfile {}", path.display())))
-}
-
-// Tiny extension trait so we can prepend context to an `Error`'s message
-// without losing the category routing. Kept private to this module — when
-// other modules need this pattern we'll lift it into `error.rs`.
-trait ErrorAttach {
-    fn attach(self, context: impl Into<String>) -> Self;
-}
-
-impl ErrorAttach for Error {
-    fn attach(mut self, context: impl Into<String>) -> Self {
-        let ctx = context.into();
-        if self.message.is_empty() {
-            self.message = ctx;
-        } else {
-            self.message = format!("{ctx}: {}", self.message);
-        }
-        self
-    }
+        .map_err(|e| Error::from(e).with_context(format!("open lockfile {}", path.display())))
 }
 
 #[cfg(test)]
@@ -294,11 +275,11 @@ mod tests {
     /// error gets the context as its new message.
     #[test]
     fn attach_prepends_context_to_message() {
-        let err = Error::permission_denied("oops").attach("foo");
+        let err = Error::permission_denied("oops").with_context("foo");
         assert_eq!(err.message, "foo: oops");
         let mut empty = Error::other("");
         empty.message.clear();
-        let attached = empty.attach("bare");
+        let attached = empty.with_context("bare");
         assert_eq!(attached.message, "bare");
     }
 

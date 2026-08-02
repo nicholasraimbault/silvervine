@@ -18,14 +18,14 @@
 
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// High-level category of a Silvervine error.
 ///
 /// Categories drive UX (notification copy, doctor advice) and analytics
 /// (opt-in reporter payload). The string form of each variant is committed
 /// API; renaming a variant is a breaking change for the Worker schema.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorCategory {
     /// Filesystem write was rejected; we likely need privilege escalation.
     PermissionDenied,
@@ -51,6 +51,15 @@ pub enum ErrorCategory {
     StateCorrupted,
     /// Running on a platform we don't (yet) support — e.g. ARM64 Linux in V1.
     UnsupportedPlatform,
+    /// An existing CDM lacks valid Silvervine provenance and must be preserved
+    /// unless the caller explicitly authorizes replacement.
+    ExternalCdm,
+    /// A Silvervine ownership marker is malformed, unsafe, or no longer
+    /// matches the installed payload.
+    InvalidMarker,
+    /// Live browser EME probe timed out, returned malformed evidence, or failed
+    /// the software-playback baseline.
+    BrowserProbeFailed,
     /// Anything not yet categorized. **Avoid in new code** — add a variant.
     Other,
 }
@@ -74,6 +83,9 @@ impl ErrorCategory {
             Self::DaemonNotRunning => "DaemonNotRunning",
             Self::StateCorrupted => "StateCorrupted",
             Self::UnsupportedPlatform => "UnsupportedPlatform",
+            Self::ExternalCdm => "ExternalCdm",
+            Self::InvalidMarker => "InvalidMarker",
+            Self::BrowserProbeFailed => "BrowserProbeFailed",
             Self::Other => "Other",
         }
     }
@@ -120,6 +132,18 @@ impl Error {
         E: std::error::Error + Send + Sync + 'static,
     {
         self.source = Some(Box::new(source));
+        self
+    }
+
+    /// Prepend operation context while preserving category and source chain.
+    #[must_use]
+    pub fn with_context(mut self, context: impl Into<String>) -> Self {
+        let context = context.into();
+        if self.message.is_empty() {
+            self.message = context;
+        } else {
+            self.message = format!("{context}: {}", self.message);
+        }
         self
     }
 
@@ -173,6 +197,21 @@ impl Error {
         Self::new(ErrorCategory::UnsupportedPlatform, message)
     }
 
+    /// Construct a [`ErrorCategory::ExternalCdm`] error.
+    pub fn external_cdm(message: impl Into<String>) -> Self {
+        Self::new(ErrorCategory::ExternalCdm, message)
+    }
+
+    /// Construct a [`ErrorCategory::InvalidMarker`] error.
+    pub fn invalid_marker(message: impl Into<String>) -> Self {
+        Self::new(ErrorCategory::InvalidMarker, message)
+    }
+
+    /// Construct a [`ErrorCategory::BrowserProbeFailed`] error.
+    pub fn browser_probe_failed(message: impl Into<String>) -> Self {
+        Self::new(ErrorCategory::BrowserProbeFailed, message)
+    }
+
     /// Construct a [`ErrorCategory::Other`] error. Prefer a more specific
     /// variant when one exists — `Other` is the catch-all for unclassified
     /// causes and shows up in dashboards as the "we should categorize this"
@@ -210,9 +249,9 @@ impl From<std::io::Error> for Error {
     }
 }
 
-/// Map JSON parse errors into a `StateCorrupted` category — the most
-/// common consumer of `serde_json` is the manifest cache and the state
-/// file, both of which are "corrupted" if they fail to parse.
+/// Map JSON parse errors into a `StateCorrupted` category. Manifests, state
+/// files, and persisted diagnostic reports are corrupted when they cannot be
+/// deserialized.
 impl From<serde_json::Error> for Error {
     fn from(err: serde_json::Error) -> Self {
         let message = err.to_string();
@@ -273,6 +312,9 @@ mod tests {
             (ErrorCategory::DaemonNotRunning, "DaemonNotRunning"),
             (ErrorCategory::StateCorrupted, "StateCorrupted"),
             (ErrorCategory::UnsupportedPlatform, "UnsupportedPlatform"),
+            (ErrorCategory::ExternalCdm, "ExternalCdm"),
+            (ErrorCategory::InvalidMarker, "InvalidMarker"),
+            (ErrorCategory::BrowserProbeFailed, "BrowserProbeFailed"),
             (ErrorCategory::Other, "Other"),
         ];
         for (cat, expected) in all {
@@ -322,6 +364,18 @@ mod tests {
             Error::browser_running("Helium").category,
             ErrorCategory::BrowserRunning
         );
+        assert_eq!(
+            Error::external_cdm("vendor install").category,
+            ErrorCategory::ExternalCdm
+        );
+        assert_eq!(
+            Error::invalid_marker("stale marker").category,
+            ErrorCategory::InvalidMarker
+        );
+        assert_eq!(
+            Error::browser_probe_failed("probe timeout").category,
+            ErrorCategory::BrowserProbeFailed
+        );
         assert_eq!(Error::other("oops").category, ErrorCategory::Other);
     }
 
@@ -332,6 +386,21 @@ mod tests {
         assert!(err.source.is_some());
         let chain = std::error::Error::source(&err);
         assert!(chain.is_some());
+    }
+
+    #[test]
+    fn with_context_prepends_message_without_losing_category_or_source() {
+        let error =
+            Error::from(std::io::Error::other("disk failed")).with_context("write state file");
+
+        assert_eq!(error.category, ErrorCategory::Other);
+        assert_eq!(error.message, "write state file: disk failed");
+        assert!(error.source.is_some());
+
+        assert_eq!(
+            Error::other("").with_context("read config").message,
+            "read config"
+        );
     }
 
     #[test]

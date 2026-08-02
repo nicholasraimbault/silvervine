@@ -57,6 +57,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::{Error, Result};
+use crate::platform::atomic_write;
 
 /// `Label=` value embedded in the plist; also used by `launchctl bootout`.
 const LABEL: &str = "com.nicholasraimbault.silvervine.tray";
@@ -144,7 +145,7 @@ fn register_with(
     let log = log_path()?;
     if let Some(parent) = log.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
-            Error::from(e).with_source_message(format!("could not create {}", parent.display()))
+            Error::from(e).with_context(format!("could not create {}", parent.display()))
         })?;
     }
     register_transaction(
@@ -382,7 +383,7 @@ fn registration_file_exists(path: &Path) -> Result<bool> {
             path.display()
         ))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(Error::from(error).with_source_message(format!(
+        Err(error) => Err(Error::from(error).with_context(format!(
             "could not inspect daemon registration {}",
             path.display()
         ))),
@@ -393,8 +394,10 @@ fn remove_plist_if_present(plist_path: &Path) -> Result<()> {
     match std::fs::remove_file(plist_path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(Error::from(error)
-            .with_source_message(format!("could not remove {}", plist_path.display()))),
+        Err(error) => {
+            Err(Error::from(error)
+                .with_context(format!("could not remove {}", plist_path.display())))
+        }
     }
 }
 
@@ -402,22 +405,6 @@ fn remove_plist_if_present(plist_path: &Path) -> Result<()> {
 #[cfg(test)]
 fn write_plist(path: &Path, body: &str) -> Result<()> {
     atomic_write(path, body.as_bytes())
-}
-
-fn atomic_write(path: &Path, body: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            Error::from(e).with_source_message(format!("could not create {}", parent.display()))
-        })?;
-    }
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&temp, body).map_err(|e| {
-        Error::from(e).with_source_message(format!("could not write {}", temp.display()))
-    })?;
-    std::fs::rename(&temp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&temp);
-        Error::from(e).with_source_message(format!("could not replace {}", path.display()))
-    })
 }
 
 /// Current user's effective UID. We use `libc::geteuid()` which is
@@ -487,21 +474,6 @@ fn launchctl_required(args: &[&str]) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-trait WithSourceMessage {
-    fn with_source_message(self, msg: String) -> Self;
-}
-
-impl WithSourceMessage for Error {
-    fn with_source_message(mut self, msg: String) -> Self {
-        if self.message.is_empty() {
-            self.message = msg;
-        } else {
-            self.message = format!("{msg}: {}", self.message);
-        }
-        self
-    }
 }
 
 #[cfg(test)]
@@ -648,20 +620,6 @@ mod tests {
         let _noop = ScopedEnv::set(super::super::NOOP_ENV, Path::new("1"));
         // Public API short-circuits, so no shell-out happens.
         assert!(super::super::unregister().is_ok());
-    }
-
-    #[test]
-    fn with_source_message_appends_to_existing() {
-        let mut err = Error::other("boom");
-        err = err.with_source_message("context".into());
-        assert_eq!(err.message, "context: boom");
-    }
-
-    #[test]
-    fn with_source_message_replaces_empty() {
-        let mut err = Error::other("");
-        err = err.with_source_message("context".into());
-        assert_eq!(err.message, "context");
     }
 
     #[test]

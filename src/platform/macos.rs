@@ -14,11 +14,8 @@
 //!
 //! ## Atomic rename
 //!
-//! `renameatx_np(RENAME_SWAP)` is the macOS-equivalent of Linux's
-//! `renameat2(RENAME_EXCHANGE)`. It works on APFS volumes (which is
-//! every macOS install since 10.13). HFS+ volumes — rare but not
-//! impossible — return `ENOTSUP`, in which case the wrapper falls back
-//! to the same two-step rename pattern as Linux.
+//! `renameatx_np(RENAME_SWAP)` is used on APFS; filesystems without native
+//! exchange support fail closed before either path moves.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -85,6 +82,14 @@ pub(super) fn run_as_root(command: &[&str]) -> Result<Output> {
         .output()
         .map_err(|e| Error::other("failed to spawn osascript").with_source(e))
 }
+pub(super) fn run_pinned_as_root(command: &[&str], expected_sha512: &str) -> Result<Output> {
+    let script = build_pinned_osa_script(command, expected_sha512)?;
+    Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map_err(|e| Error::other("failed to spawn osascript").with_source(e))
+}
 
 /// Build the AppleScript expression that runs `command` as administrator.
 ///
@@ -111,8 +116,49 @@ fn build_osa_script(command: &[&str]) -> Result<String> {
         }
         shell.push_str(&shell_quote(arg));
     }
-    // Escape backslashes and double-quotes for the AppleScript string
-    // literal that wraps `shell`.
+    Ok(apple_script_for_shell(&shell))
+}
+
+fn build_pinned_osa_script(command: &[&str], expected_sha512: &str) -> Result<String> {
+    if command.is_empty() {
+        return Err(Error::other(
+            "build_pinned_osa_script called with empty command",
+        ));
+    }
+    if !Path::new(command[0]).is_absolute() {
+        return Err(Error::other(
+            "pinned elevated executable path must be absolute",
+        ));
+    }
+    if expected_sha512.len() != 128
+        || !expected_sha512
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(Error::other(
+            "pinned elevated executable digest must be lowercase SHA-512 hex",
+        ));
+    }
+    if command.iter().any(|argument| argument.contains('\0')) {
+        return Err(Error::other(
+            "command argument contains NUL byte; cannot escalate",
+        ));
+    }
+
+    let mut shell = format!(
+        "exec 9<{} || exit 126; actual=$(/usr/bin/shasum -a 512 <&9) || exit 126; /usr/bin/perl -e 'seek(STDIN, 0, 0) or exit 1' <&9 || exit 126; actual=${{actual%% *}}; if [ \"$actual\" != {} ]; then echo 'Silvervine executable changed before privileged launch' >&2; exit 126; fi; exec /dev/fd/9",
+        shell_quote(command[0]),
+        shell_quote(expected_sha512),
+    );
+    for argument in &command[1..] {
+        shell.push(' ');
+        shell.push_str(&shell_quote(argument));
+    }
+    Ok(apple_script_for_shell(&shell))
+}
+
+fn apple_script_for_shell(shell: &str) -> String {
+    // Escape backslashes and double-quotes for the AppleScript string literal.
     let mut osa = String::from("do shell script \"");
     for c in shell.chars() {
         match c {
@@ -122,7 +168,7 @@ fn build_osa_script(command: &[&str]) -> Result<String> {
         }
     }
     osa.push_str("\" with administrator privileges");
-    Ok(osa)
+    osa
 }
 
 /// Wrap a shell argument in single quotes, escaping any internal single
@@ -141,12 +187,13 @@ fn shell_quote(arg: &str) -> String {
     out
 }
 
-/// Atomic exchange via `renameatx_np(RENAME_SWAP)`, with a two-step
-/// fallback for filesystems that don't support it (e.g. legacy HFS+).
+/// Atomic exchange via `renameatx_np(RENAME_SWAP)`.
+///
+/// Unsupported filesystems fail closed without moving either path.
 pub(super) fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
     if !dst.exists() {
         std::fs::rename(src, dst).map_err(|e| {
-            Error::from(e).message_or(format!(
+            Error::from(e).with_context(format!(
                 "rename({} -> {}) failed",
                 src.display(),
                 dst.display()
@@ -154,11 +201,7 @@ pub(super) fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
         })?;
         return Ok(());
     }
-    match swap_renameatx_np(src, dst) {
-        Ok(()) => Ok(()),
-        Err(e) if e.is_unsupported() => fallback_two_step_rename(src, dst),
-        Err(e) => Err(e.into_error(src, dst)),
-    }
+    swap_renameatx_np(src, dst).map_err(|error| error.into_error(src, dst))
 }
 
 enum SwapError {
@@ -167,15 +210,12 @@ enum SwapError {
 }
 
 impl SwapError {
-    fn is_unsupported(&self) -> bool {
-        matches!(self, Self::Unsupported)
-    }
     fn into_error(self, src: &Path, dst: &Path) -> Error {
         let io_err = match self {
             Self::Unsupported => std::io::Error::from(std::io::ErrorKind::Unsupported),
             Self::Other(e) => e,
         };
-        Error::from(io_err).message_or(format!(
+        Error::from(io_err).with_context(format!(
             "atomic_rename({} <-> {}) failed",
             src.display(),
             dst.display()
@@ -228,52 +268,6 @@ const RENAME_SWAP: libc::c_uint = 2;
 
 fn io_invalid(e: std::ffi::NulError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-}
-
-/// Fallback when `RENAME_SWAP` is unsupported: rename `dst` aside,
-/// move `src` into place, then remove the saved `dst`.
-fn fallback_two_step_rename(src: &Path, dst: &Path) -> Result<()> {
-    let backup = dst.with_extension("silvervine-tmp");
-    std::fs::rename(dst, &backup).map_err(|e| {
-        Error::from(e).message_or(format!(
-            "fallback rename: could not move {} aside",
-            dst.display()
-        ))
-    })?;
-    if let Err(e) = std::fs::rename(src, dst) {
-        let _ = std::fs::rename(&backup, dst);
-        return Err(Error::from(e).message_or(format!(
-            "fallback rename: could not move {} into {}",
-            src.display(),
-            dst.display()
-        )));
-    }
-    let _ = remove_path(&backup);
-    Ok(())
-}
-
-fn remove_path(p: &Path) -> std::io::Result<()> {
-    let meta = std::fs::symlink_metadata(p)?;
-    if meta.file_type().is_dir() {
-        std::fs::remove_dir_all(p)
-    } else {
-        std::fs::remove_file(p)
-    }
-}
-
-trait MessageOr {
-    fn message_or(self, fallback: String) -> Self;
-}
-
-impl MessageOr for Error {
-    fn message_or(mut self, fallback: String) -> Self {
-        if self.message.is_empty() {
-            self.message = fallback;
-        } else {
-            self.message = format!("{fallback}: {}", self.message);
-        }
-        self
-    }
 }
 
 #[cfg(test)]
@@ -336,11 +330,28 @@ mod tests {
         let r = build_osa_script(&["nul\0"]);
         assert!(r.is_err());
     }
+    #[test]
+    fn pinned_script_hashes_rewinds_and_executes_one_open_descriptor() {
+        let digest = "ab".repeat(64);
+        let script =
+            build_pinned_osa_script(&["/Users/test/.cargo/bin/silvervine", "doctor"], &digest)
+                .expect("script");
+        assert!(script.contains("exec 9<"));
+        assert!(script.contains("/usr/bin/shasum -a 512 <&9"));
+        assert!(script.contains("seek(STDIN, 0, 0)"));
+        assert!(script.contains("exec /dev/fd/9 'doctor'"));
+        assert!(script.contains(&digest));
+    }
 
-    /// Atomic rename swaps two files on APFS — but in CI we just verify
-    /// the wrapper handles the `tempfile`-backed default filesystem.
-    /// Most macOS tmp dirs are APFS-backed so the swap path runs; if a
-    /// runner is HFS+ the fallback runs and the test still passes.
+    #[test]
+    fn pinned_script_rejects_relative_path_or_malformed_digest() {
+        let digest = "ab".repeat(64);
+        assert!(build_pinned_osa_script(&["silvervine"], &digest).is_err());
+        assert!(build_pinned_osa_script(&["/usr/bin/silvervine"], "not-a-digest").is_err());
+    }
+
+    /// Atomic rename swaps two files on APFS. Filesystems without native
+    /// `RENAME_SWAP` support fail closed.
     #[test]
     fn atomic_rename_swaps_two_files() {
         let tmp = TempDir::new().expect("tempdir");
@@ -351,15 +362,8 @@ mod tests {
         atomic_rename(&a, &b).expect("rename ok");
         let a_after = fs::read(&a).unwrap();
         let b_after = fs::read(&b).unwrap();
-        // Either the swap succeeded (both files exist with swapped
-        // content) or the fallback ran (only `b` exists with `a`'s
-        // content).
-        let swapped = a_after == b"BBB" && b_after == b"AAA";
-        let fell_back = !a.exists() && b_after == b"AAA";
-        assert!(
-            swapped || fell_back,
-            "neither swap nor fallback worked: a={a_after:?}, b={b_after:?}"
-        );
+        assert_eq!(a_after, b"BBB");
+        assert_eq!(b_after, b"AAA");
     }
 
     #[test]
@@ -371,36 +375,5 @@ mod tests {
         atomic_rename(&a, &b).expect("rename ok");
         assert!(!a.exists());
         assert_eq!(fs::read(&b).unwrap(), b"AAA");
-    }
-
-    #[test]
-    fn fallback_two_step_rename_swaps_into_place() {
-        let tmp = TempDir::new().expect("tempdir");
-        let src = tmp.path().join("src");
-        let dst = tmp.path().join("dst");
-        fs::write(&src, b"new").unwrap();
-        fs::write(&dst, b"old").unwrap();
-        fallback_two_step_rename(&src, &dst).expect("fallback ok");
-        assert!(!src.exists());
-        assert_eq!(fs::read(&dst).unwrap(), b"new");
-    }
-
-    #[test]
-    fn fallback_two_step_rename_recovers_when_step_2_fails() {
-        let tmp = TempDir::new().expect("tempdir");
-        let src = tmp.path().join("nonexistent");
-        let dst = tmp.path().join("dst");
-        fs::write(&dst, b"old").unwrap();
-        let r = fallback_two_step_rename(&src, &dst);
-        assert!(r.is_err());
-        assert!(dst.exists());
-    }
-
-    #[test]
-    fn message_or_appends_or_replaces() {
-        let err1 = Error::other("boom").message_or("ctx".into());
-        assert_eq!(err1.message, "ctx: boom");
-        let err2 = Error::other("").message_or("ctx".into());
-        assert_eq!(err2.message, "ctx");
     }
 }

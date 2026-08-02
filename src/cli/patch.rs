@@ -16,12 +16,11 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
-
 use crate::browsers::{self, Browser};
 use crate::cli::OutputOptions;
-use crate::error::{Error, Result};
-use crate::patch::{self, PatchOptions, PatchOutcome, PlatformPatcher};
+use crate::error::{Error, ErrorCategory, Result};
+pub use crate::patch::PatchReport;
+use crate::patch::{self, PatchOptions, PlatformPatcher};
 use crate::widevine::{self, CachedCdm};
 
 /// Args for `silvervine patch`.
@@ -31,6 +30,8 @@ pub struct Args {
     pub force: bool,
     /// `--dry-run`: run pre-flight + permission audit but skip the CDM write.
     pub dry_run: bool,
+    /// `--replace-external-cdm`: explicit consent to replace an unmarked CDM.
+    pub replace_external_cdm: bool,
     /// Optional positional arg: only patch the named browser.
     pub browser: Option<String>,
     /// Output flags.
@@ -49,78 +50,25 @@ pub struct PrivilegedArgs {
     /// Trusted same-filesystem directory selected by the unprivileged parent
     /// for exclusive snapshot creation.
     pub backup_parent: PathBuf,
-    /// Exact extracted CDM directory already verified by the parent.
+    /// Mutable extracted CDM directory selected by the parent.
     pub cdm_dir: PathBuf,
-    /// Exact CDM version associated with `cdm_dir`.
-    pub cdm_version: String,
+    /// Exact payload identity verified by the unprivileged parent.
+    pub managed_marker: crate::widevine::ownership::ManagedMarker,
     /// Browser display name used only for diagnostics and snapshots.
     pub browser_name: String,
+    /// Parent-selected ownership classification. `None` means a direct
+    /// hidden invocation and reconstructs as [`BrowserKind::Detected`].
+    pub browser_kind: Option<crate::browsers::BrowserKind>,
     /// Inherit the parent's running-browser override.
     pub force: bool,
+    /// Inherit the parent's explicit external-CDM replacement consent.
+    pub replace_external_cdm: bool,
 }
 
-/// JSON-friendly outcome record.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PatchReport {
-    /// Display name of the browser.
-    pub browser: String,
-    /// `true` when the patch succeeded (or dry-run completed).
-    pub success: bool,
-    /// CDM version that was written (or would have been, in dry-run).
-    pub cdm_version: Option<String>,
-    /// Browser version detected before patching.
-    pub version_before: Option<String>,
-    /// Browser version detected after patching.
-    pub version_after: Option<String>,
-    /// `true` if dry-run mode was used.
-    pub dry_run: bool,
-    /// Error message if `success == false`.
-    pub error: Option<String>,
-}
-
-impl PatchReport {
-    fn success(outcome: &PatchOutcome) -> Self {
-        Self {
-            browser: outcome.browser_name.clone(),
-            success: true,
-            cdm_version: Some(outcome.cdm_version.clone()),
-            version_before: outcome.version_before.clone(),
-            version_after: outcome.version_after.clone(),
-            dry_run: outcome.dry_run,
-            error: None,
-        }
-    }
-
-    fn failure(name: &str, dry_run: bool, error: &Error) -> Self {
-        Self {
-            browser: name.to_string(),
-            success: false,
-            cdm_version: None,
-            version_before: None,
-            version_after: None,
-            dry_run,
-            error: Some(error.to_string()),
-        }
-    }
-}
-
-/// Core patch loop, factored so it can be invoked by both the CLI
-/// runtime and (in Phase 4) the daemon's IPC handler.
+/// CLI boundary around the core [`patch::PatchBatch`] transaction.
 ///
-/// `browsers` is the list of detected browsers to consider. `name_filter`
-/// constrains it: when `Some(name)`, only the matching browser is
-/// patched; otherwise every entry is patched.
-///
-/// `cdm_resolver` is a closure that returns a [`CachedCdm`] — tests inject a
-/// synthetic CDM so they don't trigger downloads.
-///
-/// `patcher` is the [`PlatformPatcher`] (a mock in tests, the host
-/// impl in production via [`patch::host_patcher`]).
-///
-/// # Errors
-///
-/// Returns an aggregated error if **all** patches failed. Per-browser
-/// failures show up in the returned [`Vec<PatchReport>`] regardless.
+/// Browser selection and patch execution stay in the core module. This
+/// wrapper only emits user hooks after non-dry-run, non-privileged attempts.
 pub fn run_patch_flow<F>(
     browsers: &[Browser],
     name_filter: Option<&str>,
@@ -131,42 +79,8 @@ pub fn run_patch_flow<F>(
 where
     F: FnOnce() -> Result<CachedCdm>,
 {
-    let candidates: Vec<&Browser> = browsers
-        .iter()
-        .filter(|b| name_filter.is_none_or(|n| n.eq_ignore_ascii_case(b.name())))
-        .collect();
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-    // Lazily resolve the CDM only after we've confirmed we have at
-    // least one candidate. If CDM resolution fails, we still return a
-    // failure report per candidate rather than erroring out — the user
-    // sees what would have happened.
-    let cdm = match cdm_resolver() {
-        Ok(c) => c,
-        Err(e) => {
-            let reports: Vec<_> = candidates
-                .into_iter()
-                .map(|b| PatchReport::failure(b.name(), options.dry_run, &e))
-                .collect();
-            if should_emit_hooks(options) {
-                for report in &reports {
-                    crate::hooks::emit_post_patch(report);
-                }
-            }
-            return reports;
-        }
-    };
-    let reports: Vec<_> = candidates
-        .into_iter()
-        .map(|b| match patch::patch_browser(b, &cdm, patcher, options) {
-            Ok(outcome) => PatchReport::success(&outcome),
-            Err(e) => PatchReport::failure(b.name(), options.dry_run, &e),
-        })
-        .collect();
-    // The elevated child is intentionally filesystem-only: the normal parent
-    // owns user configuration and hook execution. Dry runs do not emit a
-    // post-patch event because no patch happened.
+    let candidates = patch::select_browsers(browsers, name_filter);
+    let reports = patch::PatchBatch::new(patcher, options).execute(&candidates, cdm_resolver);
     if should_emit_hooks(options) {
         for report in &reports {
             crate::hooks::emit_post_patch(report);
@@ -220,9 +134,7 @@ fn render_text(reports: &[PatchReport], dry_run: bool, out: &mut dyn Write) -> s
 
 /// Render reports as a pretty-printed JSON array.
 fn render_json(reports: &[PatchReport], out: &mut dyn Write) -> Result<()> {
-    let s = serde_json::to_string_pretty(reports)?;
-    writeln!(out, "{s}").map_err(Error::from)?;
-    Ok(())
+    super::write_json(out, reports)
 }
 
 /// CLI entry point.
@@ -232,10 +144,16 @@ fn render_json(reports: &[PatchReport], out: &mut dyn Write) -> Result<()> {
 /// * `Other` if no browsers were detected to patch.
 /// * Any error from browser detection, manifest retrieval, or CDM resolution.
 pub fn run(args: &Args) -> Result<()> {
+    if args.replace_external_cdm && args.browser.as_deref().is_none_or(str::is_empty) {
+        return Err(Error::other(
+            "--replace-external-cdm requires an explicit browser name;              bulk external CDM replacement is not allowed",
+        ));
+    }
     let detected = browsers::detect_browsers()?;
     let patcher = patch::host_patcher()?;
     let options = PatchOptions {
         force_while_running: args.force,
+        replace_external_cdm: args.replace_external_cdm,
         dry_run: args.dry_run,
         ..Default::default()
     };
@@ -263,18 +181,38 @@ pub fn run(args: &Args) -> Result<()> {
             None => "no browsers detected to patch".to_string(),
         }));
     }
-
-    // Exit with a non-zero category if everything failed; otherwise
-    // success even if some entries failed (parity with `apt-get`-style
-    // "we did what we could").
-    if reports.iter().all(|r| !r.success) {
-        let first_err = reports
-            .iter()
-            .find_map(|r| r.error.as_deref())
-            .unwrap_or("all patches failed");
-        return Err(Error::other(first_err.to_string()));
+    if let Some(error) = all_failed_error(&reports) {
+        return Err(error);
     }
     Ok(())
+}
+
+fn all_failed_error(reports: &[PatchReport]) -> Option<Error> {
+    if reports.is_empty() || reports.iter().any(|report| report.success) {
+        return None;
+    }
+    let report = reports.first()?;
+    let category = report.error_category.unwrap_or(ErrorCategory::Other);
+    let rendered = report.error.as_deref().unwrap_or("all patches failed");
+    let prefix = format!("{category}: ");
+    let message = rendered.strip_prefix(&prefix).unwrap_or(rendered);
+    Some(Error::new(category, message))
+}
+
+/// Reconstruct the parent-selected browser for the privileged child.
+///
+/// Direct hidden invocations omit `browser_kind` and default to
+/// [`BrowserKind::Detected`]; elevated parents pass the closed token.
+#[must_use]
+pub fn privileged_browser(args: &PrivilegedArgs) -> Browser {
+    Browser {
+        name: args.browser_name.clone(),
+        install_path: args.install_path.clone(),
+        kind: args
+            .browser_kind
+            .unwrap_or(crate::browsers::BrowserKind::Detected),
+        framework_name: args.framework_name.clone(),
+    }
 }
 
 /// Execute the narrow privileged child operation. This function deliberately
@@ -301,12 +239,8 @@ pub fn run_privileged(args: &PrivilegedArgs) -> Result<()> {
             args.install_path.display()
         )));
     }
-    if !args.cdm_dir.is_dir() {
-        return Err(Error::unknown_bundle_structure(format!(
-            "CachedCdm directory does not exist: {}",
-            args.cdm_dir.display()
-        )));
-    }
+    // Do not inspect the user-writable source path with path-following APIs.
+    // `stage_verified_payload` resolves each component with openat+O_NOFOLLOW.
     #[cfg(target_os = "macos")]
     let pinned_layout = {
         let framework = args.framework_name.as_deref().ok_or_else(|| {
@@ -328,13 +262,18 @@ pub fn run_privileged(args: &PrivilegedArgs) -> Result<()> {
         pinned_layout.0,
         pinned_layout.1,
     )?;
-    let browser = Browser {
-        name: args.browser_name.clone(),
-        install_path: args.install_path.clone(),
-        kind: crate::browsers::BrowserKind::Detected,
-        framework_name: args.framework_name.clone(),
-    };
-    let cdm = CachedCdm::new(args.cdm_version.clone(), args.cdm_dir.clone());
+    let staged = crate::widevine::ownership::stage_verified_payload(
+        &args.cdm_dir,
+        &args.backup_parent,
+        &args.managed_marker,
+    )?;
+    let browser = privileged_browser(args);
+    let cdm = CachedCdm::from_verified_payload(
+        args.managed_marker.cdm_version.clone(),
+        staged.path().to_owned(),
+        args.managed_marker.library_sha512.clone(),
+        args.managed_marker.manifest_sha512.clone(),
+    );
     let patcher = patch::host_patcher_for_layout(
         args.framework_name.as_deref(),
         args.framework_version.as_deref(),
@@ -345,6 +284,7 @@ pub fn run_privileged(args: &PrivilegedArgs) -> Result<()> {
         patcher.as_ref(),
         &PatchOptions {
             force_while_running: args.force,
+            replace_external_cdm: args.replace_external_cdm,
             backups_dir: Some(args.backup_parent.clone()),
             as_root: true,
             ..Default::default()
@@ -362,6 +302,20 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+    fn test_managed_marker() -> crate::widevine::ownership::ManagedMarker {
+        let manifest = br#"{"version":"1.0"}"#;
+        crate::widevine::ownership::ManagedMarker {
+            schema_version: 3,
+            silvervine_version: env!("CARGO_PKG_VERSION").into(),
+            cdm_version: "1.0".into(),
+            platform: crate::widevine::current_platform_key()
+                .expect("platform")
+                .as_str()
+                .into(),
+            library_sha512: "0".repeat(128),
+            manifest_sha512: crate::widevine::sha512_hex(manifest),
+        }
+    }
 
     /// Same mock used by `crate::patch` tests, copied here for self-
     /// containedness.
@@ -385,7 +339,7 @@ mod tests {
     }
 
     impl PlatformPatcher for MockPatcher {
-        fn write_cdm(&self, target: &Path, _cdm_source: &Path) -> Result<()> {
+        fn write_cdm(&self, target: &Path, cdm_source: &Path) -> Result<()> {
             self.write_calls.fetch_add(1, Ordering::SeqCst);
             if self.write_should_fail {
                 return Err(Error::permission_denied(format!(
@@ -393,6 +347,24 @@ mod tests {
                     target.display()
                 )));
             }
+            let destination = target.join("WidevineCdm");
+            let platform = destination
+                .join("_platform_specific")
+                .join(test_platform_dir());
+            fs::create_dir_all(&platform).map_err(Error::from)?;
+            fs::copy(
+                cdm_source.join("manifest.json"),
+                destination.join("manifest.json"),
+            )
+            .map_err(Error::from)?;
+            fs::copy(
+                cdm_source
+                    .join("_platform_specific")
+                    .join(test_platform_dir())
+                    .join(test_library_name()),
+                platform.join(test_library_name()),
+            )
+            .map_err(Error::from)?;
             fs::write(target.join("CDM_WRITTEN"), b"1").map_err(Error::from)?;
             Ok(())
         }
@@ -423,14 +395,37 @@ mod tests {
 
     fn make_cdm(root: &Path, version: &str) -> CachedCdm {
         let dir = root.join(version);
-        fs::create_dir_all(dir.join("_platform_specific/linux_x64")).unwrap();
-        fs::write(
-            dir.join("_platform_specific/linux_x64/libwidevinecdm.so"),
-            b"fake",
+        let platform = dir.join("_platform_specific").join(test_platform_dir());
+        fs::create_dir_all(&platform).unwrap();
+        fs::write(platform.join(test_library_name()), b"fake").unwrap();
+        let manifest_body = format!(r#"{{"version":"{version}"}}"#);
+        fs::write(dir.join("manifest.json"), &manifest_body).unwrap();
+        CachedCdm::from_verified_payload(
+            version.to_string(),
+            dir,
+            crate::widevine::sha512_hex(b"fake"),
+            crate::widevine::sha512_hex(manifest_body.as_bytes()),
         )
-        .unwrap();
-        fs::write(dir.join("manifest.json"), br#"{"version":"x"}"#).unwrap();
-        CachedCdm::new(version.to_string(), dir)
+    }
+
+    fn test_platform_dir() -> &'static str {
+        if cfg!(target_os = "macos") {
+            if cfg!(target_arch = "aarch64") {
+                "mac_arm64"
+            } else {
+                "mac_x64"
+            }
+        } else {
+            "linux_x64"
+        }
+    }
+
+    fn test_library_name() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "libwidevinecdm.dylib"
+        } else {
+            "libwidevinecdm.so"
+        }
     }
 
     #[test]
@@ -484,6 +479,42 @@ mod tests {
         assert_eq!(reports[0].browser, "Helium");
         assert!(reports[0].success);
     }
+    #[test]
+    fn external_replacement_requires_one_unique_installation() {
+        let tmp = TempDir::new().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let browsers_list = vec![
+            make_browser(first, "Chromium"),
+            make_browser(second, "Chromium"),
+        ];
+        let patcher = MockPatcher::with_version("v");
+        let opts = PatchOptions {
+            force_while_running: true,
+            replace_external_cdm: true,
+            lock_path: Some(tmp.path().join("patch.lock")),
+            backups_dir: Some(tmp.path().join("backups")),
+            ..Default::default()
+        };
+
+        let reports = run_patch_flow(
+            &browsers_list,
+            Some("Chromium"),
+            || panic!("ambiguous override must not resolve a CDM"),
+            &patcher,
+            &opts,
+        );
+
+        assert_eq!(reports.len(), 2);
+        assert!(reports.iter().all(|report| !report.success));
+        assert!(reports.iter().all(|report| report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("multiple installations"))));
+        assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn run_patch_flow_case_insensitive_filter() {
@@ -521,6 +552,7 @@ mod tests {
         let patcher = MockPatcher::with_version("v");
         let opts = PatchOptions {
             force_while_running: true,
+            replace_external_cdm: false,
             dry_run: true,
             lock_path: Some(tmp.path().join("patch.lock")),
             backups_dir: Some(tmp.path().join("backups")),
@@ -602,6 +634,7 @@ mod tests {
             version_after: Some("128".into()),
             dry_run: true,
             error: None,
+            error_category: None,
         }];
         let mut buf = Vec::new();
         render_text(&reports, true, &mut buf).unwrap();
@@ -621,6 +654,7 @@ mod tests {
             version_after: None,
             dry_run: false,
             error: Some("disk full".into()),
+            error_category: None,
         }];
         let mut buf = Vec::new();
         render_text(&reports, false, &mut buf).unwrap();
@@ -647,6 +681,7 @@ mod tests {
             version_after: None,
             dry_run: false,
             error: None,
+            error_category: None,
         }];
         let mut buf = Vec::new();
         render_json(&reports, &mut buf).unwrap();
@@ -671,9 +706,11 @@ mod tests {
             framework_version: None,
             backup_parent: tmp.path().to_path_buf(),
             cdm_dir: cdm,
-            cdm_version: "1.0".into(),
+            managed_marker: test_managed_marker(),
             browser_name: "Custom".into(),
+            browser_kind: None,
             force: true,
+            replace_external_cdm: false,
         })
         .unwrap_err();
         assert!(error.to_string().contains("parent-selected framework"));
@@ -689,9 +726,95 @@ mod tests {
             version_after: None,
             dry_run: false,
             error: None,
+            error_category: None,
         };
         let s = serde_json::to_string(&r).unwrap();
         let back: PatchReport = serde_json::from_str(&s).unwrap();
         assert_eq!(back.browser, "X");
+    }
+
+    #[test]
+    fn aggregated_failure_preserves_external_cdm_category() {
+        let report = PatchReport::failure(
+            "Custom Chromium",
+            false,
+            &Error::external_cdm("existing CDM was preserved"),
+        );
+
+        let error = all_failed_error(&[report]).expect("failure");
+
+        assert_eq!(error.category, crate::ErrorCategory::ExternalCdm);
+        assert_eq!(error.message, "existing CDM was preserved");
+    }
+
+    #[test]
+    fn replace_external_cdm_requires_explicit_browser_name() {
+        let err = run(&Args {
+            replace_external_cdm: true,
+            browser: None,
+            ..Args::default()
+        })
+        .expect_err("untargeted override must fail");
+        assert!(
+            err.to_string().contains("--replace-external-cdm"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("explicit browser"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn replace_external_cdm_rejects_empty_browser_name() {
+        let err = run(&Args {
+            replace_external_cdm: true,
+            browser: Some(String::new()),
+            ..Args::default()
+        })
+        .expect_err("empty browser name must fail");
+        assert!(err.to_string().contains("explicit browser"));
+    }
+
+    #[test]
+    fn privileged_browser_preserves_known_kind_when_supplied() {
+        let tmp = TempDir::new().unwrap();
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).unwrap();
+        let browser = privileged_browser(&PrivilegedArgs {
+            install_path: install.clone(),
+            framework_name: None,
+            framework_version: None,
+            backup_parent: tmp.path().to_path_buf(),
+            cdm_dir: tmp.path().join("cdm"),
+            managed_marker: test_managed_marker(),
+            browser_name: "Helium".into(),
+            browser_kind: Some(BrowserKind::Known),
+            force: false,
+            replace_external_cdm: false,
+        });
+        assert_eq!(browser.kind, BrowserKind::Known);
+        assert_eq!(browser.name, "Helium");
+        assert_eq!(browser.install_path, install);
+    }
+
+    #[test]
+    fn privileged_browser_defaults_to_detected_without_kind() {
+        let tmp = TempDir::new().unwrap();
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).unwrap();
+        let browser = privileged_browser(&PrivilegedArgs {
+            install_path: install,
+            framework_name: None,
+            framework_version: None,
+            backup_parent: tmp.path().to_path_buf(),
+            cdm_dir: tmp.path().join("cdm"),
+            managed_marker: test_managed_marker(),
+            browser_name: "Custom".into(),
+            browser_kind: None,
+            force: false,
+            replace_external_cdm: false,
+        });
+        assert_eq!(browser.kind, BrowserKind::Detected);
     }
 }

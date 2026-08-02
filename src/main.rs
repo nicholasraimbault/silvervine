@@ -69,6 +69,11 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
 
+        /// Replace an existing unmarked CDM that Silvervine cannot prove it owns.
+        /// Requires an explicit browser positional so bulk replacement is impossible.
+        #[arg(long, requires = "browser")]
+        replace_external_cdm: bool,
+
         /// Optional: specific browser name to patch (e.g. "Helium").
         browser: Option<String>,
     },
@@ -93,17 +98,25 @@ enum Command {
         #[arg(long)]
         share: bool,
 
+        /// Collect passive browser/CDM/host media-stack evidence without launching a browser.
+        #[arg(long = "media-stack", conflicts_with = "error_code")]
+        media_stack: bool,
+
+        /// Limit passive media-stack collection to one browser name.
+        #[arg(long, requires = "media_stack")]
+        browser: Option<String>,
+
         /// EME error code to translate (e.g. Netflix N8156-6013).
         error_code: Option<String>,
     },
 
-    /// Run an EME health check against a known test page.
+    /// Run a browser-reported EME capability check.
     Test {
         /// Override the browser to test against.
         #[arg(long)]
         browser: Option<String>,
 
-        /// Override the test URL (defaults to the Shaka Player demo).
+        /// Open a manual test page instead of running the automated capability probe.
         #[arg(long)]
         url: Option<String>,
     },
@@ -153,12 +166,18 @@ enum Command {
         backup_parent: PathBuf,
         #[arg(long)]
         cdm_dir: PathBuf,
-        #[arg(long)]
-        cdm_version: String,
+        #[arg(long, value_parser = parse_managed_marker)]
+        managed_marker: Box<silvervine::widevine::ownership::ManagedMarker>,
         #[arg(long)]
         browser_name: String,
+        /// Closed ownership classification token from the locked parent.
+        /// Direct hidden invocations omit this and reconstruct as Detected.
+        #[arg(long, value_parser = parse_browser_kind_token)]
+        browser_kind: Option<silvervine::browsers::BrowserKind>,
         #[arg(long)]
         force: bool,
+        #[arg(long)]
+        replace_external_cdm: bool,
     },
 }
 
@@ -187,9 +206,11 @@ fn main() -> ExitCode {
         framework_version,
         backup_parent,
         cdm_dir,
-        cdm_version,
+        managed_marker,
         browser_name,
+        browser_kind,
         force,
+        replace_external_cdm,
     }) = &cli.command
     {
         let result = cli::patch::run_privileged(&cli::patch::PrivilegedArgs {
@@ -198,9 +219,36 @@ fn main() -> ExitCode {
             framework_version: framework_version.clone(),
             backup_parent: backup_parent.clone(),
             cdm_dir: cdm_dir.clone(),
-            cdm_version: cdm_version.clone(),
+            managed_marker: managed_marker.as_ref().clone(),
             browser_name: browser_name.clone(),
+            browser_kind: *browser_kind,
             force: *force,
+            replace_external_cdm: *replace_external_cdm,
+        });
+        return result.map_or_else(
+            |error| {
+                eprintln!("silvervine: {error}");
+                ExitCode::from(category_to_exit_code(&error))
+            },
+            |()| ExitCode::SUCCESS,
+        );
+    }
+
+    // Passive media-stack diagnostics must not migrate XDG state or open logs.
+    if let Some(Command::Doctor {
+        share,
+        media_stack: true,
+        browser,
+        error_code: None,
+    }) = &cli.command
+    {
+        let output = cli::OutputOptions::from_flags(cli.json, cli.quiet, cli.no_color);
+        let result = cli::doctor::run(&cli::doctor::Args {
+            error_code: None,
+            share: *share,
+            media_stack: true,
+            browser: browser.clone(),
+            output,
         });
         return result.map_or_else(
             |error| {
@@ -234,6 +282,19 @@ fn main() -> ExitCode {
             ExitCode::from(category_to_exit_code(&e))
         }
     }
+}
+
+fn parse_browser_kind_token(value: &str) -> Result<silvervine::browsers::BrowserKind, String> {
+    silvervine::browsers::BrowserKind::from_str_token(value).ok_or_else(|| {
+        format!("invalid browser kind '{value}'; expected known, detected, or custom")
+    })
+}
+fn parse_managed_marker(
+    value: &str,
+) -> Result<Box<silvervine::widevine::ownership::ManagedMarker>, String> {
+    serde_json::from_str(value)
+        .map(Box::new)
+        .map_err(|error| format!("invalid managed marker: {error}"))
 }
 
 fn prepare_startup_migration() -> silvervine::Result<Vec<silvervine::migration::DataMigrationEntry>>
@@ -282,10 +343,12 @@ fn dispatch(cmd: Command, output: cli::OutputOptions) -> silvervine::Result<()> 
         Command::Patch {
             force,
             dry_run,
+            replace_external_cdm,
             browser,
         } => cli::patch::run(&cli::patch::Args {
             force,
             dry_run,
+            replace_external_cdm,
             browser,
             output,
         }),
@@ -293,9 +356,16 @@ fn dispatch(cmd: Command, output: cli::OutputOptions) -> silvervine::Result<()> 
         Command::ListBrowsers { all } => {
             cli::list_browsers::run(&cli::list_browsers::Args { all, output })
         }
-        Command::Doctor { share, error_code } => cli::doctor::run(&cli::doctor::Args {
+        Command::Doctor {
+            share,
+            media_stack,
+            browser,
+            error_code,
+        } => cli::doctor::run(&cli::doctor::Args {
             error_code,
             share,
+            media_stack,
+            browser,
             output,
         }),
         Command::Test { browser, url } => cli::test::run(&cli::test::Args {
@@ -342,6 +412,9 @@ fn category_to_exit_code(err: &Error) -> u8 {
         ErrorCategory::DaemonNotRunning => 18,
         ErrorCategory::StateCorrupted => 19,
         ErrorCategory::UnsupportedPlatform => 20,
+        ErrorCategory::ExternalCdm => 21,
+        ErrorCategory::InvalidMarker => 22,
+        ErrorCategory::BrowserProbeFailed => 23,
         ErrorCategory::Other => 1,
     }
 }

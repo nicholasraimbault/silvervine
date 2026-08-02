@@ -1,64 +1,61 @@
-//! `silvervine test` — EME (Widevine) playback health check.
+//! `silvervine test` — explicit live browser EME capability testing.
 //!
-//! Designed to spawn a headless Chromium-family browser against a known
-//! EME test page (e.g. Shaka Player demo). Verifies whether the patched
-//! browser can actually play Widevine-protected content end-to-end.
-//!
-//! ## Critical guardrail
-//!
-//! The actual browser launch is gated behind a runtime path that is
-//! **only triggered when the user invokes `silvervine test` from the
-//! command line** — never from tests. Inside `cargo test`, every
-//! [`Plan::execute`] short-circuits via `SILVERVINE_TEST_BROWSER_TEST_NOOP=1`
-//! (set by the test harness when it doesn't want the real browser
-//! launched).
-//!
-//! A second, env-var-independent safety: tests never call `Plan::
-//! execute_real_browser`. They drive the wholly-pure [`Plan::dry_run`]
-//! method to verify the orchestration logic.
+//! With no URL override, this command launches the selected browser with its
+//! normal profile against Silvervine's tokenized loopback probe. `--url`
+//! preserves the manual test-page launcher and deliberately reports no
+//! automated playback result.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::thread;
+use std::time::Duration;
 
-use crate::browsers::{self, Browser};
+use crate::browsers::{self, runtime, Browser};
 use crate::cli::OutputOptions;
+use crate::diagnostics::collect::{collect_browser, BrowserDiagnostics};
+use crate::diagnostics::store::{save_default, ProbeFingerprint, StoredProbeReport};
+use crate::diagnostics::{DiagnosticCheck, DiagnosticStatus};
+use crate::eme::browser_probe::run_browser_probe;
+use crate::eme::probe::{CapabilityAssessment, RawProbeResult};
 use crate::error::{Error, Result};
 
-/// Env var that, when set, makes [`Plan::execute_real_browser`] return
-/// `Ok(())` without actually spawning a browser. Used by integration
-/// tests + by the `cargo test` harness for safety.
+/// Test-only guard that prevents both manual and automated browser launches.
 pub const NOOP_ENV: &str = "SILVERVINE_TEST_BROWSER_TEST_NOOP";
 
-/// URL of the default EME test page. Shaka Player's demo is the
-/// canonical "does Widevine work?" page on the open web; it serves an
-/// MPEG-DASH manifest with Widevine-encrypted segments.
+/// Default page used only by the manual launch plan in tests and callers that
+/// do not supply a URL.
 pub const DEFAULT_TEST_URL: &str = "https://shaka-player-demo.appspot.com/demo/";
 
 /// Args for `silvervine test`.
 #[derive(Debug, Clone, Default)]
 pub struct Args {
-    /// Optional positional: which browser to use. Defaults to the
-    /// first detected browser.
+    /// Browser to use. Defaults to the first detected browser.
     pub browser: Option<String>,
-    /// Override the test URL (for staging-environment QA, etc.).
+    /// Open a manual test page instead of collecting an automated result.
     pub url: Option<String>,
     /// Output flags.
     pub output: OutputOptions,
 }
 
-/// Plan describing what `silvervine test` would do.
-///
-/// Tests build a [`Plan`] from synthetic input and assert against its
-/// fields directly. Production code calls [`Plan::execute_real_browser`]
-/// to actually run the browser.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Manual page-launch plan used by the `--url` compatibility mode.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Plan {
+    #[serde(rename = "browser")]
     /// Browser to launch.
     pub browser_name: String,
     /// Absolute path to the browser binary that would be spawned.
+    #[serde(rename = "executable", serialize_with = "serialize_path_lossy")]
     pub browser_executable: PathBuf,
     /// URL to navigate to.
     pub url: String,
+}
+
+fn serialize_path_lossy<S>(path: &Path, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(path.to_string_lossy().as_ref())
 }
 
 impl Plan {
@@ -71,16 +68,8 @@ impl Plan {
     /// * `UnknownBundleStructure` if the matched browser's install path
     ///   doesn't yield a runnable executable.
     pub fn build(detected: &[Browser], args: &Args) -> Result<Self> {
-        let candidate = match &args.browser {
-            Some(name) => detected
-                .iter()
-                .find(|b| b.name().eq_ignore_ascii_case(name))
-                .ok_or_else(|| Error::other(format!("no detected browser named '{name}'")))?,
-            None => detected
-                .first()
-                .ok_or_else(|| Error::other("no browsers detected to run EME test against"))?,
-        };
-        let browser_executable = browser_executable_path(candidate)?;
+        let candidate = select_browser(detected, args.browser.as_deref())?;
+        let browser_executable = runtime::executable_path(candidate)?;
         Ok(Self {
             browser_name: candidate.name().to_string(),
             browser_executable,
@@ -113,62 +102,35 @@ impl Plan {
         if std::env::var_os(NOOP_ENV).is_some() {
             return Ok(());
         }
-        let mut cmd = std::process::Command::new(&self.browser_executable);
-        cmd.arg(&self.url);
-        // Detach: we're not awaiting the browser's lifetime. The user
-        // will close it manually.
-        cmd.spawn().map_err(|e| {
-            Error::other(format!(
-                "failed to spawn {}: {e}",
-                self.browser_executable.display()
-            ))
-        })?;
+        let mut child = std::process::Command::new(&self.browser_executable)
+            .arg(&self.url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| {
+                Error::other(format!(
+                    "failed to spawn {}",
+                    self.browser_executable.display()
+                ))
+                .with_source(error)
+            })?;
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
         Ok(())
     }
 }
 
-/// Resolve the executable path for `browser`.
-///
-/// On Linux this looks for a `chrome`, `chromium`, or
-/// `<lower-case-name>` binary inside the install path. On macOS it
-/// returns `<bundle>/Contents/MacOS/<bundle stem>`.
-fn browser_executable_path(browser: &Browser) -> Result<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        let app = browser.install_path();
-        let stem = app.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
-            Error::unknown_bundle_structure(format!("no bundle name for {}", app.display()))
-        })?;
-        Ok(app.join("Contents").join("MacOS").join(stem))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        // Try the most common Chromium-family binary names. Prefer the
-        // browser's lowercase name, then `chrome`, `chromium`, etc.
-        let install = browser.install_path();
-        let candidates = [
-            browser.name().to_lowercase(),
-            "chrome".into(),
-            "chromium".into(),
-            "chromium-browser".into(),
-        ];
-        for name in &candidates {
-            let p = install.join(name);
-            if p.is_file() {
-                return Ok(p);
-            }
-        }
-        Err(Error::unknown_bundle_structure(format!(
-            "could not locate browser executable in {}",
-            install.display()
-        )))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = browser;
-        Err(Error::unsupported_platform(
-            "browser-launch resolution is only implemented on Linux and macOS",
-        ))
+fn select_browser<'a>(detected: &'a [Browser], name: Option<&str>) -> Result<&'a Browser> {
+    match name {
+        Some(name) => detected
+            .iter()
+            .find(|browser| browser.name().eq_ignore_ascii_case(name))
+            .ok_or_else(|| Error::other(format!("no detected browser named '{name}'"))),
+        None => detected
+            .first()
+            .ok_or_else(|| Error::other("no browsers detected to run EME test against")),
     }
 }
 
@@ -176,35 +138,348 @@ fn browser_executable_path(browser: &Browser) -> Result<PathBuf> {
 ///
 /// # Errors
 ///
-/// * `Other` if no browsers are detected.
-/// * Any error from browser detection or `browser_executable_path`.
+/// Returns browser detection, launch, probe, persistence, or output errors.
+/// A completed automated probe also returns an error when the software
+/// playback baseline does not pass.
 pub fn run(args: &Args) -> Result<()> {
     let detected = browsers::detect_browsers()?;
-    let plan = Plan::build(&detected, args)?;
+    let browser = select_browser(&detected, args.browser.as_deref())?;
+    if args.url.is_some() {
+        return run_manual(&detected, args);
+    }
+    run_automated(browser, args)
+}
+
+fn run_manual(detected: &[Browser], args: &Args) -> Result<()> {
+    let plan = Plan::build(detected, args)?;
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
     if args.output.json {
         let body = serde_json::json!({
+            "mode": "manual_page",
             "browser": plan.browser_name,
-            "executable": plan.browser_executable.display().to_string(),
+            "executable": plan.browser_executable,
             "url": plan.url,
+            "automated_result": null,
         });
-        writeln!(handle, "{}", serde_json::to_string_pretty(&body)?).map_err(Error::from)?;
+        super::write_json(&mut handle, &body)?;
     } else {
         writeln!(handle, "{}", plan.dry_run()).map_err(Error::from)?;
         writeln!(
             handle,
-            "(network + display dependent — pass --noop to skip browser launch)",
+            "Manual page mode: Silvervine will not claim an automated playback result.",
         )
         .map_err(Error::from)?;
     }
     plan.execute_real_browser()
 }
 
+fn run_automated(browser: &Browser, args: &Args) -> Result<()> {
+    if std::env::var_os(NOOP_ENV).is_some() {
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        if args.output.json {
+            writeln!(
+                handle,
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "mode": "automated",
+                    "browser": browser.name(),
+                    "noop": true,
+                }))?
+            )
+            .map_err(Error::from)?;
+        } else {
+            writeln!(
+                handle,
+                "Would run the browser-reported EME capability probe for {}.",
+                browser.name()
+            )
+            .map_err(Error::from)?;
+        }
+        return Ok(());
+    }
+
+    if !args.output.json {
+        eprintln!(
+            "Launching {} with its normal profile for a browser-reported EME capability check…",
+            browser.name()
+        );
+    }
+    let pre_passive = collect_browser(browser);
+    let outcome = run_browser_probe(browser, Duration::from_secs(60), &pre_passive.ownership)
+        .map_err(|error| {
+            if matches!(
+                error.category,
+                crate::ErrorCategory::BrowserProbeFailed
+                    | crate::ErrorCategory::StateCorrupted
+                    | crate::ErrorCategory::NetworkError
+            ) {
+                Error::browser_probe_failed(error.message.clone()).with_source(error)
+            } else {
+                error
+            }
+        })?;
+    // Recollect after launch so cache keys never outlive a mutated binary/CDM identity.
+    let post_passive = collect_browser(browser);
+    let probe = outcome.raw;
+    let assessment = outcome.assessment;
+    let identity = resolve_live_probe_identity(browser.name(), &pre_passive, &post_passive);
+    let (cache_path, cache_warning) = if identity.exact_fingerprint.is_some() {
+        persist_report(browser, &post_passive, &probe, &assessment)
+    } else {
+        (None, identity.cache_warning.clone())
+    };
+
+    let stored = build_stored_report(
+        browser,
+        &post_passive,
+        identity.exact_fingerprint.clone(),
+        probe,
+        assessment.clone(),
+    )?;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    if args.output.json {
+        // Exactly one StoredProbeReport document on stdout.
+        writeln!(handle, "{}", serde_json::to_string_pretty(&stored)?).map_err(Error::from)?;
+        if let Some(warning) = &cache_warning {
+            eprintln!("warning: {warning}");
+        }
+    } else {
+        render_live_text(
+            browser.name(),
+            &post_passive,
+            &assessment,
+            cache_path.as_deref(),
+            cache_warning.as_deref(),
+            &mut handle,
+        )
+        .map_err(Error::from)?;
+    }
+    // Optional row Warn must not fail the command. Overall Unavailable means the
+    // software baseline could not be established (EME API/baseline missing) and
+    // is a BrowserProbeFailed exit, same as Fail.
+    match assessment.status {
+        DiagnosticStatus::Fail | DiagnosticStatus::Unavailable => {
+            Err(Error::browser_probe_failed(format!(
+                "{} did not meet the browser-reported software playback baseline",
+                browser.name()
+            )))
+        }
+        DiagnosticStatus::Pass | DiagnosticStatus::Warn => Ok(()),
+    }
+}
+
+/// Exact-cache decision for one live probe: both pre-launch and post-probe
+/// fingerprints must exist and compare equal before evidence may be persisted
+/// or labeled as an exact fingerprint match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveProbeIdentity {
+    /// Post-probe fingerprint cloned only when pre/post are complete and identical.
+    exact_fingerprint: Option<ProbeFingerprint>,
+    /// Present whenever the live report must not be cached under an exact key.
+    cache_warning: Option<String>,
+}
+
+/// Prove whether a live report is exact/cacheable from pre/post passive evidence.
+///
+/// Returns [`LiveProbeIdentity::exact_fingerprint`] only when both fingerprints
+/// exist and are byte-for-byte equal. Identity mutation or any incomplete side
+/// yields no exact key and a clear no-cache warning.
+#[must_use]
+fn resolve_live_probe_identity(
+    browser_name: &str,
+    pre: &BrowserDiagnostics,
+    post: &BrowserDiagnostics,
+) -> LiveProbeIdentity {
+    match (&pre.fingerprint, &post.fingerprint) {
+        (Some(pre_fp), Some(post_fp)) if pre_fp == post_fp => LiveProbeIdentity {
+            exact_fingerprint: Some(post_fp.clone()),
+            cache_warning: None,
+        },
+        (Some(_), Some(_)) => LiveProbeIdentity {
+            exact_fingerprint: None,
+            cache_warning: Some(format!(
+                "browser/CDM identity changed during live probe for {browser_name}; report not cached"
+            )),
+        },
+        _ => LiveProbeIdentity {
+            exact_fingerprint: None,
+            cache_warning: Some(format!(
+                "exact browser fingerprint unavailable for {browser_name}; report not cached"
+            )),
+        },
+    }
+}
+
+fn persist_report(
+    browser: &Browser,
+    passive: &BrowserDiagnostics,
+    probe: &RawProbeResult,
+    assessment: &CapabilityAssessment,
+) -> (Option<PathBuf>, Option<String>) {
+    persist_report_to(None, browser, passive, probe, assessment)
+}
+
+fn persist_report_to(
+    root: Option<&Path>,
+    browser: &Browser,
+    passive: &BrowserDiagnostics,
+    probe: &RawProbeResult,
+    assessment: &CapabilityAssessment,
+) -> (Option<PathBuf>, Option<String>) {
+    let Some(fingerprint) = passive.fingerprint.clone() else {
+        return (
+            None,
+            Some(format!(
+                "exact browser fingerprint unavailable for {}; report not cached",
+                browser.name()
+            )),
+        );
+    };
+    let stored = match StoredProbeReport::now(
+        browser.name(),
+        fingerprint,
+        probe.clone(),
+        assessment.clone(),
+    ) {
+        Ok(stored) => stored,
+        Err(error) => {
+            return (
+                None,
+                Some(format!(
+                    "could not cache live probe report for {}: {}",
+                    browser.name(),
+                    error.message
+                )),
+            );
+        }
+    };
+    let save = match root {
+        Some(root) => crate::diagnostics::store::save_report(root, &stored),
+        None => save_default(&stored),
+    };
+    match save {
+        Ok(path) => (Some(path), None),
+        Err(error) => (
+            None,
+            Some(format!(
+                "could not cache live probe report for {}: {}",
+                browser.name(),
+                error.message
+            )),
+        ),
+    }
+}
+
+fn build_stored_report(
+    browser: &Browser,
+    passive: &BrowserDiagnostics,
+    exact_fingerprint: Option<ProbeFingerprint>,
+    probe: RawProbeResult,
+    assessment: CapabilityAssessment,
+) -> Result<StoredProbeReport> {
+    if let Some(fingerprint) = exact_fingerprint {
+        return StoredProbeReport::now(browser.name(), fingerprint, probe, assessment);
+    }
+    // JSON mode still emits exactly one StoredProbeReport even without a cacheable
+    // fingerprint. Never claim the pre-launch or a mutated post-launch payload.
+    let fingerprint = ProbeFingerprint::new(
+        passive.browser_executable.as_ref().map_or_else(
+            || format!("unresolved:{}", browser.name()),
+            |path| path.display().to_string(),
+        ),
+        passive.browser_version.clone(),
+        0,
+        0,
+        "unavailable",
+        Vec::new(),
+    );
+    StoredProbeReport::now(browser.name(), fingerprint, probe, assessment)
+}
+
+fn render_live_text(
+    browser: &str,
+    passive: &BrowserDiagnostics,
+    assessment: &CapabilityAssessment,
+    cache_path: Option<&Path>,
+    cache_warning: Option<&str>,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
+    writeln!(out, "Silvervine EME capability test — {browser}")?;
+    writeln!(
+        out,
+        "Baseline: {} ({:?}) — {}",
+        status_name(assessment.status),
+        assessment.domain,
+        assessment.summary
+    )?;
+    if !assessment.findings.is_empty() {
+        writeln!(out, "Findings:")?;
+        for finding in &assessment.findings {
+            writeln!(out, "  - {finding}")?;
+        }
+    }
+    if !assessment.actions.is_empty() {
+        writeln!(out, "Actions:")?;
+        for action in &assessment.actions {
+            writeln!(out, "  - {action}")?;
+        }
+    }
+    if !assessment.service_limits.is_empty() {
+        writeln!(out, "Service limits:")?;
+        for limit in &assessment.service_limits {
+            writeln!(out, "  - {limit}")?;
+        }
+    }
+    for check in passive.checks.iter().chain(&assessment.checks) {
+        render_check(check, out)?;
+    }
+    match cache_path {
+        Some(path) => writeln!(out, "Cached exact-fingerprint report: {}", path.display())?,
+        None => writeln!(out, "Report cache path: null")?,
+    }
+    if let Some(warning) = cache_warning {
+        writeln!(out, "Cache warning: {warning}")?;
+    }
+    writeln!(
+        out,
+        "Boundary: browser-reported evidence is not certified L1 or service entitlement."
+    )
+}
+
+fn render_check(check: &DiagnosticCheck, out: &mut dyn Write) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "  [{}] {} ({:?}/{:?})",
+        status_name(check.status),
+        check.summary,
+        check.source,
+        check.failure_domain
+    )?;
+    if let Some(action) = &check.action {
+        writeln!(out, "      Action: {action}")?;
+    }
+    Ok(())
+}
+
+fn status_name(status: DiagnosticStatus) -> &'static str {
+    match status {
+        DiagnosticStatus::Pass => "PASS",
+        DiagnosticStatus::Warn => "WARN",
+        DiagnosticStatus::Fail => "FAIL",
+        DiagnosticStatus::Unavailable => "UNAVAILABLE",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::browsers::BrowserKind;
+    use crate::diagnostics::store::STORE_SCHEMA_VERSION;
+    use crate::eme::probe::{assess, EmeProbeResult};
+    use crate::widevine::ownership::OwnershipAssessment;
     use std::fs;
     use tempfile::TempDir;
 
@@ -243,8 +518,6 @@ mod tests {
             framework_name: None,
         }
     }
-
-    use std::path::Path;
 
     #[test]
     fn plan_build_with_no_browsers_errors() {
@@ -358,6 +631,24 @@ mod tests {
         unsafe { std::env::remove_var(NOOP_ENV) };
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn plan_serializes_non_utf8_executable_as_lossy_text() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let executable = PathBuf::from(std::ffi::OsString::from_vec(vec![
+            b'/', b't', b'm', b'p', b'/', 0xff,
+        ]));
+        let plan = Plan {
+            browser_name: "NonUtf8".into(),
+            browser_executable: executable,
+            url: DEFAULT_TEST_URL.into(),
+        };
+
+        let value = serde_json::to_value(plan).expect("path should serialize lossily");
+        assert_eq!(value["executable"], "/tmp/\u{fffd}");
+    }
+
     #[test]
     #[cfg(target_os = "macos")]
     fn plan_build_macos_resolves_app_bundle() {
@@ -365,5 +656,506 @@ mod tests {
         let detected = vec![make_macos_browser(tmp.path(), "Helium")];
         let plan = Plan::build(&detected, &Args::default()).expect("ok");
         assert!(plan.browser_executable.ends_with("MacOS/Helium"));
+    }
+
+    #[test]
+    fn live_text_labels_browser_evidence_and_claim_boundary() {
+        let passive = BrowserDiagnostics {
+            browser: "Chromium".into(),
+            browser_executable: None,
+            browser_version: None,
+            cdm_target: None,
+            cdm_version: None,
+            cdm_library: None,
+            cdm_library_sha512: None,
+            ownership: crate::widevine::ownership::OwnershipAssessment::default(),
+            external_cdms: Vec::new(),
+            fingerprint: None,
+            checks: Vec::new(),
+        };
+        let probe = EmeProbeResult {
+            schema_version: crate::eme::probe::PROBE_SCHEMA_VERSION,
+            user_agent: "Chromium/150".into(),
+            eme_api: true,
+            media_capabilities_api: true,
+            baseline: crate::eme::probe::CapabilityStatus::Supported,
+            baseline_error: None,
+            robustness: vec![crate::eme::probe::RobustnessResult {
+                media_kind: crate::eme::probe::MediaKind::Video,
+                robustness: "SW_SECURE_CRYPTO".into(),
+                accepted: true,
+                error: None,
+            }],
+            encryption_schemes: Vec::new(),
+            hdcp: Vec::new(),
+            codecs: vec![crate::eme::probe::CodecCapability {
+                codec: "avc1.640028".into(),
+                content_type: "video/mp4; codecs=\"avc1.640028\"".into(),
+                width: 1920,
+                height: 1080,
+                framerate: 30,
+                mse_supported: true,
+                direct_playback: crate::eme::probe::CanPlayStatus::Probably,
+                media_capabilities: Some(crate::eme::probe::MediaCapabilitiesFacts {
+                    supported: true,
+                    smooth: Some(true),
+                    power_efficient: Some(false),
+                    key_system_access: Some(true),
+                }),
+                error: None,
+            }],
+        };
+        let assessment = assess(&probe, &passive.ownership);
+        let mut output = Vec::new();
+
+        render_live_text(
+            "Chromium",
+            &passive,
+            &assessment,
+            None,
+            Some("report not cached"),
+            &mut output,
+        )
+        .expect("render");
+        let text = String::from_utf8(output).expect("UTF-8");
+
+        assert!(text.contains("Baseline: PASS"));
+        assert!(text.contains("BrowserMediaStack"));
+        assert!(
+            text.contains("LiveBrowser/BrowserMediaStack")
+                || text.contains("VerifiedFile/Silvervine")
+                || text.contains("(BrowserMediaStack)")
+        );
+        assert!(text.contains("not certified L1"));
+        assert!(
+            text.contains("null") || text.contains("not cached") || text.contains("Cache warning")
+        );
+    }
+
+    #[test]
+    fn stored_report_json_schema_is_exact_top_level_document() {
+        let probe = EmeProbeResult {
+            schema_version: crate::eme::probe::PROBE_SCHEMA_VERSION,
+            user_agent: "Chromium/150".into(),
+            eme_api: true,
+            media_capabilities_api: true,
+            baseline: crate::eme::probe::CapabilityStatus::Supported,
+            baseline_error: None,
+            robustness: vec![crate::eme::probe::RobustnessResult {
+                media_kind: crate::eme::probe::MediaKind::Video,
+                robustness: "SW_SECURE_CRYPTO".into(),
+                accepted: true,
+                error: None,
+            }],
+            encryption_schemes: Vec::new(),
+            hdcp: Vec::new(),
+            codecs: vec![crate::eme::probe::CodecCapability {
+                codec: "avc1.640028".into(),
+                content_type: "video/mp4; codecs=\"avc1.640028\"".into(),
+                width: 1920,
+                height: 1080,
+                framerate: 30,
+                mse_supported: true,
+                direct_playback: crate::eme::probe::CanPlayStatus::Probably,
+                media_capabilities: Some(crate::eme::probe::MediaCapabilitiesFacts {
+                    supported: true,
+                    smooth: Some(true),
+                    power_efficient: Some(false),
+                    key_system_access: Some(true),
+                }),
+                error: None,
+            }],
+        };
+        let assessment = crate::eme::probe::assess(&probe, &OwnershipAssessment::default());
+        let report = StoredProbeReport {
+            schema_version: STORE_SCHEMA_VERSION,
+            probed_at: 1,
+            browser_name: "Chromium".into(),
+            fingerprint: ProbeFingerprint::new(
+                "chromium",
+                Some("1".into()),
+                1,
+                1,
+                "browser-digest",
+                Vec::new(),
+            ),
+            raw: probe,
+            assessment,
+        };
+        let value = serde_json::to_value(&report).expect("json");
+        let keys = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                "assessment",
+                "browser_name",
+                "fingerprint",
+                "probed_at",
+                "raw",
+                "schema_version"
+            ]
+        );
+        assert_eq!(value["browser_name"], "Chromium");
+        assert!(value["raw"].get("persistent_license").is_none());
+    }
+
+    #[test]
+    fn cache_write_failure_keeps_passing_assessment() {
+        use crate::browsers::BrowserKind;
+        use std::fs;
+        use tempfile::TempDir;
+
+        let probe = EmeProbeResult {
+            schema_version: crate::eme::probe::PROBE_SCHEMA_VERSION,
+            user_agent: "Chromium/150".into(),
+            eme_api: true,
+            media_capabilities_api: true,
+            baseline: crate::eme::probe::CapabilityStatus::Supported,
+            baseline_error: None,
+            robustness: vec![crate::eme::probe::RobustnessResult {
+                media_kind: crate::eme::probe::MediaKind::Video,
+                robustness: "SW_SECURE_CRYPTO".into(),
+                accepted: true,
+                error: None,
+            }],
+            encryption_schemes: Vec::new(),
+            hdcp: Vec::new(),
+            codecs: vec![crate::eme::probe::CodecCapability {
+                codec: "avc1.640028".into(),
+                content_type: "video/mp4; codecs=\"avc1.640028\"".into(),
+                width: 1920,
+                height: 1080,
+                framerate: 30,
+                mse_supported: true,
+                direct_playback: crate::eme::probe::CanPlayStatus::Probably,
+                media_capabilities: None,
+                error: None,
+            }],
+        };
+        let ownership = OwnershipAssessment::default();
+        let assessment = assess(&probe, &ownership);
+        assert_eq!(assessment.status, DiagnosticStatus::Pass);
+
+        let browser = Browser {
+            name: "Chromium".into(),
+            install_path: PathBuf::from("/tmp/chromium"),
+            kind: BrowserKind::Detected,
+            framework_name: None,
+        };
+        let fingerprint = ProbeFingerprint::new(
+            "/opt/test/chromium",
+            Some("150".into()),
+            10,
+            1_700_000_000,
+            "browser-digest",
+            Vec::new(),
+        );
+        let passive = BrowserDiagnostics {
+            browser: "Chromium".into(),
+            browser_executable: Some(PathBuf::from("/opt/test/chromium")),
+            browser_version: Some("150".into()),
+            cdm_target: None,
+            cdm_version: None,
+            cdm_library: None,
+            cdm_library_sha512: None,
+            ownership: ownership.clone(),
+            external_cdms: Vec::new(),
+            fingerprint: Some(fingerprint),
+            checks: Vec::new(),
+        };
+
+        // File path as cache root makes save_report fail.
+        let tmp = TempDir::new().expect("tmp");
+        let blocker = tmp.path().join("not-a-dir");
+        fs::write(&blocker, b"x").expect("blocker");
+
+        let exact = passive.fingerprint.clone();
+        let (cache_path, cache_warning) =
+            persist_report_to(Some(&blocker), &browser, &passive, &probe, &assessment);
+        let stored = build_stored_report(&browser, &passive, exact, probe, assessment)
+            .expect("stored report");
+
+        assert_eq!(stored.assessment.status, DiagnosticStatus::Pass);
+        assert!(cache_path.is_none());
+        assert!(cache_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("could not cache")));
+
+        let json = serde_json::to_value(&stored).expect("json");
+        assert!(json.get("assessment").is_some());
+        assert_eq!(json["assessment"]["status"], "pass");
+        assert!(json.get("mode").is_none());
+
+        let mut out = Vec::new();
+        render_live_text(
+            "Chromium",
+            &passive,
+            &stored.assessment,
+            cache_path.as_deref(),
+            cache_warning.as_deref(),
+            &mut out,
+        )
+        .expect("render");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("Baseline: PASS"));
+        assert!(text.contains("Cache warning") || text.contains("null"));
+    }
+
+    fn sample_fingerprint(digest: &str) -> ProbeFingerprint {
+        ProbeFingerprint::new(
+            "/opt/test/chromium",
+            Some("150".into()),
+            10,
+            1_700_000_000,
+            digest,
+            vec![crate::diagnostics::store::CdmFingerprintEntry::new(
+                "/opt/test/WidevineCdm/libwidevinecdm.so",
+                Some("4.10.2891.0".into()),
+                Some("cdm-digest".into()),
+            )],
+        )
+    }
+
+    fn sample_passive(fingerprint: Option<ProbeFingerprint>) -> BrowserDiagnostics {
+        BrowserDiagnostics {
+            browser: "Chromium".into(),
+            browser_executable: Some(PathBuf::from("/opt/test/chromium")),
+            browser_version: Some("150".into()),
+            cdm_target: None,
+            cdm_version: Some("4.10.2891.0".into()),
+            cdm_library: Some(PathBuf::from("/opt/test/WidevineCdm/libwidevinecdm.so")),
+            cdm_library_sha512: Some("cdm-digest".into()),
+            ownership: OwnershipAssessment::default(),
+            external_cdms: Vec::new(),
+            fingerprint,
+            checks: Vec::new(),
+        }
+    }
+
+    fn sample_probe() -> EmeProbeResult {
+        EmeProbeResult {
+            schema_version: crate::eme::probe::PROBE_SCHEMA_VERSION,
+            user_agent: "Chromium/150".into(),
+            eme_api: true,
+            media_capabilities_api: true,
+            baseline: crate::eme::probe::CapabilityStatus::Supported,
+            baseline_error: None,
+            robustness: vec![crate::eme::probe::RobustnessResult {
+                media_kind: crate::eme::probe::MediaKind::Video,
+                robustness: "SW_SECURE_CRYPTO".into(),
+                accepted: true,
+                error: None,
+            }],
+            encryption_schemes: Vec::new(),
+            hdcp: Vec::new(),
+            codecs: vec![crate::eme::probe::CodecCapability {
+                codec: "avc1.640028".into(),
+                content_type: "video/mp4; codecs=\"avc1.640028\"".into(),
+                width: 1920,
+                height: 1080,
+                framerate: 30,
+                mse_supported: true,
+                direct_playback: crate::eme::probe::CanPlayStatus::Probably,
+                media_capabilities: None,
+                error: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn live_probe_identity_is_exact_only_when_pre_and_post_match() {
+        let fingerprint = sample_fingerprint("browser-digest");
+        let pre = sample_passive(Some(fingerprint.clone()));
+        let post = sample_passive(Some(fingerprint.clone()));
+
+        let identity = resolve_live_probe_identity("Chromium", &pre, &post);
+        assert_eq!(identity.exact_fingerprint.as_ref(), Some(&fingerprint));
+        assert!(identity.cache_warning.is_none());
+    }
+
+    #[test]
+    fn live_probe_identity_rejects_mutation_during_launch() {
+        let pre = sample_passive(Some(sample_fingerprint("before-digest")));
+        let post = sample_passive(Some(sample_fingerprint("after-digest")));
+
+        let identity = resolve_live_probe_identity("Chromium", &pre, &post);
+        assert!(identity.exact_fingerprint.is_none());
+        assert!(identity
+            .cache_warning
+            .as_deref()
+            .is_some_and(
+                |warning| warning.contains("identity changed") && warning.contains("not cached")
+            ));
+    }
+
+    #[test]
+    fn live_probe_identity_rejects_incomplete_pre_or_post_fingerprint() {
+        let complete = sample_passive(Some(sample_fingerprint("browser-digest")));
+        let incomplete = sample_passive(None);
+
+        let missing_pre = resolve_live_probe_identity("Chromium", &incomplete, &complete);
+        assert!(missing_pre.exact_fingerprint.is_none());
+        assert!(missing_pre
+            .cache_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("fingerprint unavailable")));
+
+        let missing_post = resolve_live_probe_identity("Chromium", &complete, &incomplete);
+        assert!(missing_post.exact_fingerprint.is_none());
+        assert!(missing_post
+            .cache_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("fingerprint unavailable")));
+    }
+
+    #[test]
+    fn mutated_identity_skips_cache_and_uses_unavailable_json_fingerprint() {
+        let browser = Browser {
+            name: "Chromium".into(),
+            install_path: PathBuf::from("/tmp/chromium"),
+            kind: BrowserKind::Detected,
+            framework_name: None,
+        };
+        let pre = sample_passive(Some(sample_fingerprint("before-digest")));
+        let post = sample_passive(Some(sample_fingerprint("after-digest")));
+        let probe = sample_probe();
+        let assessment = assess(&probe, &OwnershipAssessment::default());
+
+        let identity = resolve_live_probe_identity(browser.name(), &pre, &post);
+        assert!(identity.exact_fingerprint.is_none());
+
+        let (cache_path, cache_warning) = if identity.exact_fingerprint.is_some() {
+            persist_report_to(
+                Some(Path::new("/tmp")),
+                &browser,
+                &post,
+                &probe,
+                &assessment,
+            )
+        } else {
+            (None, identity.cache_warning.clone())
+        };
+        assert!(cache_path.is_none());
+        assert!(cache_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("identity changed")));
+
+        let stored = build_stored_report(
+            &browser,
+            &post,
+            identity.exact_fingerprint.clone(),
+            probe,
+            assessment.clone(),
+        )
+        .expect("stored report");
+        assert_eq!(stored.fingerprint.executable_sha512, "unavailable");
+        assert_ne!(
+            stored.fingerprint.executable_sha512, "before-digest",
+            "must never serialize the stale pre-launch fingerprint"
+        );
+        assert_ne!(
+            stored.fingerprint.executable_sha512, "after-digest",
+            "must not claim the mutated post-launch fingerprint as exact"
+        );
+
+        let json = serde_json::to_value(&stored).expect("json");
+        let keys = json
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                "assessment",
+                "browser_name",
+                "fingerprint",
+                "probed_at",
+                "raw",
+                "schema_version"
+            ]
+        );
+        assert_eq!(json["fingerprint"]["executable_sha512"], "unavailable");
+
+        let mut out = Vec::new();
+        render_live_text(
+            "Chromium",
+            &post,
+            &assessment,
+            cache_path.as_deref(),
+            cache_warning.as_deref(),
+            &mut out,
+        )
+        .expect("render");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("Baseline: PASS"));
+        assert!(text.contains("Cache warning"));
+        assert!(text.contains("identity changed") || text.contains("not cached"));
+        // Exit semantics stay assessment-driven: Pass/Warn succeed.
+        assert_eq!(assessment.status, DiagnosticStatus::Pass);
+    }
+
+    #[test]
+    fn stable_identity_persists_exact_post_probe_fingerprint() {
+        let tmp = TempDir::new().expect("tmp");
+        let browser = Browser {
+            name: "Chromium".into(),
+            install_path: PathBuf::from("/tmp/chromium"),
+            kind: BrowserKind::Detected,
+            framework_name: None,
+        };
+        let fingerprint = sample_fingerprint("stable-digest");
+        let pre = sample_passive(Some(fingerprint.clone()));
+        let post = sample_passive(Some(fingerprint.clone()));
+        let probe = sample_probe();
+        let assessment = assess(&probe, &OwnershipAssessment::default());
+
+        let identity = resolve_live_probe_identity(browser.name(), &pre, &post);
+        assert_eq!(identity.exact_fingerprint.as_ref(), Some(&fingerprint));
+
+        let (cache_path, cache_warning) = if identity.exact_fingerprint.is_some() {
+            persist_report_to(Some(tmp.path()), &browser, &post, &probe, &assessment)
+        } else {
+            (None, identity.cache_warning.clone())
+        };
+        assert!(cache_path.is_some());
+        assert!(cache_warning.is_none());
+
+        let stored = build_stored_report(
+            &browser,
+            &post,
+            identity.exact_fingerprint.clone(),
+            probe,
+            assessment,
+        )
+        .expect("stored report");
+        assert_eq!(stored.fingerprint, fingerprint);
+        assert_eq!(stored.fingerprint.executable_sha512, "stable-digest");
+
+        let mut out = Vec::new();
+        render_live_text(
+            "Chromium",
+            &post,
+            &stored.assessment,
+            cache_path.as_deref(),
+            cache_warning.as_deref(),
+            &mut out,
+        )
+        .expect("render");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("Cached exact-fingerprint report"));
+        assert!(!text.contains("Cache warning"));
+    }
+
+    #[test]
+    fn baseline_failure_uses_browser_probe_failed_category() {
+        let err = Error::browser_probe_failed("baseline failed");
+        assert_eq!(err.category, crate::ErrorCategory::BrowserProbeFailed);
     }
 }

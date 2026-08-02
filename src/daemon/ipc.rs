@@ -186,7 +186,7 @@ pub enum IpcResult {
     Ack,
 }
 
-/// Handle to a running IPC server. Drop calls [`shutdown`].
+/// Handle to a running IPC server. Drop calls [`Self::shutdown`].
 pub struct IpcServer {
     socket_path: PathBuf,
     stop: Arc<AtomicBool>,

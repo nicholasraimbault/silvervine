@@ -112,15 +112,15 @@ jobs:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   msrv:
-    name: MSRV (1.85)
+    name: MSRV (1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # The `@1.85` ref is a *Rust toolchain version*, not an action
+      # The `@1.88` ref is a *Rust toolchain version*, not an action
       # release tag. Must match `rust-version` in Cargo.toml. Don't let
       # dependabot "bump" this — see the ignore rule in
       # `.github/dependabot.yml`.
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv

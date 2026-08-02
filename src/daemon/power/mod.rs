@@ -6,9 +6,9 @@
 //! subscribe to a platform-native wake event:
 //!
 //! * **macOS:** `NSWorkspaceDidWakeNotification` via `NSWorkspace`'s
-//!   notification center (Cocoa, `AppKit`). Implemented in [`macos`].
+//!   notification center (Cocoa, `AppKit`). Implemented in `macos`.
 //! * **Linux:** `org.freedesktop.login1.Manager.PrepareForSleep` D-Bus
-//!   signal (systemd-logind). Implemented in [`linux`]. The signal is
+//!   signal (systemd-logind). Implemented in `linux`. The signal is
 //!   emitted twice per sleep cycle — `true` before sleep, `false` after
 //!   wake — and we fire the user callback only on the wake transition.
 //!

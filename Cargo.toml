@@ -1,8 +1,8 @@
 [package]
 name = "silvervine"
-version = "2.0.1"
+version = "2.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["Nicholas Raimbault <nraimbault16@gmail.com>"]
 license = "MIT"
 description = "Single-binary cross-platform DRM (Widevine) helper for Chromium-family browsers"
@@ -36,8 +36,12 @@ url = "2"
 dirs = "6"
 # `flock`-based exclusive lockfile.
 fs2 = "0.4"
+# Compact, non-poisoning mutexes for daemon state shared across watcher threads.
+parking_lot = "0.12"
 # SHA-512 verification for Widevine CRX3 downloads.
 sha2 = "0.11"
+# Cryptographically random single-use loopback probe tokens.
+getrandom = "0.3"
 # CRX3 ZIP body extraction. Select only flate2-based deflate decoding;
 # zip's umbrella `deflate` feature also enables the unused Zopfli encoder.
 zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"] }
@@ -106,40 +110,22 @@ png = "0.18"
 # attacker-planted path.
 tempfile = "3"
 
-# macOS-specific deps: ObjC FFI for NSWorkspace wake notifications.
+# macOS-specific deps: use one objc2 ecosystem version throughout the graph.
 # `block2` is required because NSNotificationCenter takes a block-typed
-# handler argument; objc2-app-kit doesn't enable the dep transitively
-# under default features.
+# handler argument; the framework crates do not enable it transitively.
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.5"
-# objc2-foundation 0.2 feature-gates every Foundation class behind its
-# own cargo feature. We need NSString and NSNotification for the
-# sleep/wake observer in src/daemon/power/macos.rs.
-# (NSNotificationCenter ships under the NSNotification feature; no
-# separate feature flag exists for it in 0.2.x.)
-objc2-foundation = { version = "0.2", features = [
-    # NSObject is the typed root class — used as the observer handle
-    # returned by `addObserverForName:`.
+objc2 = "0.6"
+# Foundation feature-gates each generated class. The wake observer needs
+# NSString/NSNotification plus NSOperationQueue's block-taking API.
+objc2-foundation = { version = "0.3", features = [
     "NSObject",
     "NSString",
     "NSNotification",
-    # NSOperation covers NSOperationQueue, which appears as the `queue:`
-    # parameter of `addObserverForName:object:queue:usingBlock:` —
-    # without it the method isn't generated.
     "NSOperation",
-    # `block2` exposes the block-taking methods (e.g.
-    # `addObserverForName:object:queue:usingBlock:` on
-    # NSNotificationCenter, which we use for the wake observer).
     "block2",
 ] }
-# objc2-app-kit 0.2 likewise gates NSWorkspace (and the
-# NSWorkspaceDidWakeNotification static) behind the NSWorkspace feature.
-objc2-app-kit = { version = "0.2", features = ["NSWorkspace"] }
-# Pin block2 to 0.5: 0.6 pairs with objc2 0.6 and changed the
-# `IntoBlock` trait signature. Bumping requires a coordinated
-# migration to the 0.6 ecosystem across `src/daemon/power/macos.rs`
-# (and other macOS FFI sites). Listed in dependabot.yml's ignore.
-block2 = "~0.5"
+objc2-app-kit = { version = "0.3", features = ["NSWorkspace"] }
+block2 = "0.6"
 # NSStatusItem-backed tray for macOS via Tauri's tray-icon crate.
 # Default features pull libxdo for keyboard accelerators we don't use,
 # so opt out. This remains macOS-only; Linux uses ksni.

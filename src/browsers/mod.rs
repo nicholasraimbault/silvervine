@@ -18,9 +18,11 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{Config, CustomBrowserConfig};
 use crate::error::Result;
+use crate::widevine::{CDM_BUNDLE_DIRECTORY, CDM_MANIFEST_FILENAME};
 
 pub mod discovery;
 pub mod known;
+pub mod runtime;
 
 pub use discovery::{discover_filesystem, discover_processes, is_running, FilesystemRoots};
 pub use known::{KnownBrowser, KNOWN_LINUX, KNOWN_MACOS};
@@ -65,6 +67,29 @@ pub enum BrowserKind {
     Detected,
     /// Listed in `~/.config/silvervine/config.toml`'s `[[browsers]]` array.
     Custom,
+}
+
+impl BrowserKind {
+    /// Stable wire token used by privileged argv and diagnostics.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Known => "known",
+            Self::Detected => "detected",
+            Self::Custom => "custom",
+        }
+    }
+
+    /// Parse a closed wire token. Rejects debug strings and unknown labels.
+    #[must_use]
+    pub fn from_str_token(token: &str) -> Option<Self> {
+        match token {
+            "known" => Some(Self::Known),
+            "detected" => Some(Self::Detected),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
 }
 
 /// A detected browser.
@@ -129,9 +154,7 @@ impl Browser {
     #[must_use]
     pub fn installed_cdm_version(&self) -> Option<String> {
         let manifest_path = self.cdm_manifest_path()?;
-        let body = std::fs::read_to_string(&manifest_path).ok()?;
-        let manifest: serde_json::Value = serde_json::from_str(&body).ok()?;
-        manifest.get("version")?.as_str().map(String::from)
+        crate::widevine::manifest::read_installed_cdm_version(&manifest_path).ok()
     }
 
     /// Resolve the path to the installed CDM's `manifest.json`, if
@@ -152,8 +175,8 @@ impl Browser {
                     let manifest = entry
                         .path()
                         .join("Libraries")
-                        .join("WidevineCdm")
-                        .join("manifest.json");
+                        .join(CDM_BUNDLE_DIRECTORY)
+                        .join(CDM_MANIFEST_FILENAME);
                     if manifest.exists() {
                         return Some(manifest);
                     }
@@ -161,7 +184,10 @@ impl Browser {
             }
             return None;
         }
-        let manifest = self.install_path.join("WidevineCdm").join("manifest.json");
+        let manifest = self
+            .install_path
+            .join(CDM_BUNDLE_DIRECTORY)
+            .join(CDM_MANIFEST_FILENAME);
         manifest.exists().then_some(manifest)
     }
 }
@@ -593,5 +619,27 @@ mod tests {
         };
         let b = browser_from_custom(Os::Macos, &mac).expect("macos");
         assert_eq!(b.framework_name.as_deref(), Some("M Framework"));
+    }
+
+    #[test]
+    fn browser_kind_tokens_are_closed() {
+        assert_eq!(BrowserKind::Known.as_str(), "known");
+        assert_eq!(BrowserKind::Detected.as_str(), "detected");
+        assert_eq!(BrowserKind::Custom.as_str(), "custom");
+        assert_eq!(
+            BrowserKind::from_str_token("known"),
+            Some(BrowserKind::Known)
+        );
+        assert_eq!(
+            BrowserKind::from_str_token("detected"),
+            Some(BrowserKind::Detected)
+        );
+        assert_eq!(
+            BrowserKind::from_str_token("custom"),
+            Some(BrowserKind::Custom)
+        );
+        assert_eq!(BrowserKind::from_str_token("Known"), None);
+        assert_eq!(BrowserKind::from_str_token("BrowserKind::Known"), None);
+        assert_eq!(BrowserKind::from_str_token("unknown"), None);
     }
 }

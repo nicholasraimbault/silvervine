@@ -17,9 +17,8 @@
 //! `renameat2(RENAME_EXCHANGE)` works on every modern Linux filesystem
 //! (ext4 ≥ 3.15, btrfs, xfs, f2fs). We call `libc::renameat2` directly
 //! because nix's safe wrapper is gated on `target_env = "gnu"` and does
-//! not exist on musl (a target we ship via cargo-dist). On `EINVAL`
-//! (filesystem doesn't support exchange) we fall back to the two-step
-//! rename documented in the trait doc.
+//! not exist on musl (a target we ship via cargo-dist). Filesystems that
+//! return `EINVAL` for native exchange fail closed before either path moves.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -91,6 +90,9 @@ pub(super) fn run_as_root(command: &[&str]) -> Result<Output> {
         "neither pkexec nor sudo is on $PATH; cannot elevate privileges",
     ))
 }
+pub(super) fn run_pinned_as_root(command: &[&str], _expected_sha512: &str) -> Result<Output> {
+    run_as_root(command)
+}
 
 /// Path-resolve `binary` against `$PATH`. Returns `None` if not found.
 ///
@@ -118,14 +120,15 @@ fn spawn_with_elevator(elevator: &str, command: &[&str]) -> Result<Output> {
         .map_err(|e| Error::other(format!("failed to spawn {elevator}")).with_source(e))
 }
 
-/// Atomic exchange via `renameat2(RENAME_EXCHANGE)`, with a two-step
-/// fallback for filesystems that don't support it.
+/// Atomic exchange via `renameat2(RENAME_EXCHANGE)`.
+///
+/// Unsupported filesystems fail closed without moving either path.
 pub(super) fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
     if !dst.exists() {
         // No exchange needed if the destination doesn't yet exist —
         // a plain rename is already atomic.
         std::fs::rename(src, dst).map_err(|e| {
-            Error::from(e).message_or(format!(
+            Error::from(e).with_context(format!(
                 "rename({} -> {}) failed",
                 src.display(),
                 dst.display()
@@ -133,11 +136,7 @@ pub(super) fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
         })?;
         return Ok(());
     }
-    match exchange_renameat2(src, dst) {
-        Ok(()) => Ok(()),
-        Err(e) if e.is_invalid_argument() => fallback_two_step_rename(src, dst),
-        Err(e) => Err(e.into_error(src, dst)),
-    }
+    exchange_renameat2(src, dst).map_err(|error| error.into_error(src, dst))
 }
 
 /// Wrapper return type for `renameat2`-style exchanges.
@@ -149,16 +148,12 @@ enum ExchangeError {
 }
 
 impl ExchangeError {
-    fn is_invalid_argument(&self) -> bool {
-        matches!(self, Self::InvalidArgument)
-    }
-
     fn into_error(self, src: &Path, dst: &Path) -> Error {
         let io_err = match self {
             Self::InvalidArgument => std::io::Error::from(std::io::ErrorKind::InvalidInput),
             Self::Other(e) => e,
         };
-        Error::from(io_err).message_or(format!(
+        Error::from(io_err).with_context(format!(
             "atomic_rename({} <-> {}) failed",
             src.display(),
             dst.display()
@@ -215,73 +210,12 @@ fn exchange_renameat2(src: &Path, dst: &Path) -> std::result::Result<(), Exchang
     }
 }
 
-/// `RENAME_EXCHANGE` from `<linux/fs.h>`. Hardcoded to keep the libc
-/// dependency surface small (newer libc versions expose it as
-/// `libc::RENAME_EXCHANGE`, but our MSRV may target older).
+/// `RENAME_EXCHANGE` from `<linux/fs.h>`. `libc` does not expose this constant
+/// consistently across every Linux target we support.
 const RENAME_EXCHANGE: libc::c_uint = 2;
 
 fn io_invalid(e: std::ffi::NulError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-}
-
-/// Fallback when `RENAME_EXCHANGE` is unsupported: rename `dst` aside,
-/// move `src` into place, then remove the saved `dst`.
-///
-/// This is atomic in the common case (a `kill -9` between steps 2 and 3
-/// leaves `dst` correctly populated and `dst.silvervine-tmp` as orphan to
-/// clean up). It's not crash-safe in the strict sense — a power loss
-/// between step 1 and step 2 leaves `dst` missing.
-fn fallback_two_step_rename(src: &Path, dst: &Path) -> Result<()> {
-    let backup = dst.with_extension("silvervine-tmp");
-    std::fs::rename(dst, &backup).map_err(|e| {
-        Error::from(e).message_or(format!(
-            "fallback rename: could not move {} aside",
-            dst.display()
-        ))
-    })?;
-    if let Err(e) = std::fs::rename(src, dst) {
-        // Best-effort: try to restore the original from the backup so
-        // we don't leave the user with a missing browser bundle.
-        let _ = std::fs::rename(&backup, dst);
-        return Err(Error::from(e).message_or(format!(
-            "fallback rename: could not move {} into {}",
-            src.display(),
-            dst.display()
-        )));
-    }
-    // Step 3 is best-effort: orphaning `backup` is recoverable but not
-    // a hard error.
-    let _ = remove_path(&backup);
-    Ok(())
-}
-
-/// Recursively remove a file or directory at `p`.
-fn remove_path(p: &Path) -> std::io::Result<()> {
-    let meta = std::fs::symlink_metadata(p)?;
-    if meta.file_type().is_dir() {
-        std::fs::remove_dir_all(p)
-    } else {
-        std::fs::remove_file(p)
-    }
-}
-
-trait MessageOr {
-    fn message_or(self, fallback: String) -> Self;
-}
-
-impl MessageOr for Error {
-    /// Replace the inner message of an [`Error`] when the existing one
-    /// is empty (which happens when `From<io::Error>` produces only the
-    /// raw `io::Error` text). Useful for adding a path context without
-    /// losing the io error's `source`.
-    fn message_or(mut self, fallback: String) -> Self {
-        if self.message.is_empty() {
-            self.message = fallback;
-        } else {
-            self.message = format!("{fallback}: {}", self.message);
-        }
-        self
-    }
 }
 
 #[cfg(test)]
@@ -367,54 +301,9 @@ mod tests {
         let _ = which("sudo");
     }
 
-    /// Fallback two-step rename works when invoked directly. Integration
-    /// of "kernel rejected the syscall, fall back" requires a non-ext4
-    /// filesystem we can't synthesize cheaply; we exercise the helper
-    /// directly to keep the path covered.
-    #[test]
-    fn fallback_two_step_rename_swaps_into_place() {
-        let tmp = TempDir::new().expect("tempdir");
-        let src = tmp.path().join("src");
-        let dst = tmp.path().join("dst");
-        fs::write(&src, b"new").unwrap();
-        fs::write(&dst, b"old").unwrap();
-        fallback_two_step_rename(&src, &dst).expect("fallback ok");
-        assert!(!src.exists(), "src consumed");
-        assert_eq!(fs::read(&dst).unwrap(), b"new");
-    }
-
-    #[test]
-    fn fallback_two_step_rename_recovers_when_step_2_fails() {
-        let tmp = TempDir::new().expect("tempdir");
-        let src = tmp.path().join("nonexistent");
-        let dst = tmp.path().join("dst");
-        fs::write(&dst, b"old").unwrap();
-        // Step 1 succeeds (rename dst -> backup), step 2 fails because
-        // src doesn't exist; the function must restore dst from backup.
-        let r = fallback_two_step_rename(&src, &dst);
-        assert!(r.is_err());
-        assert!(dst.exists(), "dst must be restored on failure");
-    }
-
-    #[test]
-    fn message_or_appends_to_existing_message() {
-        let mut err = Error::other("boom");
-        err = err.message_or("context".into());
-        assert_eq!(err.message, "context: boom");
-    }
-
-    #[test]
-    fn message_or_replaces_empty_message() {
-        let mut err = Error::other("");
-        err = err.message_or("context".into());
-        assert_eq!(err.message, "context");
-    }
-
-    /// Direct test of the renameat2 wrapper: should succeed on tmpfs.
-    /// Most CI runners use tmpfs for `/tmp`, which supports
-    /// `RENAME_EXCHANGE` since kernel 3.15. If a CI agent ever runs on
-    /// an exotic FS that returns `EINVAL`, the wrapper still works
-    /// because the public `atomic_rename` falls back.
+    /// Direct test of the renameat2 wrapper. Most CI `/tmp` filesystems
+    /// support `RENAME_EXCHANGE`; unsupported filesystems return an error
+    /// without invoking a non-atomic fallback.
     #[test]
     fn exchange_renameat2_swaps_on_tmpfs() {
         let tmp = TempDir::new().expect("tempdir");
@@ -471,7 +360,7 @@ mod tests {
     #[test]
     fn exchange_error_into_error_carries_path_context() {
         let e = ExchangeError::InvalidArgument;
-        assert!(e.is_invalid_argument());
+        assert!(matches!(&e, ExchangeError::InvalidArgument));
         let err = e.into_error(std::path::Path::new("/x"), std::path::Path::new("/y"));
         assert!(err.message.contains("atomic_rename"));
         assert!(err.message.contains("/x"));
@@ -488,20 +377,5 @@ mod tests {
         let nul_err = std::ffi::CString::new("a\0b").unwrap_err();
         let io_err = super::io_invalid(nul_err);
         assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidInput);
-    }
-
-    /// `remove_path` removes both files and directories.
-    #[test]
-    fn remove_path_handles_files_and_dirs() {
-        let tmp = TempDir::new().expect("tempdir");
-        let f = tmp.path().join("file");
-        fs::write(&f, b"x").unwrap();
-        super::remove_path(&f).expect("remove file ok");
-        assert!(!f.exists());
-        let d = tmp.path().join("d");
-        fs::create_dir_all(d.join("nested")).unwrap();
-        fs::write(d.join("nested/x"), b"x").unwrap();
-        super::remove_path(&d).expect("remove dir ok");
-        assert!(!d.exists());
     }
 }

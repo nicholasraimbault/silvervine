@@ -70,6 +70,8 @@ use crate::config::{load_config, Config};
 use crate::error::Result;
 use crate::notify as notify_user;
 use crate::platform;
+use crate::widevine::ownership::{self, OwnershipAssessment, OwnershipKind};
+use crate::widevine::CachedCdm;
 
 use ipc::{IpcRequest, IpcResponse, IpcResult, IpcServer};
 use tray::{BrowserMenuEntry, MenuState, Tray, TrayCommand};
@@ -80,7 +82,7 @@ use watcher::{Watcher, WatcherCallback};
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 60;
 
 /// Weekly tick interval for the CDM integrity check. The daemon recomputes
-/// the cached CDM's hash against the manifest and notifies on mismatch.
+/// the cached library hash against its persisted installation metadata.
 pub const INTEGRITY_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 
 /// Filename of the heartbeat artifact under `cache_dir/silvervine/`.
@@ -118,8 +120,8 @@ pub struct RunOptions {
     pub single_iteration: bool,
 }
 
-/// Entry point for the daemon. Production callers in
-/// [`crate::main`] invoke this when `silvervine` is run with no arguments.
+/// Entry point for the daemon. The Silvervine binary invokes this when run
+/// with no arguments.
 ///
 /// Returns once the user / system requests shutdown.
 ///
@@ -444,60 +446,17 @@ fn spawn_integrity_check(interval: Duration, stop: Arc<AtomicBool>) -> Option<Jo
 /// Run the integrity check once. Best-effort: failures are logged but
 /// don't abort the daemon.
 fn check_cdm_integrity() {
-    // Resolve the manifest from on-disk cache (no network — we don't want
-    // to hammer Mozilla weekly). If the manifest cache is empty or
-    // unparseable, we skip the check.
-    use crate::widevine::cache::verify_integrity;
-    use crate::widevine::manifest::{cached_manifest_path, parse_manifest};
-    let Some(cache_path) = cached_manifest_path() else {
-        tracing::info!(
-            target: "silvervine::daemon",
-            "integrity check: no resolvable manifest cache path; skipping"
-        );
-        return;
-    };
-    let bytes = match std::fs::read(&cache_path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            tracing::info!(
-                target: "silvervine::daemon",
-                "integrity check: no cached manifest at {}; skipping",
-                cache_path.display()
-            );
-            return;
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: "silvervine::daemon",
-                error = %e,
-                path = %cache_path.display(),
-                "integrity check: failed to read cached manifest"
-            );
-            return;
-        }
-    };
-    let manifest = match parse_manifest(&bytes) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(
-                target: "silvervine::daemon",
-                error = %e,
-                "integrity check: failed to parse cached manifest"
-            );
-            return;
-        }
-    };
-    match verify_integrity(&manifest) {
+    match crate::widevine::cache::verify_current_integrity() {
         Ok(()) => {
             tracing::debug!(target: "silvervine::daemon", "integrity check passed");
         }
-        Err(e) => {
+        Err(error) => {
             tracing::warn!(
                 target: "silvervine::daemon",
-                error = %e,
+                error = %error,
                 "integrity check failed; CDM may need redownload"
             );
-            notify_user::notify_failure(e.category, &e.message);
+            notify_user::notify_failure(error.category, &error.message);
         }
     }
 }
@@ -658,78 +617,184 @@ fn drive_patch_flow_with_cdm(
     force: bool,
     fresh_cdm: Option<crate::widevine::CachedCdm>,
 ) -> Vec<(String, bool)> {
+    let candidates = crate::patch::select_browsers(browsers, name_filter);
     if daemon_patch_noop() {
-        return browsers
-            .iter()
-            .filter(|b| name_filter.is_none_or(|n| n == b.name()))
-            .map(|b| (b.name().to_string(), false))
+        return candidates
+            .into_iter()
+            .map(|browser| (browser.name().to_string(), false))
             .collect();
     }
     let Ok(patcher) = crate::patch::host_patcher() else {
-        return browsers
-            .iter()
-            .filter(|b| name_filter.is_none_or(|n| n == b.name()))
-            .map(|b| (b.name().to_string(), false))
+        return candidates
+            .into_iter()
+            .map(|browser| (browser.name().to_string(), false))
             .collect();
     };
-    // Retain the selected CDM so repair does not fetch a manifest when the
-    // verified current cache is already usable.
-    let cached_cdm =
-        fresh_cdm.or_else(|| crate::widevine::cache::validated_current().ok().flatten());
-    let cached_version = cached_cdm.as_ref().map(|cdm| cdm.version().to_string());
-    let candidates: Vec<&Browser> = browsers
-        .iter()
-        .filter(|b| name_filter.is_none_or(|n| n == b.name()))
-        .collect();
-    let (needs, skip): (Vec<&Browser>, Vec<&Browser>) = candidates
-        .into_iter()
-        .partition(|b| needs_patch(b, cached_version.as_deref(), force));
-    let mut results: Vec<(String, bool)> =
-        skip.iter().map(|b| (b.name().to_string(), true)).collect();
+
+    // Metadata-only current cache is never patch-authoritative. A live
+    // vendor ensure supplies verified digests when a patch is required.
+    // Already-managed installs still short-circuit via classify_without_candidate
+    // without network.
+    let cached_cdm = fresh_cdm.filter(|cdm| {
+        cdm.verified_library_sha512().is_some() && cdm.verified_manifest_sha512().is_some()
+    });
+    let mut results: Vec<(String, bool)> = Vec::new();
+    let mut needs: Vec<&Browser> = Vec::new();
+    for browser in candidates {
+        let cdm_target = match patcher.cdm_target(browser.install_path()) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(
+                    browser = browser.name(),
+                    error = %error,
+                    "could not resolve CDM target; treating as patch failure"
+                );
+                results.push((browser.name().to_string(), false));
+                continue;
+            }
+        };
+        match select_patch_action(browser, cached_cdm.as_ref(), force, &cdm_target) {
+            PatchSelection::Patch => needs.push(browser),
+            PatchSelection::SkipCurrent => results.push((browser.name().to_string(), true)),
+            PatchSelection::SkipPreserved { summary, action } => {
+                tracing::warn!(
+                    browser = browser.name(),
+                    summary = %summary,
+                    action = %action,
+                    "preserving non-Silvervine CDM; daemon will not replace it"
+                );
+                results.push((browser.name().to_string(), false));
+            }
+        }
+    }
     if needs.is_empty() {
         return results;
     }
-    let cdm_resolver = move || {
+
+    let options = crate::patch::PatchOptions {
+        force_while_running: force,
+        dry_run: false,
+        ..Default::default()
+    };
+    let reports = crate::patch::PatchBatch::new(patcher.as_ref(), &options).execute(&needs, || {
         if let Some(cdm) = cached_cdm {
             return Ok(cdm);
         }
         let manifest = crate::widevine::fetch_manifest()?;
         crate::widevine::cache::ensure_cdm_for(&manifest)
-    };
-    let opts = crate::patch::PatchOptions {
-        force_while_running: force,
-        dry_run: false,
-        ..Default::default()
-    };
-    let needs_owned: Vec<Browser> = needs.into_iter().cloned().collect();
-    let reports = crate::cli::patch::run_patch_flow(
-        &needs_owned,
-        None,
-        cdm_resolver,
-        patcher.as_ref(),
-        &opts,
+    });
+    for report in &reports {
+        crate::hooks::emit_post_patch(report);
+    }
+    results.extend(
+        reports
+            .into_iter()
+            .map(|report| (report.browser, report.success)),
     );
-    results.extend(reports.into_iter().map(|r| (r.browser, r.success)));
     results
 }
 
-/// Decide whether a browser needs a patch. Returns `true` when forced,
-/// when the browser has no installed CDM, when the on-disk version
-/// differs from the cached one, or when the cached version is unknown
-/// (we can't prove the on-disk one is current, so we err toward
-/// patching).
+/// Daemon decision for one browser before invoking the patcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatchSelection {
+    /// Invoke the transactional patch core.
+    Patch,
+    /// Verified managed marker matches the candidate; treat as success.
+    SkipCurrent,
+    /// External or invalid marker state must be preserved without success.
+    SkipPreserved {
+        /// Human-readable ownership summary.
+        summary: String,
+        /// Actionable next step.
+        action: String,
+    },
+}
+
+/// Decide whether a browser needs a patch under the daemon's provenance rules.
+///
+/// Same-version skips require a verified Silvervine marker matching the
+/// candidate payload. External and invalid installs are preserved and never
+/// counted as patched success. Eligible legacy installs return
+/// [`PatchSelection::Patch`] so the core can adopt them transactionally.
+///
+/// `force` re-checks managed installs (and bypasses the running-browser gate
+/// later) but never authorizes external/invalid replacement.
 #[must_use]
-pub fn needs_patch(browser: &Browser, cached_version: Option<&str>, force: bool) -> bool {
-    if force {
-        return true;
-    }
-    let Some(installed) = browser.installed_cdm_version() else {
-        return true;
+pub fn select_patch_action(
+    browser: &Browser,
+    candidate: Option<&CachedCdm>,
+    force: bool,
+    cdm_target: &std::path::Path,
+) -> PatchSelection {
+    let Some(candidate) = candidate else {
+        let assessment = match ownership::classify_without_candidate(browser, cdm_target) {
+            Ok(assessment) => assessment,
+            Err(error) => OwnershipAssessment {
+                kind: OwnershipKind::InvalidMarker,
+                summary: "The CDM target could not be classified safely.".into(),
+                action: Some("Inspect the browser CDM path before retrying.".into()),
+                details: std::collections::BTreeMap::from([
+                    ("error_category".into(), error.category.as_str().into()),
+                    ("error".into(), error.message),
+                ]),
+            },
+        };
+        return match assessment.kind {
+            OwnershipKind::External | OwnershipKind::InvalidMarker => {
+                preserved_selection(&assessment)
+            }
+            // Valid managed installs are a no-op without network when the
+            // daemon has no live vendor-authenticated candidate.
+            OwnershipKind::Managed if !force => PatchSelection::SkipCurrent,
+            OwnershipKind::Missing | OwnershipKind::Managed | OwnershipKind::LegacyManaged => {
+                PatchSelection::Patch
+            }
+        };
     };
-    match cached_version {
-        Some(c) => installed != c,
-        None => true,
+    let Ok(marker) = ownership::marker_for_cached(candidate) else {
+        return PatchSelection::Patch;
+    };
+    let Ok(assessment) = ownership::classify(browser, cdm_target, candidate, &marker) else {
+        return PatchSelection::Patch;
+    };
+    match assessment.kind {
+        OwnershipKind::Managed => {
+            let matches_candidate = ownership::validate_installed_cdm(cdm_target)
+                .is_ok_and(|installed| installed.matches_candidate(&marker));
+            if matches_candidate && !force {
+                PatchSelection::SkipCurrent
+            } else {
+                PatchSelection::Patch
+            }
+        }
+        OwnershipKind::Missing | OwnershipKind::LegacyManaged => PatchSelection::Patch,
+        OwnershipKind::External | OwnershipKind::InvalidMarker => preserved_selection(&assessment),
     }
+}
+
+fn preserved_selection(assessment: &OwnershipAssessment) -> PatchSelection {
+    PatchSelection::SkipPreserved {
+        summary: assessment.summary.clone(),
+        action: assessment
+            .action
+            .clone()
+            .unwrap_or_else(|| "Inspect ownership before replacing this CDM.".into()),
+    }
+}
+
+/// Decide whether a browser needs a patch. Returns `true` when the daemon
+/// should invoke the transactional patch core.
+#[must_use]
+pub fn needs_patch(
+    browser: &Browser,
+    candidate: Option<&CachedCdm>,
+    force: bool,
+    cdm_target: &std::path::Path,
+) -> bool {
+    matches!(
+        select_patch_action(browser, candidate, force, cdm_target),
+        PatchSelection::Patch
+    )
 }
 
 /// Resolve the current detected-browser list. Prefers the shared daemon
@@ -1340,57 +1405,229 @@ mod tests {
         run_event_loop(&tray, &stop, true, None).unwrap();
     }
 
-    /// Build a fake browser whose `WidevineCdm/manifest.json` reports
-    /// the given CDM version. Useful for exercising `needs_patch`.
-    fn fake_patched_browser(name: &str, install: &Path, cdm_version: &str) -> Browser {
-        let cdm = install.join("WidevineCdm");
-        std::fs::create_dir_all(&cdm).unwrap();
+    fn platform_dir() -> &'static str {
+        if cfg!(target_os = "macos") {
+            if cfg!(target_arch = "aarch64") {
+                "mac_arm64"
+            } else {
+                "mac_x64"
+            }
+        } else {
+            "linux_x64"
+        }
+    }
+
+    fn library_name() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "libwidevinecdm.dylib"
+        } else {
+            "libwidevinecdm.so"
+        }
+    }
+
+    fn write_payload(root: &Path, version: &str, library: &[u8]) {
+        let platform = root.join("_platform_specific").join(platform_dir());
+        std::fs::create_dir_all(&platform).unwrap();
         std::fs::write(
-            cdm.join("manifest.json"),
-            format!(r#"{{"version":"{cdm_version}"}}"#),
+            root.join("manifest.json"),
+            format!(r#"{{"version":"{version}"}}"#),
         )
         .unwrap();
-        Browser {
-            name: name.into(),
-            install_path: install.to_path_buf(),
-            kind: BrowserKind::Detected,
-            framework_name: None,
-        }
+        std::fs::write(platform.join(library_name()), library).unwrap();
+    }
+
+    fn make_candidate(root: &Path, version: &str, library: &[u8]) -> CachedCdm {
+        let dir = root.join("cache").join(version);
+        write_payload(&dir, version, library);
+        let manifest_body = format!(r#"{{"version":"{version}"}}"#);
+        CachedCdm::from_verified_payload(
+            version.to_string(),
+            dir,
+            crate::widevine::sha512_hex(library),
+            crate::widevine::sha512_hex(manifest_body.as_bytes()),
+        )
+    }
+
+    fn install_target(browser: &Browser) -> PathBuf {
+        browser.install_path.join("WidevineCdm")
+    }
+
+    fn write_managed_install(browser: &Browser, candidate: &CachedCdm) {
+        let target = install_target(browser);
+        let source = candidate.cdm_dir();
+        write_payload(
+            &target,
+            candidate.version(),
+            &std::fs::read(
+                source
+                    .join("_platform_specific")
+                    .join(platform_dir())
+                    .join(library_name()),
+            )
+            .unwrap(),
+        );
+        let marker = ownership::marker_for_cached(candidate).unwrap();
+        ownership::write_marker(&target, &marker).unwrap();
     }
 
     #[test]
     fn needs_patch_when_no_cdm_installed() {
         let tmp = TempDir::new().unwrap();
         let b = fake_browser("Helium", tmp.path().join("h"));
-        assert!(needs_patch(&b, Some("4.10.2934.0"), false));
+        let candidate = make_candidate(tmp.path(), "4.10.2934.0", b"candidate");
+        assert!(needs_patch(
+            &b,
+            Some(&candidate),
+            false,
+            &install_target(&b)
+        ));
     }
 
     #[test]
-    fn needs_patch_when_version_differs() {
+    fn needs_patch_when_managed_version_differs() {
         let tmp = TempDir::new().unwrap();
-        let b = fake_patched_browser("Helium", &tmp.path().join("h"), "4.10.2891.0");
-        assert!(needs_patch(&b, Some("4.10.2934.0"), false));
+        let b = fake_browser("Helium", tmp.path().join("h"));
+        let old = make_candidate(tmp.path(), "4.10.2891.0", b"old");
+        write_managed_install(&b, &old);
+        let candidate = make_candidate(tmp.path(), "4.10.2934.0", b"new");
+        assert_eq!(
+            select_patch_action(&b, Some(&candidate), false, &install_target(&b)),
+            PatchSelection::Patch
+        );
     }
 
     #[test]
-    fn skips_patch_when_versions_match() {
+    fn skips_patch_only_for_verified_matching_marker() {
         let tmp = TempDir::new().unwrap();
-        let b = fake_patched_browser("Helium", &tmp.path().join("h"), "4.10.2934.0");
-        assert!(!needs_patch(&b, Some("4.10.2934.0"), false));
+        let b = fake_browser("Helium", tmp.path().join("h"));
+        let candidate = make_candidate(tmp.path(), "4.10.2934.0", b"managed");
+        write_managed_install(&b, &candidate);
+        assert_eq!(
+            select_patch_action(&b, Some(&candidate), false, &install_target(&b)),
+            PatchSelection::SkipCurrent
+        );
+        assert!(!needs_patch(
+            &b,
+            Some(&candidate),
+            false,
+            &install_target(&b)
+        ));
     }
 
     #[test]
-    fn force_overrides_version_match() {
+    fn same_version_without_marker_is_preserved_not_success() {
         let tmp = TempDir::new().unwrap();
-        let b = fake_patched_browser("Helium", &tmp.path().join("h"), "4.10.2934.0");
-        assert!(needs_patch(&b, Some("4.10.2934.0"), true));
+        let mut b = fake_browser("Custom", tmp.path().join("c"));
+        b.kind = BrowserKind::Detected;
+        let candidate = make_candidate(tmp.path(), "4.10.2934.0", b"candidate");
+        write_payload(&install_target(&b), "4.10.2934.0", b"external-bytes");
+        match select_patch_action(&b, Some(&candidate), false, &install_target(&b)) {
+            PatchSelection::SkipPreserved { .. } => {}
+            other => panic!("expected preserved external, got {other:?}"),
+        }
+        assert!(!needs_patch(
+            &b,
+            Some(&candidate),
+            false,
+            &install_target(&b)
+        ));
     }
 
     #[test]
-    fn needs_patch_when_cache_unknown() {
+    fn invalid_marker_is_preserved_not_success() {
         let tmp = TempDir::new().unwrap();
-        let b = fake_patched_browser("Helium", &tmp.path().join("h"), "4.10.2891.0");
-        assert!(needs_patch(&b, None, false));
+        let b = fake_browser("Helium", tmp.path().join("h"));
+        let candidate = make_candidate(tmp.path(), "4.10.2934.0", b"candidate");
+        write_payload(&install_target(&b), "4.10.2934.0", b"payload");
+        std::fs::write(
+            install_target(&b).join(ownership::MANAGED_MARKER_FILENAME),
+            br#"{"schema_version":3,"silvervine_version":"2.0.1","cdm_version":"4.10.2934.0","platform":"bogus","library_sha512":"deadbeef","manifest_sha512":"cafebabe"}"#,
+        )
+        .unwrap();
+        match select_patch_action(&b, Some(&candidate), false, &install_target(&b)) {
+            PatchSelection::SkipPreserved { summary, action } => {
+                assert!(
+                    !summary.is_empty() && !action.is_empty(),
+                    "preserved invalid marker must carry summary/action"
+                );
+            }
+            other => panic!("expected preserved invalid marker, got {other:?}"),
+        }
+        assert!(!needs_patch(
+            &b,
+            Some(&candidate),
+            false,
+            &install_target(&b)
+        ));
+        // force must still not authorize invalid-marker replacement.
+        match select_patch_action(&b, Some(&candidate), true, &install_target(&b)) {
+            PatchSelection::SkipPreserved { .. } => {}
+            other => panic!("force must not replace invalid marker: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn known_unmarked_install_without_exact_match_is_preserved() {
+        let tmp = TempDir::new().unwrap();
+        let mut b = fake_browser("Helium", tmp.path().join("h"));
+        b.kind = BrowserKind::Known;
+        let candidate = make_candidate(tmp.path(), "4.10.2934.0", b"candidate");
+        write_payload(&install_target(&b), "4.9.0.0", b"legacy");
+        assert!(matches!(
+            select_patch_action(&b, Some(&candidate), false, &install_target(&b)),
+            PatchSelection::SkipPreserved { .. }
+        ));
+    }
+
+    #[test]
+    fn force_does_not_authorize_external_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let mut b = fake_browser("Custom", tmp.path().join("c"));
+        b.kind = BrowserKind::Detected;
+        let candidate = make_candidate(tmp.path(), "4.10.2934.0", b"candidate");
+        write_payload(&install_target(&b), "9.9.9.9", b"vendor");
+        match select_patch_action(&b, Some(&candidate), true, &install_target(&b)) {
+            PatchSelection::SkipPreserved { .. } => {}
+            other => panic!("force must not replace external: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn force_rechecks_verified_managed_install() {
+        let tmp = TempDir::new().unwrap();
+        let b = fake_browser("Helium", tmp.path().join("h"));
+        let candidate = make_candidate(tmp.path(), "4.10.2934.0", b"managed");
+        write_managed_install(&b, &candidate);
+        assert_eq!(
+            select_patch_action(&b, Some(&candidate), true, &install_target(&b)),
+            PatchSelection::Patch
+        );
+    }
+
+    #[test]
+    fn managed_install_without_verified_candidate_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let b = fake_browser("Helium", tmp.path().join("h"));
+        let candidate = make_candidate(tmp.path(), "4.10.2934.0", b"managed");
+        write_managed_install(&b, &candidate);
+        assert_eq!(
+            select_patch_action(&b, None, false, &install_target(&b)),
+            PatchSelection::SkipCurrent
+        );
+        assert!(!needs_patch(&b, None, false, &install_target(&b)));
+        // force still rechecks managed installs when a candidate is absent.
+        assert_eq!(
+            select_patch_action(&b, None, true, &install_target(&b)),
+            PatchSelection::Patch
+        );
+    }
+
+    #[test]
+    fn cache_unknown_preserves_unmarked_install() {
+        let tmp = TempDir::new().unwrap();
+        let b = fake_browser("Helium", tmp.path().join("h"));
+        write_payload(&install_target(&b), "4.10.2891.0", b"old");
+        assert!(!needs_patch(&b, None, false, &install_target(&b)));
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //! mutexes.
 //!
 //! The fix: every env-mutating test acquires the *same* global guard
-//! exposed by [`env_lock`] before touching env state. This crate-wide
+//! exposed by `env_lock` before touching env state. This crate-wide
 //! singleton serializes env mutations across the entire test binary so
 //! `cargo test --jobs N` for any N is reproducible.
 //!

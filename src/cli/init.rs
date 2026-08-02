@@ -24,9 +24,10 @@ use std::io::{IsTerminal, Write};
 
 use crate::browsers::{self, Browser};
 use crate::cli::OutputOptions;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCategory, Result};
 use crate::migration;
 use crate::patch::{self, PatchOptions, PlatformPatcher};
+use crate::widevine::ownership::{self, OwnershipKind};
 use crate::widevine::{self, CachedCdm};
 
 /// Args for `silvervine init`.
@@ -199,78 +200,158 @@ where
 {
     writeln!(out, "Silvervine: starting first-run setup.").map_err(Error::from)?;
 
-    // Step 1: legacy migration.
     if plan.run_migration {
-        let install = migration::detect_legacy_install();
-        if !install.is_empty() {
-            writeln!(out, "Removing {} legacy artifact(s)…", install.len()).map_err(Error::from)?;
-            match migration::remove_legacy(install) {
-                Ok(outcome) => {
-                    migration::write_migration_summary(out, &outcome).map_err(Error::from)?;
-                }
-                Err(e) => {
-                    writeln!(out, "Migration: warning — {e}").map_err(Error::from)?;
-                }
-            }
-        }
+        migrate_legacy_install(out)?;
     }
 
-    // Step 2: ensure the CDM is cached.
-    if !plan.browsers_to_manage.is_empty() {
-        writeln!(out, "Preparing Widevine CDM…").map_err(Error::from)?;
+    let cdm = prepare_cdm(&plan.browsers_to_manage, cdm_resolver, out)?;
+    let patch_failures = patch_selected_browsers(
+        &plan.browsers_to_manage,
+        cdm.as_ref(),
+        patcher,
+        out,
+        &patch_options,
+    )?;
+
+    finish_setup(plan, patch_failures, out)
+}
+
+fn migrate_legacy_install(out: &mut dyn Write) -> Result<()> {
+    let install = migration::detect_legacy_install();
+    if install.is_empty() {
+        return Ok(());
     }
-    let cdm = if plan.browsers_to_manage.is_empty() {
-        None
-    } else {
-        Some(cdm_resolver()?)
+
+    writeln!(out, "Removing {} legacy artifact(s)…", install.len()).map_err(Error::from)?;
+    match migration::remove_legacy(install) {
+        Ok(outcome) => migration::write_migration_summary(out, &outcome).map_err(Error::from),
+        Err(error) => writeln!(out, "Migration: warning — {error}").map_err(Error::from),
+    }
+}
+
+fn prepare_cdm<F>(
+    browsers: &[Browser],
+    cdm_resolver: F,
+    out: &mut dyn Write,
+) -> Result<Option<CachedCdm>>
+where
+    F: FnOnce() -> Result<CachedCdm>,
+{
+    if browsers.is_empty() {
+        return Ok(None);
+    }
+
+    writeln!(out, "Preparing Widevine CDM…").map_err(Error::from)?;
+    cdm_resolver().map(Some)
+}
+
+fn patch_selected_browsers(
+    browsers: &[Browser],
+    cdm: Option<&CachedCdm>,
+    patcher: &dyn PlatformPatcher,
+    out: &mut dyn Write,
+    patch_options: &PatchOptions,
+) -> Result<usize> {
+    let Some(cdm) = cdm else {
+        return Ok(0);
     };
 
-    // Step 3: patch each browser.
-    let mut patch_failures = 0_usize;
-    for browser in &plan.browsers_to_manage {
-        if let Some(cdm) = &cdm {
-            // Idempotency: if the browser is already patched at the
-            // cached CDM version, skip cleanly. This matters for
-            // re-runs of `silvervine setup` after upgrading Silvervine — the user
-            // may have the browser open, and a forced re-patch would
-            // fail with `BrowserRunning` even though the system is
-            // already in the desired state.
-            if let Some(installed) = browser.installed_cdm_version() {
-                if installed == cdm.version() {
-                    writeln!(
-                        out,
-                        "{}: already patched (Widevine {installed}); skipping",
-                        browser.name()
-                    )
-                    .map_err(Error::from)?;
-                    continue;
-                }
-            }
-            match patch::patch_browser(browser, cdm, patcher, &patch_options) {
-                Ok(outcome) => {
-                    writeln!(
-                        out,
-                        "Patched {}: Widevine {}",
-                        outcome.browser_name, outcome.cdm_version
-                    )
-                    .map_err(Error::from)?;
-                }
-                Err(e) => {
-                    patch_failures += 1;
-                    writeln!(out, "Patching {} FAILED: {e}", browser.name())
-                        .map_err(Error::from)?;
-                }
-            }
+    let mut failures = 0;
+    for browser in browsers {
+        if patch_browser_for_setup(browser, cdm, patcher, out, patch_options)? {
+            failures += 1;
         }
     }
+    Ok(failures)
+}
 
-    // Step 4: install daemon.
+fn patch_browser_for_setup(
+    browser: &Browser,
+    cdm: &CachedCdm,
+    patcher: &dyn PlatformPatcher,
+    out: &mut dyn Write,
+    patch_options: &PatchOptions,
+) -> Result<bool> {
+    let cdm_target = match patcher.cdm_target(browser.install_path()) {
+        Ok(path) => path,
+        Err(error) => return report_patch_failure(browser, &error, out),
+    };
+    let candidate_marker = match ownership::marker_for_cached(cdm) {
+        Ok(marker) => marker,
+        Err(error) => return report_patch_failure(browser, &error, out),
+    };
+    let assessment = match ownership::classify(browser, &cdm_target, cdm, &candidate_marker) {
+        Ok(assessment) => assessment,
+        Err(error) => return report_patch_failure(browser, &error, out),
+    };
+
+    if assessment.kind == OwnershipKind::Managed
+        && ownership::validate_installed_cdm(&cdm_target)
+            .is_ok_and(|installed| installed.matches_candidate(&candidate_marker))
+    {
+        writeln!(
+            out,
+            "{}: already patched (Widevine {}); skipping",
+            browser.name(),
+            candidate_marker.cdm_version
+        )
+        .map_err(Error::from)?;
+        return Ok(false);
+    }
+
+    if matches!(
+        assessment.kind,
+        OwnershipKind::External | OwnershipKind::InvalidMarker
+    ) {
+        let action = assessment
+            .action
+            .as_deref()
+            .unwrap_or("Inspect ownership before replacing this CDM.");
+        writeln!(
+            out,
+            "{}: preserved existing CDM — {}. {action}",
+            browser.name(),
+            assessment.summary
+        )
+        .map_err(Error::from)?;
+        return Ok(false);
+    }
+
+    match patch::patch_browser(browser, cdm, patcher, patch_options) {
+        Ok(outcome) => {
+            writeln!(
+                out,
+                "Patched {}: Widevine {}",
+                outcome.browser_name, outcome.cdm_version
+            )
+            .map_err(Error::from)?;
+            Ok(false)
+        }
+        Err(error)
+            if matches!(
+                error.category,
+                ErrorCategory::ExternalCdm | ErrorCategory::InvalidMarker
+            ) =>
+        {
+            writeln!(out, "{}: preserved existing CDM — {error}", browser.name())
+                .map_err(Error::from)?;
+            Ok(false)
+        }
+        Err(error) => report_patch_failure(browser, &error, out),
+    }
+}
+
+fn report_patch_failure(browser: &Browser, error: &Error, out: &mut dyn Write) -> Result<bool> {
+    writeln!(out, "Patching {} FAILED: {error}", browser.name()).map_err(Error::from)?;
+    Ok(true)
+}
+
+fn finish_setup(plan: &Plan, patch_failures: usize, out: &mut dyn Write) -> Result<()> {
     if plan.install_daemon {
         crate::daemon::lifecycle::register()?;
         writeln!(out, "Daemon registered for auto-start on login.").map_err(Error::from)?;
     }
 
-    // Step 5: EME health check (skippable).
     if plan.run_eme_test {
         writeln!(
             out,
@@ -286,11 +367,10 @@ where
             "Setup completed with {patch_failures} patch failure(s). \
              Run `silvervine doctor` for diagnostics."
         )
-        .map_err(Error::from)?;
+        .map_err(Error::from)
     } else {
-        writeln!(out, "Setup complete.").map_err(Error::from)?;
+        writeln!(out, "Setup complete.").map_err(Error::from)
     }
-    Ok(())
 }
 
 /// CLI entry point.
@@ -369,8 +449,21 @@ mod tests {
     }
 
     impl PlatformPatcher for MockPatcher {
-        fn write_cdm(&self, target: &Path, _cdm_source: &Path) -> Result<()> {
+        fn write_cdm(&self, target: &Path, cdm_source: &Path) -> Result<()> {
             self.write_calls.fetch_add(1, Ordering::SeqCst);
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&fs::read(cdm_source.join("manifest.json"))?)?;
+            let version = manifest
+                .get("version")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| Error::state_corrupted("test CDM manifest has no version"))?;
+            let library = fs::read(
+                cdm_source
+                    .join("_platform_specific")
+                    .join(test_platform_dir())
+                    .join(test_library_name()),
+            )?;
+            write_test_cdm(&target.join("WidevineCdm"), version, &library);
             fs::write(target.join("CDM_WRITTEN"), b"1").map_err(Error::from)
         }
         fn verify_post_patch(&self, _target: &Path) -> Result<()> {
@@ -420,13 +513,45 @@ mod tests {
 
     fn make_cdm(root: &Path, version: &str) -> CachedCdm {
         let dir = root.join(version);
-        fs::create_dir_all(dir.join("_platform_specific/linux_x64")).unwrap();
+        write_test_cdm(&dir, version, b"fake");
+        let manifest_body = format!(r#"{{"version":"{version}"}}"#);
+        CachedCdm::from_verified_payload(
+            version.to_string(),
+            dir,
+            crate::widevine::sha512_hex(b"fake"),
+            crate::widevine::sha512_hex(manifest_body.as_bytes()),
+        )
+    }
+
+    fn write_test_cdm(root: &Path, version: &str, library: &[u8]) {
+        let platform = root.join("_platform_specific").join(test_platform_dir());
+        fs::create_dir_all(&platform).unwrap();
+        fs::write(platform.join(test_library_name()), library).unwrap();
         fs::write(
-            dir.join("_platform_specific/linux_x64/libwidevinecdm.so"),
-            b"fake",
+            root.join("manifest.json"),
+            format!(r#"{{"version":"{version}"}}"#),
         )
         .unwrap();
-        CachedCdm::new(version.to_string(), dir)
+    }
+
+    fn test_platform_dir() -> &'static str {
+        if cfg!(target_os = "macos") {
+            if cfg!(target_arch = "aarch64") {
+                "mac_arm64"
+            } else {
+                "mac_x64"
+            }
+        } else {
+            "linux_x64"
+        }
+    }
+
+    fn test_library_name() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "libwidevinecdm.dylib"
+        } else {
+            "libwidevinecdm.so"
+        }
     }
 
     #[test]
@@ -516,18 +641,16 @@ mod tests {
         let _g = crate::test_support::env_lock();
         let _life = ScopedEnv::set(crate::daemon::lifecycle::NOOP_ENV, Path::new("1"));
         let tmp = TempDir::new().unwrap();
-        // Browser install dir + a pre-existing patched manifest at
-        // "4.10.2934.0" — i.e. the CDM is already in place at the
-        // version we'll claim is cached.
+        // Verified managed install: matching payload + Silvervine marker.
         let h = tmp.path().join("h");
-        fs::create_dir_all(h.join("WidevineCdm")).unwrap();
-        fs::write(
-            h.join("WidevineCdm").join("manifest.json"),
-            br#"{"version":"4.10.2934.0"}"#,
-        )
-        .unwrap();
+        fs::create_dir_all(&h).unwrap();
         let cache = tmp.path().join("cache");
         fs::create_dir_all(&cache).unwrap();
+        let cdm = make_cdm(&cache, "4.10.2934.0");
+        let target = h.join("WidevineCdm");
+        write_test_cdm(&target, "4.10.2934.0", b"fake");
+        let marker = ownership::marker_for_cached(&cdm).unwrap();
+        ownership::write_marker(&target, &marker).unwrap();
 
         let plan = Plan {
             browsers_to_manage: vec![make_browser(h.clone(), "Helium")],
@@ -565,22 +688,115 @@ mod tests {
     }
 
     #[test]
-    fn execute_plan_repatches_when_installed_cdm_version_mismatches() {
+    fn execute_plan_preserves_unmarked_mismatched_cdm() {
         let _g = crate::test_support::env_lock();
         let _life = ScopedEnv::set(crate::daemon::lifecycle::NOOP_ENV, Path::new("1"));
         let tmp = TempDir::new().unwrap();
-        // Browser is patched at an OLDER version; cached CDM is newer
-        // — we should re-patch (write_calls == 1).
+        // An older unmarked CDM has no Silvervine provenance, even for a known
+        // browser, so setup must preserve it pending an explicit replacement.
         let h = tmp.path().join("h");
-        fs::create_dir_all(h.join("WidevineCdm")).unwrap();
+        write_test_cdm(&h.join("WidevineCdm"), "4.10.0.0", b"old");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let mut browser = make_browser(h.clone(), "Helium");
+        browser.kind = BrowserKind::Known;
+
+        let plan = Plan {
+            browsers_to_manage: vec![browser],
+            ..Plan::empty()
+        };
+        let mut buf = Vec::new();
+        let opts = PatchOptions {
+            force_while_running: true,
+            lock_path: Some(tmp.path().join("patch.lock")),
+            backups_dir: Some(tmp.path().join("backups")),
+            ..Default::default()
+        };
+        let patcher = MockPatcher::default();
+        execute_plan(
+            &plan,
+            || Ok(make_cdm(&cache, "4.10.2934.0")),
+            &patcher,
+            &mut buf,
+            opts,
+        )
+        .expect("ok");
+
+        assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn execute_plan_does_not_skip_same_version_without_marker() {
+        let _g = crate::test_support::env_lock();
+        let _life = ScopedEnv::set(crate::daemon::lifecycle::NOOP_ENV, Path::new("1"));
+        let tmp = TempDir::new().unwrap();
+        let h = tmp.path().join("h");
+        // Same version, no marker, Detected browser => External preservation.
+        write_test_cdm(&h.join("WidevineCdm"), "4.10.2934.0", b"external");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let plan = Plan {
+            browsers_to_manage: vec![make_browser(h.clone(), "Custom")],
+            ..Plan::empty()
+        };
+        let mut buf = Vec::new();
+        let opts = PatchOptions {
+            force_while_running: true,
+            lock_path: Some(tmp.path().join("patch.lock")),
+            backups_dir: Some(tmp.path().join("backups")),
+            ..Default::default()
+        };
+        let patcher = MockPatcher::default();
+        execute_plan(
+            &plan,
+            || Ok(make_cdm(&cache, "4.10.2934.0")),
+            &patcher,
+            &mut buf,
+            opts,
+        )
+        .expect("ok");
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.contains("preserved existing CDM"),
+            "expected preserved outcome; got: {s}"
+        );
+        assert!(
+            !s.contains("already patched"),
+            "must not bless unmarked same-version"
+        );
+        assert!(
+            !s.contains("FAILED"),
+            "preservation is not a generic failure: {s}"
+        );
+        assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fs::read(
+                h.join("WidevineCdm")
+                    .join("_platform_specific")
+                    .join(test_platform_dir())
+                    .join(test_library_name())
+            )
+            .unwrap(),
+            b"external"
+        );
+    }
+
+    #[test]
+    fn execute_plan_preserves_invalid_marker_without_writing() {
+        let _g = crate::test_support::env_lock();
+        let _life = ScopedEnv::set(crate::daemon::lifecycle::NOOP_ENV, Path::new("1"));
+        let tmp = TempDir::new().unwrap();
+        let h = tmp.path().join("h");
+        // Valid payload layout + corrupt ownership marker => InvalidMarker.
+        write_test_cdm(&h.join("WidevineCdm"), "4.10.2934.0", b"payload");
         fs::write(
-            h.join("WidevineCdm").join("manifest.json"),
-            br#"{"version":"4.10.0.0"}"#,
+            h.join("WidevineCdm")
+                .join(ownership::MANAGED_MARKER_FILENAME),
+            br#"{"not":"a-valid-marker"}"#,
         )
         .unwrap();
         let cache = tmp.path().join("cache");
         fs::create_dir_all(&cache).unwrap();
-
         let plan = Plan {
             browsers_to_manage: vec![make_browser(h.clone(), "Helium")],
             ..Plan::empty()
@@ -601,8 +817,74 @@ mod tests {
             opts,
         )
         .expect("ok");
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.contains("preserved existing CDM"),
+            "expected preserved invalid-marker outcome; got: {s}"
+        );
+        assert!(
+            !s.contains("already patched"),
+            "must not bless invalid marker: {s}"
+        );
+        assert!(
+            !s.contains("FAILED"),
+            "invalid marker is preserved, not a generic failure: {s}"
+        );
+        assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fs::read(
+                h.join("WidevineCdm")
+                    .join("_platform_specific")
+                    .join(test_platform_dir())
+                    .join(test_library_name())
+            )
+            .unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            fs::read(
+                h.join("WidevineCdm")
+                    .join(ownership::MANAGED_MARKER_FILENAME)
+            )
+            .unwrap(),
+            br#"{"not":"a-valid-marker"}"#
+        );
+    }
 
-        assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 1);
+    #[test]
+    fn execute_plan_preserves_known_unmarked_install_without_exact_match() {
+        let _g = crate::test_support::env_lock();
+        let _life = ScopedEnv::set(crate::daemon::lifecycle::NOOP_ENV, Path::new("1"));
+        let tmp = TempDir::new().unwrap();
+        let h = tmp.path().join("h");
+        write_test_cdm(&h.join("WidevineCdm"), "4.9.0.0", b"legacy");
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let mut browser = make_browser(h.clone(), "Helium");
+        browser.kind = BrowserKind::Known;
+        let plan = Plan {
+            browsers_to_manage: vec![browser],
+            ..Plan::empty()
+        };
+        let mut buf = Vec::new();
+        let opts = PatchOptions {
+            force_while_running: true,
+            lock_path: Some(tmp.path().join("patch.lock")),
+            backups_dir: Some(tmp.path().join("backups")),
+            ..Default::default()
+        };
+        let patcher = MockPatcher::default();
+        execute_plan(
+            &plan,
+            || Ok(make_cdm(&cache, "4.10.2934.0")),
+            &patcher,
+            &mut buf,
+            opts,
+        )
+        .expect("ok");
+        assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 0);
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("Preserved"), "got: {s}");
     }
 
     /// A patcher whose `write_cdm` fails — used by

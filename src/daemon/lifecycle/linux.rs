@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::{Error, Result};
+use crate::platform::atomic_write;
 
 /// Service file name (under `systemd/user/`).
 const SERVICE_NAME: &str = "silvervine.service";
@@ -392,7 +393,7 @@ fn registration_file_exists(path: &Path) -> Result<bool> {
             path.display()
         ))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(Error::from(error).with_source_message(format!(
+        Err(error) => Err(Error::from(error).with_context(format!(
             "could not inspect daemon registration {}",
             path.display()
         ))),
@@ -403,7 +404,7 @@ fn remove_unit_file_if_present(unit_path: &Path) -> Result<()> {
     match std::fs::remove_file(unit_path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(Error::from(error).with_source_message(format!(
+        Err(error) => Err(Error::from(error).with_context(format!(
             "could not remove unit file {}",
             unit_path.display()
         ))),
@@ -415,22 +416,6 @@ fn remove_unit_file_if_present(unit_path: &Path) -> Result<()> {
 #[cfg(test)]
 fn write_unit_file(path: &Path, body: &str) -> Result<()> {
     atomic_write(path, body.as_bytes())
-}
-
-fn atomic_write(path: &Path, body: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            Error::from(e).with_source_message(format!("could not create {}", parent.display()))
-        })?;
-    }
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&temp, body).map_err(|e| {
-        Error::from(e).with_source_message(format!("could not write {}", temp.display()))
-    })?;
-    std::fs::rename(&temp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&temp);
-        Error::from(e).with_source_message(format!("could not replace {}", path.display()))
-    })
 }
 
 /// Run `systemctl --user <args>` and surface non-zero exits as errors.
@@ -510,25 +495,6 @@ fn systemctl_user(args: &[&str]) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-/// Glue trait: attach a path-context message to an `Error` when its
-/// message is empty (preserving the io error source). Mirrors the
-/// `MessageOr` helper in `platform::linux` but kept private to this
-/// file to avoid a cross-team dependency on a non-public symbol.
-trait WithSourceMessage {
-    fn with_source_message(self, msg: String) -> Self;
-}
-
-impl WithSourceMessage for Error {
-    fn with_source_message(mut self, msg: String) -> Self {
-        if self.message.is_empty() {
-            self.message = msg;
-        } else {
-            self.message = format!("{msg}: {}", self.message);
-        }
-        self
-    }
 }
 
 #[cfg(test)]
@@ -654,20 +620,6 @@ mod tests {
         let _noop = ScopedEnv::set(super::super::NOOP_ENV, Path::new("1"));
         // Public API short-circuits via NOOP guard.
         assert!(super::super::unregister().is_ok());
-    }
-
-    #[test]
-    fn with_source_message_appends_to_existing_message() {
-        let mut err = Error::other("boom");
-        err = err.with_source_message("context".into());
-        assert_eq!(err.message, "context: boom");
-    }
-
-    #[test]
-    fn with_source_message_replaces_empty_message() {
-        let mut err = Error::other("");
-        err = err.with_source_message("context".into());
-        assert_eq!(err.message, "context");
     }
 
     /// `systemctl_user` errors when the binary doesn't exist (i.e. on

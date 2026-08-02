@@ -40,33 +40,64 @@
 //! at another platform key. [`Manifest::resolve_platform`] follows aliases
 //! transparently.
 //!
-//! ## URL fallback chain
+//! ## Authenticated URL fallback chain
 //!
-//! Per the spec ("Mozilla manifest URL fallback chain"):
+//! [`fetch_manifest`] tries the fixed Mozilla HTTPS origins in order:
 //!
 //! 1. `https://hg.mozilla.org/...`
 //! 2. `https://raw.githubusercontent.com/...`
-//! 3. `~/.cache/silvervine/last-manifest.json` (TTL 24h)
 //!
-//! [`fetch_manifest`] walks the chain in order. On any successful network
-//! fetch it writes the parsed JSON back to the cache so step 3 stays warm.
+//! Each origin attempt covers download **and** parse/schema validation.
+//! Transport failures, non-success HTTP status, and malformed/schema-invalid
+//! bodies all continue to the next fixed origin. A successful response may be
+//! written as a diagnostic snapshot, but mutable on-disk snapshots are never
+//! read back to authorize executable CDM content.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::error::{Error, ErrorCategory, Result};
 
-/// TTL for the cached `last-manifest.json` file. Matches the spec
-/// (`~/.cache/silvervine/last-manifest.json (TTL 24h)`).
+/// Legacy manifest snapshot freshness value retained for API compatibility.
+///
+/// Mutable snapshots are write-only and never used as executable-content
+/// authenticity roots.
 pub const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// HTTP request timeout per fallback URL. The chain has three steps; we
-/// don't want any single step to hang for too long.
+/// HTTP request timeout per origin.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Minimal schema for a CDM bundle's installed `manifest.json`.
+///
+/// Chromium extension manifests contain many fields, but Silvervine only
+/// needs the version. Serde ignores all other fields without allocating a
+/// dynamic JSON tree.
+#[derive(Debug, Deserialize)]
+struct InstalledCdmManifest {
+    version: String,
+}
+
+/// Stream an installed CDM manifest and return its version.
+pub(crate) fn read_installed_cdm_version(path: &Path) -> Result<String> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        Error::from(error).with_context(format!(
+            "could not open installed Widevine manifest {}",
+            path.display()
+        ))
+    })?;
+    let manifest: InstalledCdmManifest = serde_json::from_reader(std::io::BufReader::new(file))
+        .map_err(|error| {
+            Error::from(error).with_context(format!(
+                "could not parse installed Widevine manifest {}",
+                path.display()
+            ))
+        })?;
+    Ok(manifest.version)
+}
 
 /// Top-level manifest shape.
 ///
@@ -273,95 +304,100 @@ fn default_urls() -> Vec<Url> {
     vec![primary_url, secondary_url]
 }
 
-/// Compute the on-disk path for the cached manifest fallback (`step 3` of
-/// the chain). Returns `None` if `dirs::cache_dir()` cannot be resolved
-/// (e.g. running with no `HOME`).
+/// Compute the path for the best-effort manifest diagnostic snapshot.
+///
+/// Returns `None` if `dirs::cache_dir()` cannot be resolved.
 #[must_use]
 pub fn cached_manifest_path() -> Option<PathBuf> {
     let cache = dirs::cache_dir()?;
     Some(cache.join("silvervine").join("last-manifest.json"))
 }
 
-/// Fetch the manifest using the full default URL chain plus the on-disk
-/// 24h cache fallback. This is the convenience entry point most callers
-/// (CLI, daemon) want.
+/// Fetch a fresh manifest from the fixed Mozilla HTTPS origins.
+///
+/// Successful bytes are retained as a best-effort diagnostic snapshot. The
+/// snapshot is never read back: if both origins fail (transport **or**
+/// parse/schema), this function fails closed rather than allowing mutable
+/// cache data to authorize native code.
 ///
 /// # Errors
 ///
-/// [`ErrorCategory::ManifestFetchFailed`] if every URL in the chain fails
-/// AND the on-disk cache is missing or stale. The error's `source` chains
-/// through the network errors so `--verbose` output can show what went
-/// wrong.
+/// [`ErrorCategory::ManifestFetchFailed`] if every HTTPS origin fails. The
+/// error's `source` retains the last per-origin failure (network or parse)
+/// for verbose diagnostics — never surfaces a bare
+/// [`ErrorCategory::StateCorrupted`] from a single origin.
 pub fn fetch_manifest() -> Result<Manifest> {
     let urls = default_urls();
     fetch_manifest_with(&urls, cached_manifest_path().as_deref(), CACHE_TTL)
 }
 
-/// Fetch the manifest with a caller-specified URL chain and cache config.
+/// Fetch a manifest from a caller-specified URL chain.
 ///
-/// This is the testable form: integration tests pass in a `urls` slice
-/// pointing at a local mock server, and a `cache_path` pointing at a
-/// `tempfile::TempDir` so the test doesn't touch the user's real cache.
+/// A successful response is written to `cache_path` when provided. The
+/// `cache_ttl` argument is retained for API compatibility, but snapshots are
+/// deliberately write-only and never become executable-content trust roots.
 ///
 /// # Behavior
 ///
-/// 1. Try each URL in `urls` in order. On the first successful parse,
-///    write the bytes to `cache_path` (if `Some`) and return.
-/// 2. If all URLs fail and `cache_path` exists and was modified within
-///    `cache_ttl`, return the cached manifest.
-/// 3. Otherwise return [`ErrorCategory::ManifestFetchFailed`].
+/// 1. Try each URL in order (download + parse/schema validation as one attempt).
+/// 2. On the first fully valid response, optionally snapshot its exact bytes
+///    and return the parsed manifest.
+/// 3. Transport, HTTP status, and parse/schema failures all continue to the
+///    next URL.
+/// 4. If every URL fails, return [`ErrorCategory::ManifestFetchFailed`] with
+///    the last per-origin failure as `source`.
 ///
 /// # Errors
 ///
-/// See above. The returned error's `source` chains through the most recent
-/// network failure for diagnostic purposes.
+/// See above. The returned error's category is always
+/// [`ErrorCategory::ManifestFetchFailed`] when the chain is exhausted; parse
+/// corruption from one origin is not leaked as the top-level category.
 pub fn fetch_manifest_with(
     urls: &[Url],
     cache_path: Option<&Path>,
-    cache_ttl: Duration,
+    _cache_ttl: Duration,
 ) -> Result<Manifest> {
     let client = reqwest::blocking::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .build()
         .map_err(|e| Error::network("failed to construct HTTP client").with_source(e))?;
 
-    let mut last_network_failure: Option<Error> = None;
+    let mut last_failure: Option<Error> = None;
     for url in urls {
         match try_fetch_one(&client, url) {
-            Ok(bytes) => {
-                let manifest = parse_manifest(&bytes)?;
+            Ok((manifest, bytes)) => {
                 // Best-effort cache write — failures here shouldn't fail
                 // the whole fetch (we have a perfectly good response in hand).
+                // Only the exact bytes of the first fully parsed valid
+                // response are retained; snapshots are never read back.
                 if let Some(path) = cache_path {
                     let _ = write_cache(path, &bytes);
                 }
                 return Ok(manifest);
             }
             Err(e) => {
-                last_network_failure = Some(e);
+                last_failure = Some(e);
             }
         }
     }
 
-    // All network attempts exhausted; fall back to disk cache if recent.
-    if let Some(path) = cache_path {
-        if let Some(bytes) = read_recent_cache(path, cache_ttl) {
-            return parse_manifest(&bytes);
-        }
-    }
-
     let mut err = Error::manifest_fetch_failed(format!(
-        "all {} manifest URLs failed and no recent cache available",
+        "all {} authenticated manifest URLs failed",
         urls.len()
     ));
-    if let Some(network_err) = last_network_failure {
-        err.source = Some(Box::new(network_err));
+    if let Some(origin_err) = last_failure {
+        err.source = Some(Box::new(origin_err));
     }
     Err(err)
 }
 
-/// Fetch one URL and return the raw response bytes.
-fn try_fetch_one(client: &reqwest::blocking::Client, url: &Url) -> Result<Vec<u8>> {
+/// Fetch one URL, parse/schema-validate the body, and return both the
+/// manifest and the exact response bytes on success.
+///
+/// Failures cover transport errors, non-success HTTP status, body read
+/// errors, and JSON/schema validation. Callers treat every failure the same
+/// for fallback purposes.
+fn try_fetch_one(client: &reqwest::blocking::Client, url: &Url) -> Result<(Manifest, Vec<u8>)> {
     let response = client
         .get(url.clone())
         .send()
@@ -374,31 +410,19 @@ fn try_fetch_one(client: &reqwest::blocking::Client, url: &Url) -> Result<Vec<u8
     }
     let bytes = response
         .bytes()
-        .map_err(|e| Error::network(format!("read body from {url}")).with_source(e))?;
-    Ok(bytes.to_vec())
+        .map_err(|e| Error::network(format!("read body from {url}")).with_source(e))?
+        .to_vec();
+    let manifest = parse_manifest(&bytes).map_err(|e| {
+        Error::state_corrupted(format!("manifest from {url} failed schema validation"))
+            .with_source(e)
+    })?;
+    Ok((manifest, bytes))
 }
 
-/// Write cached manifest bytes to disk, creating the parent directory if
-/// missing. Best-effort — caller ignores failures.
+/// Atomically cache manifest bytes, creating the parent directory if needed.
+/// Best-effort — callers intentionally ignore failures.
 fn write_cache(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, bytes)?;
-    Ok(())
-}
-
-/// Read cached manifest bytes if the file exists AND was modified within
-/// `ttl`. Returns `None` if missing, stale, or unreadable — those all
-/// fall through to the "every URL failed" branch.
-fn read_recent_cache(path: &Path, ttl: Duration) -> Option<Vec<u8>> {
-    let meta = std::fs::metadata(path).ok()?;
-    let modified = meta.modified().ok()?;
-    let age = SystemTime::now().duration_since(modified).ok()?;
-    if age > ttl {
-        return None;
-    }
-    std::fs::read(path).ok()
+    crate::platform::atomic_write(path, bytes)
 }
 
 // `ErrorCategory` is not used directly here, but documenting it inline
@@ -576,22 +600,19 @@ mod tests {
         // assert anything — that's a valid environment for the binary.
     }
 
-    /// `fetch_manifest_with` falls back to disk cache when every URL fails.
-    /// We use the literal <http://127.0.0.1:1/nope> URL (port 1 is in
-    /// privileged range and almost always rejects connections) so the
-    /// network step deterministically fails without external network
-    /// dependencies.
+    /// Mutable manifest snapshots are diagnostic cache only and must never
+    /// authorize executable bytes after the HTTPS origins fail.
     #[test]
-    fn falls_back_to_disk_cache_on_network_failure() {
+    fn fresh_cache_is_not_used_when_network_fails() {
         let tmp = TempDir::new().expect("tempdir");
         let cache_path = tmp.path().join("last-manifest.json");
-        // Pre-seed the cache with the fixture.
-        fs::write(&cache_path, fixture_bytes()).expect("seed cache");
-
+        fs::write(&cache_path, fixture_bytes()).expect("seed forged cache");
         let bad_url = Url::parse("http://127.0.0.1:1/nope").expect("url parse");
-        let manifest =
-            fetch_manifest_with(&[bad_url], Some(&cache_path), CACHE_TTL).expect("disk fallback");
-        assert!(!manifest.widevine().expect("vendor").version.is_empty());
+
+        let error = fetch_manifest_with(&[bad_url], Some(&cache_path), CACHE_TTL)
+            .expect_err("mutable cache must not become an authenticity root");
+
+        assert_eq!(error.category, ErrorCategory::ManifestFetchFailed);
     }
 
     #[test]
@@ -601,29 +622,6 @@ mod tests {
         let bad_url = Url::parse("http://127.0.0.1:1/nope").expect("url parse");
         let err = fetch_manifest_with(&[bad_url], Some(&cache_path), CACHE_TTL)
             .expect_err("both should fail");
-        assert_eq!(err.category, ErrorCategory::ManifestFetchFailed);
-    }
-
-    #[test]
-    fn stale_cache_is_ignored() {
-        let tmp = TempDir::new().expect("tempdir");
-        let cache_path = tmp.path().join("stale.json");
-        fs::write(&cache_path, fixture_bytes()).expect("seed cache");
-        // Backdate the file. We use the platform's `set_modified` if
-        // available; otherwise we just skip the assertion (cache is "fresh"
-        // by virtue of being just written).
-        let one_year_ago = SystemTime::now() - Duration::from_secs(365 * 86_400);
-        if let Ok(file) = fs::OpenOptions::new().write(true).open(&cache_path) {
-            // `set_modified` exists on Rust 1.75 (our MSRV).
-            let _ = file.set_modified(one_year_ago);
-        }
-        let bad_url = Url::parse("http://127.0.0.1:1/nope").expect("url parse");
-        let outcome = fetch_manifest_with(
-            &[bad_url],
-            Some(&cache_path),
-            Duration::from_secs(60), // 60s TTL ≪ 1 year
-        );
-        let err = outcome.expect_err("stale cache should not be honored");
         assert_eq!(err.category, ErrorCategory::ManifestFetchFailed);
     }
 
@@ -719,6 +717,44 @@ mod tests {
         let manifest =
             fetch_manifest_with(&[bad, good], None, CACHE_TTL).expect("secondary must win");
         assert!(!manifest.widevine().expect("vendor").version.is_empty());
+    }
+
+    /// A 200 response whose body fails JSON/schema validation must continue
+    /// to the next fixed origin exactly like a transport failure. The valid
+    /// secondary wins, and only its exact bytes are snapshotted.
+    #[test]
+    fn fetch_manifest_with_falls_through_on_malformed_primary() {
+        let malformed = spawn_fixture_server(b"{\"vendors\": \"not-an-object\"}".to_vec());
+        let good = spawn_fixture_server(fixture_bytes());
+        let tmp = TempDir::new().expect("tempdir");
+        let cache_path = tmp.path().join("cache.json");
+
+        let manifest = fetch_manifest_with(&[malformed, good], Some(&cache_path), CACHE_TTL)
+            .expect("valid secondary must win after schema-invalid primary");
+        assert!(!manifest.widevine().expect("vendor").version.is_empty());
+
+        let cached = std::fs::read(&cache_path).expect("cache file written");
+        assert_eq!(
+            cached,
+            fixture_bytes(),
+            "snapshot must be exact bytes of the first fully parsed valid response"
+        );
+    }
+
+    /// Exhausting the chain on parse/schema failures (not only transport)
+    /// must surface ManifestFetchFailed, never a leaked StateCorrupted.
+    #[test]
+    fn exhausted_parse_failures_are_manifest_fetch_failed() {
+        let bad = spawn_fixture_server(b"not-json-at-all".to_vec());
+        let err = fetch_manifest_with(&[bad], None, CACHE_TTL)
+            .expect_err("schema-invalid sole origin must fail the chain");
+        assert_eq!(err.category, ErrorCategory::ManifestFetchFailed);
+        let source = err
+            .source
+            .as_ref()
+            .and_then(|s| s.downcast_ref::<Error>())
+            .expect("last origin failure retained as Error source");
+        assert_eq!(source.category, ErrorCategory::StateCorrupted);
     }
 
     /// A non-2xx HTTP response is treated as a network failure.

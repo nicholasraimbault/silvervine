@@ -11,11 +11,10 @@
 //! * [`run_as_root`] — execute an arbitrary command with elevated privileges.
 //!   Returns the captured [`Output`] regardless of exit status; callers
 //!   inspect `status.success()` and the stderr text for diagnostics.
-//! * [`atomic_rename`] — APFS / ext4-aware swap (uses the `nix` crate
-//!   internally; falls back to two-step rename on filesystems that don't
-//!   support `RENAME_EXCHANGE` / `RENAME_SWAP`). This is the helper that
-//!   `core-engine`'s `patch::backup` uses; living here keeps the syscall
-//!   gating out of cross-cutting modules.
+//! * [`atomic_rename`] — crash-atomic APFS / ext4 directory exchange that
+//!   fails closed when the filesystem lacks native swap support.
+//! * `atomic_write` — same-directory temporary-file replacement for internal
+//!   state and registration files.
 //!
 //! ## What does NOT live here
 //!
@@ -33,10 +32,13 @@
 //! (`SILVERVINE_TEST_ESCALATE_NOOP=1`) so CI never actually prompts for a
 //! password.
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use crate::error::{Error, Result};
+
+pub mod process;
 
 #[cfg(target_os = "linux")]
 use linux as imp;
@@ -51,8 +53,8 @@ use unsupported as imp;
 ///
 /// Implementations:
 ///
-/// * Linux ([`linux::LinuxPaths`](self::linux::LinuxPaths)): XDG-compliant.
-/// * macOS ([`macos::MacosPaths`](self::macos::MacosPaths)): `~/Library/...`.
+/// * Linux (`LinuxPaths`): XDG-compliant.
+/// * macOS (`MacosPaths`): `~/Library/...`.
 ///
 /// Tests that need to assert against the trait without a real `$HOME` use
 /// the per-platform impl directly, since the methods are pure (no I/O).
@@ -149,6 +151,36 @@ pub fn run_as_root(command: &[&str]) -> Result<Output> {
     }
     imp::run_as_root(command)
 }
+/// Run an executable under elevation while binding macOS execution to the
+/// exact image digest selected by the unprivileged parent.
+///
+/// Linux callers pass `/proc/<pid>/exe`, which is already inode-pinned. On
+/// macOS the elevated shell opens the path once, verifies `expected_sha512`
+/// through that descriptor, then executes `/dev/fd/9`; a path swap during the
+/// authorization prompt therefore cannot change the elevated image.
+///
+/// # Errors
+///
+/// Returns an error for empty commands, malformed SHA-512 digests, unsupported
+/// platforms, or elevation-tool failures.
+pub(crate) fn run_pinned_as_root(command: &[&str], expected_sha512: &str) -> Result<Output> {
+    if command.is_empty() {
+        return Err(Error::other("run_pinned_as_root called with empty command"));
+    }
+    if expected_sha512.len() != 128
+        || !expected_sha512
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(Error::other(
+            "run_pinned_as_root requires a lowercase SHA-512 digest",
+        ));
+    }
+    if std::env::var_os("SILVERVINE_TEST_ESCALATE_NOOP").is_some() {
+        return Ok(noop_output());
+    }
+    imp::run_pinned_as_root(command, expected_sha512)
+}
 
 /// Run a shell script under a single elevated invocation.
 ///
@@ -178,36 +210,57 @@ pub fn run_as_root_script(script: &str) -> Result<Output> {
     if std::env::var_os("SILVERVINE_TEST_ESCALATE_NOOP").is_some() {
         return Ok(noop_output());
     }
-    imp::run_as_root(&["sh", "-c", script])
+    imp::run_as_root(&["/bin/sh", "-c", script])
 }
 
-/// Atomic rename helper used by [`crate::patch`] (via core-engine's
-/// `patch::backup`).
+/// Exchange two existing filesystem entries.
 ///
-/// On Linux this uses `renameat2(RENAME_EXCHANGE)`; on macOS it uses
-/// `renameatx_np(RENAME_SWAP)`. If the underlying syscall returns
-/// `EINVAL` (i.e. the filesystem doesn't support atomic swap, e.g.
-/// non-APFS macOS volumes) the function falls back to a two-step
-/// `rename` sequence:
-///
-/// 1. `rename(dst, dst.tmp)`
-/// 2. `rename(src, dst)`
-/// 3. remove `dst.tmp`
-///
-/// The fallback is atomic in the typical case but not perfectly
-/// crash-safe — documented as a known limitation in the spec.
-///
-/// Both `src` and `dst` must already exist for the atomic-swap path. The
-/// fallback path requires `dst` to exist; if it doesn't, the function
-/// performs a plain `rename(src, dst)`.
+/// Linux uses `renameat2(RENAME_EXCHANGE)` and macOS uses
+/// `renameatx_np(RENAME_SWAP)`. When the destination does not exist, a plain
+/// rename is already atomic. When native exchange is unsupported, this fails
+/// without moving either path; transactional patch writers must never fall
+/// back to a crash-vulnerable multi-rename sequence.
 ///
 /// # Errors
 ///
 /// * [`crate::ErrorCategory::PermissionDenied`] if writes to either path
 ///   are rejected.
-/// * [`crate::ErrorCategory::Other`] for any other I/O failure.
+/// * [`crate::ErrorCategory::Other`] if native atomic exchange is unavailable
+///   or any other I/O failure occurs.
 pub fn atomic_rename(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     imp::atomic_rename(src, dst)
+}
+
+/// Replace a file from a same-directory temporary file.
+///
+/// The parent directory is created when needed. Writing and syncing happen
+/// before the atomic rename, so readers never observe a partially written
+/// state file.
+pub(crate) fn atomic_write(path: &Path, body: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|error| {
+        Error::from(error).with_context(format!("could not create {}", parent.display()))
+    })?;
+
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+        Error::from(error).with_context(format!(
+            "could not create temporary file beside {}",
+            path.display()
+        ))
+    })?;
+    temporary.write_all(body).map_err(|error| {
+        Error::from(error).with_context(format!("could not write {}", path.display()))
+    })?;
+    temporary.as_file_mut().sync_all().map_err(|error| {
+        Error::from(error).with_context(format!("could not sync {}", path.display()))
+    })?;
+    temporary.persist(path).map_err(|error| {
+        Error::from(error.error).with_context(format!("could not replace {}", path.display()))
+    })?;
+    Ok(())
 }
 
 /// Whether the current process is already running with effective UID 0
@@ -301,6 +354,11 @@ mod unsupported {
             "run_as_root is only implemented on Linux and macOS",
         ))
     }
+    pub(super) fn run_pinned_as_root(_command: &[&str], _expected_sha512: &str) -> Result<Output> {
+        Err(Error::unsupported_platform(
+            "run_pinned_as_root is only implemented on Linux and macOS",
+        ))
+    }
     pub(super) fn atomic_rename(_src: &Path, _dst: &Path) -> Result<()> {
         Err(Error::unsupported_platform(
             "atomic_rename is only implemented on Linux and macOS",
@@ -316,6 +374,7 @@ mod tests {
     /// points so CI never prompts for a password.
     #[test]
     fn noop_short_circuit_in_test_mode() {
+        let _guard = crate::test_support::env_lock();
         // SAFETY: setting an env var is a process-wide mutation; this
         // test takes a small risk of interfering with parallel tests in
         // the same module, but `cargo test` runs each `#[test]` in its
