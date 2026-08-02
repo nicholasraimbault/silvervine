@@ -12,13 +12,16 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::thread;
 
 use serde::{Deserialize, Serialize};
 
 use crate::browsers;
 use crate::cli::OutputOptions;
 use crate::daemon::tray::{detect_tray_availability, TrayAvailability};
-use crate::diagnostics::collect::{collect_browser, collect_host_media_checks, BrowserDiagnostics};
+use crate::diagnostics::collect::{
+    collect_browser_with_cache_validation, collect_host_media_checks, BrowserDiagnostics,
+};
 use crate::diagnostics::store::{load_default, CacheLookup, ProbeFingerprint, StoredProbeReport};
 use crate::diagnostics::{DiagnosticCheck, DiagnosticStatus, EvidenceSource, FailureDomain};
 use crate::eme;
@@ -271,28 +274,104 @@ fn status_name(status: DiagnosticStatus) -> &'static str {
     }
 }
 
-fn collect_media(detected: &[&crate::browsers::Browser]) -> MediaDiagnostics {
-    let browsers = detected
-        .iter()
-        .copied()
-        .map(|browser| {
-            let passive = collect_browser(browser);
-            let (cached_probe, cache_check) = cached_probe(
-                browser.name(),
-                passive.fingerprint.as_ref(),
-                &passive.ownership,
-            );
-            BrowserMediaDiagnostics {
-                passive,
-                cached_probe,
-                cache_check,
-            }
-        })
-        .collect();
-    MediaDiagnostics {
-        browsers,
-        host_checks: collect_host_media_checks(),
+const MAX_MEDIA_WORKERS: usize = 4;
+
+fn join_worker<T>(handle: thread::ScopedJoinHandle<'_, T>) -> T {
+    handle
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+}
+
+fn collect_ordered_bounded<T, R, F>(items: &[T], worker: &F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    if items.len() <= 1 {
+        return items.iter().map(worker).collect();
     }
+
+    let mut results = Vec::with_capacity(items.len());
+    for (wave_index, wave) in items.chunks(MAX_MEDIA_WORKERS).enumerate() {
+        thread::scope(|scope| {
+            let tasks: Vec<_> = wave
+                .iter()
+                .enumerate()
+                .map(|(offset, item)| {
+                    let worker_index = wave_index * MAX_MEDIA_WORKERS + offset;
+                    match thread::Builder::new()
+                        .name(format!("silvervine-media-{worker_index}"))
+                        .spawn_scoped(scope, move || worker(item))
+                    {
+                        Ok(handle) => Ok(handle),
+                        Err(_) => Err(worker(item)),
+                    }
+                })
+                .collect();
+
+            results.extend(tasks.into_iter().map(|task| match task {
+                Ok(handle) => join_worker(handle),
+                Err(value) => value,
+            }));
+        });
+    }
+    results
+}
+
+fn collect_browser_media(
+    browser: &crate::browsers::Browser,
+    cache_validation: &Result<Option<crate::widevine::CachedCdm>>,
+) -> BrowserMediaDiagnostics {
+    let passive = collect_browser_with_cache_validation(browser, cache_validation);
+    let (cached_probe, cache_check) = cached_probe(
+        browser.name(),
+        passive.fingerprint.as_ref(),
+        &passive.ownership,
+    );
+    BrowserMediaDiagnostics {
+        passive,
+        cached_probe,
+        cache_check,
+    }
+}
+
+fn collect_media(detected: &[&crate::browsers::Browser]) -> MediaDiagnostics {
+    collect_media_with_validator(detected, crate::widevine::cache::validated_current_readonly)
+}
+
+fn collect_media_with_validator<F>(
+    detected: &[&crate::browsers::Browser],
+    validate_cache: F,
+) -> MediaDiagnostics
+where
+    F: FnOnce() -> Result<Option<crate::widevine::CachedCdm>>,
+{
+    if detected.is_empty() {
+        return MediaDiagnostics {
+            browsers: Vec::new(),
+            host_checks: collect_host_media_checks(),
+        };
+    }
+
+    let cache_validation = validate_cache();
+    thread::scope(|scope| {
+        let host_task = thread::Builder::new()
+            .name("silvervine-media-host".into())
+            .spawn_scoped(scope, collect_host_media_checks)
+            .ok();
+        let browsers = collect_ordered_bounded(detected, &|browser| {
+            collect_browser_media(browser, &cache_validation)
+        });
+        let host_checks = match host_task {
+            Some(handle) => join_worker(handle),
+            None => collect_host_media_checks(),
+        };
+        MediaDiagnostics {
+            browsers,
+            host_checks,
+        }
+    })
 }
 
 fn cached_probe(
@@ -598,6 +677,8 @@ mod tests {
     use super::*;
     use crate::browsers::{Browser, BrowserKind};
     use std::path::PathBuf;
+    use std::sync::{mpsc, Arc, Condvar, Mutex};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn fake_browser(name: &str, install: PathBuf) -> Browser {
@@ -989,5 +1070,122 @@ mod tests {
             crate::diagnostics::FailureDomain::BrowserMediaStack
         );
         assert_eq!(check.failure_domain, updated.assessment.domain);
+    }
+    #[test]
+    fn ordered_collection_runs_single_item_inline() {
+        let caller = std::thread::current().id();
+        let worker_threads = collect_ordered_bounded(&[1], &|_| std::thread::current().id());
+        assert_eq!(worker_threads, [caller]);
+    }
+
+    #[test]
+    fn ordered_collection_overlaps_first_wave() {
+        let gate = Arc::new((Mutex::new((0_usize, false)), Condvar::new()));
+        let worker_gate = Arc::clone(&gate);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let runner = std::thread::spawn(move || {
+            let input = [0, 1, 2, 3];
+            let result = collect_ordered_bounded(&input, &|item| {
+                let (lock, wake) = &*worker_gate;
+                let mut state = lock.lock().expect("gate lock");
+                state.0 += 1;
+                wake.notify_all();
+                while !state.1 {
+                    state = wake.wait(state).expect("gate wait");
+                }
+                *item
+            });
+            result_tx.send(result).expect("send results");
+        });
+
+        let (lock, wake) = &*gate;
+        let state = lock.lock().expect("gate lock");
+        let (mut state, _) = wake
+            .wait_timeout_while(state, Duration::from_secs(2), |state| {
+                state.0 < MAX_MEDIA_WORKERS
+            })
+            .expect("gate wait");
+        let started_before_release = state.0;
+        state.1 = true;
+        wake.notify_all();
+        drop(state);
+
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("collector completed");
+        runner.join().expect("collector thread");
+        assert_eq!(started_before_release, MAX_MEDIA_WORKERS);
+        assert_eq!(result.len(), MAX_MEDIA_WORKERS);
+    }
+
+    #[test]
+    fn ordered_collection_preserves_input_order_across_waves() {
+        let input = [7, 2, 9, 1, 8, 3, 6, 4, 5];
+        let result = collect_ordered_bounded(&input, &|item| item * 2);
+        assert_eq!(result, [14, 4, 18, 2, 16, 6, 12, 8, 10]);
+    }
+
+    #[test]
+    fn ordered_collection_resumes_worker_panic() {
+        let panic = std::panic::catch_unwind(|| {
+            collect_ordered_bounded(&[0, 1], &|item| {
+                assert_eq!(*item, 0, "worker panic");
+                *item
+            })
+        });
+        let payload = panic.expect_err("worker panic must propagate");
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+        assert!(message.is_some_and(|message| message.contains("worker panic")));
+    }
+
+    #[test]
+    fn media_collection_validates_cache_once_for_all_browsers() {
+        let tmp = TempDir::new().expect("tempdir");
+        let browsers = [
+            fake_browser("Helium", tmp.path().join("helium")),
+            fake_browser("Thorium", tmp.path().join("thorium")),
+        ];
+        let detected: Vec<_> = browsers.iter().collect();
+        let validation_calls = std::cell::Cell::new(0);
+
+        let media = collect_media_with_validator(&detected, || {
+            validation_calls.set(validation_calls.get() + 1);
+            Ok::<Option<crate::widevine::CachedCdm>, crate::Error>(None)
+        });
+
+        assert_eq!(validation_calls.get(), 1);
+        assert_eq!(media.browsers.len(), browsers.len());
+    }
+
+    #[test]
+    fn shared_cache_validation_error_warns_every_browser() {
+        let tmp = TempDir::new().expect("tempdir");
+        let browsers = [
+            fake_browser("Helium", tmp.path().join("helium")),
+            fake_browser("Thorium", tmp.path().join("thorium")),
+        ];
+        let detected: Vec<_> = browsers.iter().collect();
+
+        let media = collect_media_with_validator(&detected, || {
+            Err(crate::Error::hash_mismatch("cache drift"))
+        });
+
+        for browser in media.browsers {
+            assert!(browser.passive.fingerprint.is_none());
+            let cache_check = browser
+                .passive
+                .checks
+                .iter()
+                .find(|check| check.id == "cdm.cache")
+                .expect("per-browser cache warning");
+            assert_eq!(cache_check.status, DiagnosticStatus::Warn);
+            assert_eq!(
+                cache_check.details.get("error").map(String::as_str),
+                Some("cache drift")
+            );
+        }
     }
 }

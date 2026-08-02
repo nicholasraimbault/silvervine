@@ -84,7 +84,16 @@ pub struct BrowserDiagnostics {
 /// its processes, dumping profiles, or making network requests.
 #[must_use]
 pub fn collect_browser(browser: &Browser) -> BrowserDiagnostics {
-    match crate::widevine::cache::validated_current_readonly() {
+    let validation = crate::widevine::cache::validated_current_readonly();
+    collect_browser_with_cache_validation(browser, &validation)
+}
+
+#[must_use]
+pub(crate) fn collect_browser_with_cache_validation(
+    browser: &Browser,
+    validation: &Result<Option<CachedCdm>>,
+) -> BrowserDiagnostics {
+    match validation {
         Ok(candidate) => collect_browser_with_candidate(browser, candidate.as_ref()),
         Err(error) => {
             let mut diagnostics = collect_browser_with_candidate(browser, None);
@@ -98,7 +107,7 @@ pub fn collect_browser(browser: &Browser) -> BrowserDiagnostics {
                 action: Some("Run `silvervine update widevine`, then retry.".into()),
                 details: BTreeMap::from([
                     ("error_category".into(), error.category.as_str().into()),
-                    ("error".into(), error.message),
+                    ("error".into(), error.message.clone()),
                 ]),
             });
             diagnostics

@@ -10,6 +10,13 @@ Future entries are generated from
 
 ## [Unreleased]
 
+### Changed
+
+- Reduced multi-browser `doctor --media-stack` latency with bounded concurrent
+  browser/host evidence collection and one shared read-only current-CDM
+  integrity validation, while preserving deterministic output and synchronous
+  resource-pressure fallbacks.
+
 ## [2.1.0] - 2026-08-02
 
 ### Added
