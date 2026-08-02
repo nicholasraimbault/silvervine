@@ -35,7 +35,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::patch::PlatformPatcher;
+use crate::patch::{ManagedWrite, PlatformPatcher};
+use crate::platform::process::run_output_with_timeout;
+use crate::widevine::ownership::{self, ManagedMarker};
 use crate::widevine::{
     platform_directory, platform_library, Platform, PLATFORM_SPECIFIC_DIRECTORY,
 };
@@ -59,6 +61,15 @@ impl LinuxPatcher {
 impl PlatformPatcher for LinuxPatcher {
     fn write_cdm(&self, target: &Path, cdm_source: &Path) -> Result<()> {
         write_cdm_into(target, cdm_source)
+    }
+    fn write_managed_cdm(
+        &self,
+        target: &Path,
+        cdm_source: &Path,
+        parent_marker: &ManagedMarker,
+    ) -> Result<ManagedWrite> {
+        write_managed_cdm_into(target, cdm_source, parent_marker)?;
+        Ok(ManagedWrite::MarkerCommitted(parent_marker.clone()))
     }
 
     fn verify_post_patch(&self, target: &Path) -> Result<()> {
@@ -104,6 +115,41 @@ fn write_cdm_into(target: &Path, cdm_source: &Path) -> Result<()> {
     }
 
     replace_cdm_transactionally(target, |staged| copy_recursive(cdm_source, staged))
+}
+fn write_managed_cdm_into(
+    target: &Path,
+    cdm_source: &Path,
+    parent_marker: &ManagedMarker,
+) -> Result<()> {
+    if !cdm_source.exists() {
+        return Err(Error::unknown_bundle_structure(format!(
+            "CDM source directory does not exist: {}",
+            cdm_source.display()
+        )));
+    }
+    if !target.exists() {
+        return Err(Error::unknown_bundle_structure(format!(
+            "browser install path does not exist: {}",
+            target.display()
+        )));
+    }
+    replace_cdm_transactionally(target, |staged| {
+        copy_recursive(cdm_source, staged)?;
+        let copied = ownership::marker_for_finalized_payload(staged, parent_marker)?;
+        if &copied != parent_marker {
+            return Err(Error::invalid_marker(
+                "Linux CDM copy changed the parent-selected payload",
+            ));
+        }
+        ownership::write_marker(staged, parent_marker)?;
+        let installed = ownership::validate_installed_cdm(staged)?;
+        if installed.marker() != parent_marker {
+            return Err(Error::invalid_marker(
+                "Linux staging committed an unexpected ownership marker",
+            ));
+        }
+        Ok(())
+    })
 }
 
 fn replace_cdm_transactionally<F>(target: &Path, populate: F) -> Result<()>
@@ -305,41 +351,19 @@ fn is_executable(p: &Path) -> bool {
     fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
 }
 
-/// Best-effort spawn of `binary --version` with a `timeout`-style wait.
-///
-/// Returns the trimmed first line of stdout on success. The standard library
-/// has no timeout-aware `Command::output`, so we use a simple thread-based
-/// wait pattern.
+/// Best-effort spawn of `binary --version` with bounded output and a
+/// process-group timeout.
 fn run_with_timeout(binary: &Path, args: &[&str], timeout: Duration) -> Option<String> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::sync::mpsc;
-    use std::thread;
-
-    let mut child = Command::new(binary)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let stdout = child.stdout.take()?;
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut buf = String::new();
-        let mut handle = stdout;
-        let _ = handle.read_to_string(&mut buf);
-        let _ = tx.send(buf);
-    });
-
-    let result = rx.recv_timeout(timeout).ok()?;
-    let _ = child.kill();
-    let first_line = result.lines().next()?.trim();
+    let output = run_output_with_timeout(binary, args, timeout).ok()?;
+    if output.timed_out || !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first_line = stdout.lines().next()?.trim();
     if first_line.is_empty() {
         None
     } else {
-        Some(first_line.to_string())
+        Some(first_line.to_owned())
     }
 }
 

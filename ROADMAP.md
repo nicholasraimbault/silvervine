@@ -22,7 +22,12 @@ V2 is the first Rust-rewrite release. The prior bash + Swift + Go implementation
 - **Browser-running detection.** Defers patches when the browser is running; retries when it quits (mtime-stable + 1h hard cap).
 - **Tray icon + native notifications.** `ksni` on Linux (StatusNotifierItem directly over D-Bus — zero GTK / libappindicator runtime dep); `tray-icon` on macOS; `notify-rust` for notifications.
 - **Mozilla manifest URL fallback chain.** `hg.mozilla.org` → GitHub mirror → 24h on-disk cache.
-- **`silvervine doctor` with EME error-code translation** across Netflix, Disney+, HBO Max, Spotify, Hulu; `--share` produces a pre-filled GitHub issue URL.
+- **Diagnostics.** `silvervine doctor` translates service error codes and
+  `--share` produces a pre-filled GitHub issue URL. `doctor --media-stack` adds
+  passive browser/CDM provenance, architecture, codec, and graphics evidence;
+  the explicit `silvervine test` command collects browser-reported EME,
+  robustness, Media Capabilities, and HDCP policy results through a bounded
+  loopback page.
 - **`silvervine repair`.** Uninstall + setup composition; preserves user config.
 - **Migration from V1.** Detects bash installs and packaged installs (AUR / .deb / .rpm) with a pkg-manager-aware uninstall hint sniffed from `/etc/os-release`. Probes `/etc/systemd/system/`, `/usr/lib/systemd/system/`, `/lib/systemd/system/`; dedupes merged-usr symlinks. See [MIGRATION.md](MIGRATION.md).
 - **Sleep/wake hooks.** `NSWorkspaceDidWakeNotification` on macOS; `org.freedesktop.login1.PrepareForSleep` on Linux.
@@ -42,9 +47,14 @@ First six months post-V2.0. Driven by what surfaces during the rc and early prod
 
 ### Diagnostics + media-stack helpers
 
-- **`silvervine doctor --media-stack`** — checks codec presence (h264/h265/av1/vp9), HDR support (Wayland color management + monitor + GPU driver), GPU-accel flags (VAAPI / VideoToolbox). Reports a "media stack health" summary with concrete fixes. Linux side by me; macOS VideoToolbox detection `[needs macOS verifier]`.
+- **Shipped after V2.0:** `silvervine doctor --media-stack` performs passive local
+  browser/CDM integrity, architecture, VA-API/Vulkan, and macOS graphics
+  checks. `silvervine test` owns the explicit browser-launch path and caches
+  live EME/codec/robustness/HDCP evidence only for an exact browser/CDM
+  fingerprint.
+- **Remaining media-stack work:** Wayland color-management, display HDR, and
+  deeper VideoToolbox capability checks. `[needs macOS verifier]`
 - **`silvervine configure-youtube-hdr`** — one-shot helper that flips the right flags + installs the right extension for YouTube HDR on supported configurations (Wayland + HDR display + HEVC). Linux-only at the start.
-- **Codec presence detection** as a shared library module so `silvervine doctor` and `silvervine configure-youtube-hdr` share the logic.
 
 ### Operational improvements
 

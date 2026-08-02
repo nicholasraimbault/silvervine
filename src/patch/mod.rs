@@ -54,6 +54,7 @@ use crate::error::{Error, Result};
 use crate::lockfile;
 use crate::platform;
 use crate::widevine::cache::CachedCdm;
+use crate::widevine::ownership::{self, ManagedMarker, OwnershipAssessment, OwnershipKind};
 
 pub mod backup;
 
@@ -160,10 +161,14 @@ pub fn default_patch_lock() -> Option<PathBuf> {
 
 /// Options for [`patch_browser`].
 #[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)] // Independent CLI safety controls.
 pub struct PatchOptions {
     /// If `true`, patch even when the browser is currently running. Spec
     /// recommends against this; reserved for `silvervine patch --force-while-running`.
     pub force_while_running: bool,
+    /// Permit replacement of an unmarked CDM classified as externally
+    /// managed. Invalid Silvervine markers are never bypassed.
+    pub replace_external_cdm: bool,
     /// If `true`, run all pre-flight + post-patch checks but do not touch
     /// the bundle. Used by `silvervine patch --dry-run`.
     pub dry_run: bool,
@@ -227,6 +232,9 @@ pub struct PatchReport {
     /// Browser version reported before the patch; CDM placement does not
     /// change it.
     pub version_after: Option<String>,
+    /// Stable error category when `success` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_category: Option<crate::ErrorCategory>,
     /// `true` if dry-run mode was used.
     pub dry_run: bool,
     /// Error message if `success == false`.
@@ -234,29 +242,44 @@ pub struct PatchReport {
 }
 
 impl PatchReport {
-    fn success(outcome: &PatchOutcome) -> Self {
+    pub(crate) fn success(outcome: &PatchOutcome) -> Self {
         Self {
             browser: outcome.browser_name.clone(),
             success: true,
             cdm_version: Some(outcome.cdm_version.clone()),
             version_before: outcome.version_before.clone(),
             version_after: outcome.version_after.clone(),
+            error_category: None,
             dry_run: outcome.dry_run,
             error: None,
         }
     }
 
-    fn failure(name: &str, dry_run: bool, error: &Error) -> Self {
+    pub(crate) fn failure(name: &str, dry_run: bool, error: &Error) -> Self {
         Self {
             browser: name.to_string(),
             success: false,
             cdm_version: None,
             version_before: None,
             version_after: None,
+            error_category: Some(error.category),
             dry_run,
             error: Some(error.to_string()),
         }
     }
+}
+/// Result of a parent-authorized platform write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedWrite {
+    /// Only payload bytes were written; core must validate and commit a marker.
+    PayloadOnly,
+    /// Payload and marker were validated and atomically published together.
+    MarkerCommitted(ManagedMarker),
+}
+enum PatchAttempt {
+    Success,
+    FailedBeforeModification(Error),
+    ModifiedOriginal(Error),
 }
 
 /// Trait implemented by the per-OS patch modules.
@@ -296,12 +319,53 @@ pub trait PlatformPatcher {
     /// implementations that modified it.
     fn write_cdm(&self, target: &Path, cdm_source: &Path) -> Result<()>;
 
-    /// Verify the CDM at its expected live post-patch location.
+    /// Place a parent-verified CDM and report whether its marker was committed
+    /// inside the platform transaction.
     ///
-    /// This runs after [`PlatformPatcher::write_cdm`]. For transactional
-    /// implementations it is a post-publish check; for legacy implementations
-    /// it runs before core commits the snapshot. Success requires a present,
-    /// non-empty platform library.
+    /// The default writes only the payload; core then validates and commits the
+    /// marker. Transactional implementations override this to seal the marker
+    /// before atomic publication.
+    fn write_managed_cdm(
+        &self,
+        target: &Path,
+        cdm_source: &Path,
+        _parent_marker: &ManagedMarker,
+    ) -> Result<ManagedWrite> {
+        self.write_cdm(target, cdm_source)?;
+        Ok(ManagedWrite::PayloadOnly)
+    }
+
+    /// Resolve the exact CDM directory owned by this platform layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns a categorized layout error when the platform-specific CDM
+    /// target cannot be resolved safely.
+    fn cdm_target(&self, target: &Path) -> Result<PathBuf> {
+        Ok(target.join("WidevineCdm"))
+    }
+
+    /// Validate a payload-only write and produce the marker core will commit.
+    fn prepare_managed_payload(
+        &self,
+        _target: &Path,
+        cdm_target: &Path,
+        parent_marker: &ManagedMarker,
+    ) -> Result<ManagedMarker> {
+        let finalized = ownership::marker_for_finalized_payload(cdm_target, parent_marker)?;
+        if &finalized != parent_marker {
+            return Err(Error::invalid_marker(
+                "platform write changed the parent-selected CDM payload",
+            ));
+        }
+        Ok(finalized)
+    }
+
+    /// Verify the CDM and ownership marker at their live post-patch location.
+    ///
+    /// This runs after marker commit. Transactional implementations perform a
+    /// post-publish check only; they must not mutate the marked payload or its
+    /// enclosing signature seal.
     ///
     /// # Errors
     ///
@@ -374,6 +438,13 @@ impl<'a> PatchBatch<'a> {
     {
         if browsers.is_empty() {
             return Vec::new();
+        }
+        if self.options.replace_external_cdm && browsers.len() != 1 {
+            let error = Error::other(format!(
+                "--replace-external-cdm matched multiple installations ({}); the browser name must identify exactly one installation",
+                browsers.len()
+            ));
+            return reports_for_error(browsers, self.options.dry_run, &error);
         }
 
         let cdm = match cdm_resolver() {
@@ -461,17 +532,14 @@ fn patch_lock_path(options: &PatchOptions) -> Result<PathBuf> {
 ///
 /// 1. Acquire the patch lock, unless this is the elevated child whose parent
 ///    already holds it.
-/// 2. Reject a running browser unless `force_while_running` is set.
-/// 3. Escalate once when the patcher's write-access root is not writable.
-/// 4. For transactional patchers, call [`PlatformPatcher::write_cdm`] and then
-///    [`PlatformPatcher::verify_post_patch`]; the implementation owns staged
-///    publication and write-time rollback.
-/// 5. For legacy patchers, snapshot the install, write and verify, then restore
-///    a modified failure or commit a success.
-/// 6. Return [`PatchOutcome`].
+/// 2. Validate candidate and installed CDM provenance.
+/// 3. Reject a running browser unless `force_while_running` is set.
+/// 4. Escalate once when the patcher's write-access root is not writable.
+/// 5. Transactional patchers seal payload and marker before atomic publish;
+///    legacy patchers run under the snapshot/restore protocol.
+/// 6. Verify the live payload and marker, then return [`PatchOutcome`].
 ///
-/// With `dry_run = true`, both write paths are skipped; the returned outcome
-/// records the versions that would have been used.
+/// With `dry_run = true`, write paths are skipped after provenance preflight.
 ///
 /// # Errors
 ///
@@ -528,10 +596,13 @@ fn run_patch(
 ) -> Result<PatchOutcome> {
     let started = Instant::now();
 
-    // Pre-flight: refuse to patch a running browser unless --force-while-running.
-    // The locked parent already performed this preflight before escalation;
-    // the privileged child must remain filesystem-only and not rediscover
-    // processes under a different account/session.
+    let marker = ownership::marker_for_cached(cdm)?;
+    let cdm_target = patcher.cdm_target(browser.install_path())?;
+    let ownership = ownership::classify(browser, &cdm_target, cdm, &marker)?;
+    enforce_ownership(&ownership, options)?;
+
+    // The locked parent performs process inspection once. The elevated child
+    // remains filesystem-only and never probes another account's session.
     if !options.as_root
         && !options.force_while_running
         && processes.is_some_and(|snapshot| snapshot.is_running(browser))
@@ -542,8 +613,12 @@ fn run_patch(
         )));
     }
 
-    let version_before = patcher.read_browser_version(browser.install_path());
-
+    let running_as_root = platform::is_running_as_root();
+    let version_before = if options.as_root || running_as_root {
+        None
+    } else {
+        patcher.read_browser_version(browser.install_path())
+    };
     if options.dry_run {
         return Ok(PatchOutcome {
             browser_name: browser.name().to_string(),
@@ -555,37 +630,48 @@ fn run_patch(
         });
     }
 
-    // Decide whether we can publish through the patcher's actual write root.
-    // If yes, proceed through the user-space code path (cheap, no escalation).
-    // If no AND we're not already running as root, hand off to a `pkexec` /
-    // `sudo` / `osascript`-elevated child invocation that re-enters this code
-    // with `as_root = true` set.
+    // Escalate only when the patcher's actual publication root is not writable.
     if decide_escalate(
         options.as_root,
-        platform::is_running_as_root(),
+        running_as_root,
         target_writable(patcher.write_access_root(browser.install_path())),
     ) {
-        return run_patch_via_escalation(browser, cdm, patcher, options, started, version_before);
+        return run_patch_via_escalation(
+            browser,
+            cdm,
+            patcher,
+            options,
+            started,
+            version_before,
+            &marker,
+        );
     }
 
     if patcher.writes_transactionally() {
-        patcher.write_cdm(browser.install_path(), cdm.cdm_dir())?;
-        patcher.verify_post_patch(browser.install_path())?;
+        match perform_patch(browser, cdm, patcher, &cdm_target, &marker) {
+            PatchAttempt::Success => {}
+            PatchAttempt::FailedBeforeModification(error)
+            | PatchAttempt::ModifiedOriginal(error) => return Err(error),
+        }
     } else {
-        // Legacy implementations mutate the live bundle directly, so retain
-        // the full snapshot/restore protocol around their write.
         let snapshot = take_snapshot(browser, options, version_before.as_deref())?;
-        if let Err(patch_err) = perform_patch(browser, cdm, patcher) {
-            if let Err(restore_err) = snapshot.restore() {
-                return Err(restore_err.with_source(patch_err));
+        match perform_patch(browser, cdm, patcher, &cdm_target, &marker) {
+            PatchAttempt::Success => {}
+            PatchAttempt::FailedBeforeModification(patch_err) => {
+                let _ = snapshot.commit();
+                return Err(patch_err);
             }
-            return Err(patch_err);
+            PatchAttempt::ModifiedOriginal(patch_err) => {
+                if let Err(restore_err) = snapshot.restore() {
+                    return Err(restore_err.with_source(patch_err));
+                }
+                return Err(patch_err);
+            }
         }
         snapshot.commit()?;
     }
 
     let version_after = version_before.clone();
-
     Ok(PatchOutcome {
         browser_name: browser.name().to_string(),
         version_before,
@@ -594,6 +680,26 @@ fn run_patch(
         duration: started.elapsed(),
         dry_run: false,
     })
+}
+
+fn enforce_ownership(assessment: &OwnershipAssessment, options: &PatchOptions) -> Result<()> {
+    let message = match assessment.action.as_deref() {
+        Some(action) => format!("{} {action}", assessment.summary),
+        None => assessment.summary.clone(),
+    };
+    match assessment.kind {
+        OwnershipKind::InvalidMarker if !options.replace_external_cdm => {
+            Err(Error::invalid_marker(message))
+        }
+        OwnershipKind::External if !options.replace_external_cdm => {
+            Err(Error::external_cdm(message))
+        }
+        OwnershipKind::Missing
+        | OwnershipKind::Managed
+        | OwnershipKind::LegacyManaged
+        | OwnershipKind::External
+        | OwnershipKind::InvalidMarker => Ok(()),
+    }
 }
 
 /// Choose the snapshot location based on privilege context and filesystem
@@ -729,6 +835,13 @@ pub fn validate_privileged_snapshot_parent(install_path: &Path, parent: &Path) -
             "privileged snapshot parent must be a non-symlink directory",
         ));
     }
+    // SAFETY: `geteuid` has no preconditions and does not modify process state.
+    let effective_uid = unsafe { libc::geteuid() };
+    if parent_metadata.uid() != effective_uid || parent_metadata.mode() & 0o022 != 0 {
+        return Err(Error::permission_denied(
+            "privileged snapshot parent must be owned by the elevated user and not group/world-writable",
+        ));
+    }
     if install_metadata.dev() != parent_metadata.dev() {
         return Err(Error::unknown_bundle_structure(
             "privileged snapshot parent must share the browser filesystem",
@@ -754,6 +867,7 @@ fn run_patch_via_escalation(
     options: &PatchOptions,
     started: Instant,
     version_before: Option<String>,
+    marker: &ManagedMarker,
 ) -> Result<PatchOutcome> {
     let exe = std::env::current_exe()
         .map_err(|e| Error::other("could not resolve current executable").with_source(e))?;
@@ -761,7 +875,7 @@ fn run_patch_via_escalation(
         .to_str()
         .ok_or_else(|| Error::other("current executable path is not valid UTF-8"))?;
 
-    let argv = privileged_patch_argv(exe_str, browser, cdm, options)?;
+    let argv = privileged_patch_argv(exe_str, browser, cdm, marker, options)?;
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let output = platform::run_as_root(&argv_refs)?;
 
@@ -794,6 +908,7 @@ fn privileged_patch_argv(
     exe: &str,
     browser: &Browser,
     cdm: &CachedCdm,
+    marker: &ManagedMarker,
     options: &PatchOptions,
 ) -> Result<Vec<String>> {
     let install = browser
@@ -808,6 +923,7 @@ fn privileged_patch_argv(
     let backup_parent = backup_parent
         .to_str()
         .ok_or_else(|| Error::other("snapshot parent path is not valid UTF-8"))?;
+    let marker_json = serde_json::to_string(marker).map_err(Error::from)?;
     let mut argv = vec![
         exe.to_string(),
         "__privileged-patch".into(),
@@ -817,10 +933,12 @@ fn privileged_patch_argv(
         backup_parent.into(),
         "--cdm-dir".into(),
         cdm_dir.into(),
-        "--cdm-version".into(),
-        cdm.version().into(),
+        "--managed-marker".into(),
+        marker_json,
         "--browser-name".into(),
         browser.name().into(),
+        "--browser-kind".into(),
+        browser.kind.as_str().into(),
     ];
     #[cfg(target_os = "macos")]
     {
@@ -841,19 +959,74 @@ fn privileged_patch_argv(
     if options.force_while_running {
         argv.push("--force".into());
     }
+    if options.replace_external_cdm {
+        argv.push("--replace-external-cdm".into());
+    }
     Ok(argv)
 }
 
-fn perform_patch(browser: &Browser, cdm: &CachedCdm, patcher: &dyn PlatformPatcher) -> Result<()> {
-    patcher.write_cdm(browser.install_path(), cdm.cdm_dir())?;
-    patcher.verify_post_patch(browser.install_path())
+fn perform_patch(
+    browser: &Browser,
+    cdm: &CachedCdm,
+    patcher: &dyn PlatformPatcher,
+    cdm_target: &Path,
+    marker: &ManagedMarker,
+) -> PatchAttempt {
+    let managed_write =
+        match patcher.write_managed_cdm(browser.install_path(), cdm.cdm_dir(), marker) {
+            Ok(outcome) => outcome,
+            Err(error) if patcher.writes_transactionally() => {
+                return PatchAttempt::FailedBeforeModification(error);
+            }
+            Err(error) => return PatchAttempt::ModifiedOriginal(error),
+        };
+
+    let finalized_marker = match managed_write {
+        ManagedWrite::PayloadOnly => {
+            let finalized =
+                match patcher.prepare_managed_payload(browser.install_path(), cdm_target, marker) {
+                    Ok(marker) => marker,
+                    Err(error) => return PatchAttempt::ModifiedOriginal(error),
+                };
+            if let Err(error) = ownership::write_marker(cdm_target, &finalized) {
+                return PatchAttempt::ModifiedOriginal(error);
+            }
+            finalized
+        }
+        ManagedWrite::MarkerCommitted(committed) => {
+            let expected = match ownership::marker_for_finalized_payload(cdm_target, marker) {
+                Ok(marker) => marker,
+                Err(error) => return PatchAttempt::ModifiedOriginal(error),
+            };
+            if committed != expected {
+                return PatchAttempt::ModifiedOriginal(Error::invalid_marker(
+                    "transactional patch committed an unexpected CDM identity",
+                ));
+            }
+            committed
+        }
+    };
+
+    if let Err(error) = patcher.verify_post_patch(browser.install_path()) {
+        return PatchAttempt::ModifiedOriginal(error);
+    }
+    match ownership::validate_installed_cdm(cdm_target) {
+        Ok(installed) if installed.marker() == &finalized_marker => {}
+        Ok(_) => {
+            return PatchAttempt::ModifiedOriginal(Error::invalid_marker(
+                "finalized CDM marker changed after platform verification",
+            ));
+        }
+        Err(error) => return PatchAttempt::ModifiedOriginal(error),
+    }
+    PatchAttempt::Success
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::fs;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use tempfile::TempDir;
 
@@ -863,11 +1036,57 @@ mod tests {
     /// Build a minimum [`CachedCdm`] on disk for tests.
     fn make_cached_cdm(root: &Path, version: &str) -> CachedCdm {
         let dir = root.join(version);
-        let cdm = dir.join("_platform_specific").join("linux_x64");
+        let cdm = dir.join("_platform_specific").join(test_platform_dir());
         fs::create_dir_all(&cdm).expect("mkdir cdm");
-        fs::write(cdm.join("libwidevinecdm.so"), b"fake-so").expect("write so");
-        fs::write(dir.join("manifest.json"), br#"{"version":"4.10.0.0"}"#).expect("write manifest");
+        fs::write(cdm.join(test_library_name()), b"fake-so").expect("write library");
+        fs::write(
+            dir.join("manifest.json"),
+            format!(r#"{{"version":"{version}"}}"#),
+        )
+        .expect("write manifest");
         CachedCdm::new(version.to_string(), dir)
+    }
+
+    fn write_installed_cdm(install: &Path, version: &str, library: &[u8]) {
+        let target = install.join("WidevineCdm");
+        let platform = target.join("_platform_specific").join(test_platform_dir());
+        fs::create_dir_all(&platform).expect("platform");
+        fs::write(
+            target.join("manifest.json"),
+            format!(r#"{{"version":"{version}"}}"#),
+        )
+        .expect("manifest");
+        fs::write(platform.join(test_library_name()), library).expect("library");
+    }
+
+    fn test_platform_dir() -> &'static str {
+        if cfg!(target_os = "macos") {
+            if cfg!(target_arch = "aarch64") {
+                "mac_arm64"
+            } else {
+                "mac_x64"
+            }
+        } else {
+            "linux_x64"
+        }
+    }
+
+    fn test_library_name() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "libwidevinecdm.dylib"
+        } else {
+            "libwidevinecdm.so"
+        }
+    }
+
+    fn ownership_options(tmp: &TempDir, replace_external_cdm: bool) -> PatchOptions {
+        PatchOptions {
+            force_while_running: true,
+            replace_external_cdm,
+            lock_path: Some(tmp.path().join("ownership.lock")),
+            backups_dir: Some(tmp.path().join("ownership-backups")),
+            ..PatchOptions::default()
+        }
     }
 
     /// Recording mock implementation of [`PlatformPatcher`].
@@ -875,6 +1094,7 @@ mod tests {
     struct MockPatcher {
         write_calls: AtomicUsize,
         verify_calls: AtomicUsize,
+        verify_saw_marker: AtomicBool,
         version_calls: AtomicUsize,
         version: RefCell<Option<String>>,
         write_should_fail: bool,
@@ -892,7 +1112,7 @@ mod tests {
     }
 
     impl PlatformPatcher for MockPatcher {
-        fn write_cdm(&self, target: &Path, _cdm_source: &Path) -> Result<()> {
+        fn write_cdm(&self, target: &Path, cdm_source: &Path) -> Result<()> {
             self.write_calls.fetch_add(1, Ordering::SeqCst);
             if self.write_should_fail {
                 return Err(Error::permission_denied(format!(
@@ -900,14 +1120,33 @@ mod tests {
                     target.display()
                 )));
             }
-            // Touch a marker file so the test can confirm the implementation
-            // ran.
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&fs::read(cdm_source.join("manifest.json"))?)
+                    .map_err(Error::from)?;
+            let version = manifest
+                .get("version")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| Error::state_corrupted("mock manifest has no version"))?;
+            let library = fs::read(
+                cdm_source
+                    .join("_platform_specific")
+                    .join(test_platform_dir())
+                    .join(test_library_name()),
+            )?;
+            write_installed_cdm(target, version, &library);
             fs::write(target.join("CDM_WRITTEN"), b"1").map_err(Error::from)?;
             Ok(())
         }
 
         fn verify_post_patch(&self, target: &Path) -> Result<()> {
             self.verify_calls.fetch_add(1, Ordering::SeqCst);
+            self.verify_saw_marker.store(
+                target
+                    .join("WidevineCdm")
+                    .join(ownership::MANAGED_MARKER_FILENAME)
+                    .is_file(),
+                Ordering::SeqCst,
+            );
             if self.verify_should_fail {
                 return Err(Error::unknown_bundle_structure(format!(
                     "mock verify failed for {}",
@@ -942,6 +1181,81 @@ mod tests {
             None
         }
     }
+    struct UnknownBundleMock;
+
+    impl PlatformPatcher for UnknownBundleMock {
+        fn write_cdm(&self, _target: &Path, _source: &Path) -> Result<()> {
+            Err(Error::unknown_bundle_structure("unsupported test layout"))
+        }
+
+        fn verify_post_patch(&self, _target: &Path) -> Result<()> {
+            Ok(())
+        }
+
+        fn read_browser_version(&self, _target: &Path) -> Option<String> {
+            None
+        }
+    }
+
+    struct PartialFailMock;
+
+    impl PlatformPatcher for PartialFailMock {
+        fn write_cdm(&self, _target: &Path, _source: &Path) -> Result<()> {
+            Err(Error::permission_denied("injected partial write failure"))
+        }
+
+        fn verify_post_patch(&self, _target: &Path) -> Result<()> {
+            Ok(())
+        }
+
+        fn read_browser_version(&self, _target: &Path) -> Option<String> {
+            None
+        }
+    }
+
+    struct MarkerPoisonMock;
+    impl PlatformPatcher for MarkerPoisonMock {
+        fn write_cdm(&self, target: &Path, source: &Path) -> Result<()> {
+            MockPatcher::default().write_cdm(target, source)?;
+            fs::create_dir(
+                target
+                    .join("WidevineCdm")
+                    .join(ownership::MANAGED_MARKER_FILENAME),
+            )
+            .map_err(Error::from)
+        }
+
+        fn verify_post_patch(&self, _target: &Path) -> Result<()> {
+            Ok(())
+        }
+
+        fn read_browser_version(&self, _target: &Path) -> Option<String> {
+            None
+        }
+    }
+    struct FinalizeMutationMock;
+
+    impl PlatformPatcher for FinalizeMutationMock {
+        fn write_cdm(&self, target: &Path, source: &Path) -> Result<()> {
+            MockPatcher::default().write_cdm(target, source)
+        }
+
+        fn verify_post_patch(&self, target: &Path) -> Result<()> {
+            fs::write(
+                target
+                    .join("WidevineCdm")
+                    .join("_platform_specific")
+                    .join(test_platform_dir())
+                    .join(test_library_name()),
+                b"finalizer changed library",
+            )
+            .map_err(Error::from)
+        }
+
+        fn read_browser_version(&self, _target: &Path) -> Option<String> {
+            None
+        }
+    }
 
     fn make_browser(install_path: PathBuf) -> Browser {
         Browser {
@@ -970,6 +1284,7 @@ mod tests {
 
         let opts = PatchOptions {
             force_while_running: true, // skip is_running check in test env
+            replace_external_cdm: false,
             dry_run: false,
             lock_path: Some(tmp.path().join("patch.lock")),
             backups_dir: Some(tmp.path().join("backups")),
@@ -985,8 +1300,128 @@ mod tests {
         assert!(!outcome.dry_run);
         assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 1);
         assert_eq!(patcher.verify_calls.load(Ordering::SeqCst), 1);
+        assert!(patcher.verify_saw_marker.load(Ordering::SeqCst));
         // Mock wrote a CDM_WRITTEN marker; confirm it survived.
         assert!(install.join("CDM_WRITTEN").exists());
+    }
+
+    #[test]
+    fn external_cdm_is_preserved_before_the_platform_writer_runs() {
+        let tmp = TempDir::new().expect("tempdir");
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).expect("install");
+        write_installed_cdm(&install, "9.9.9", b"external");
+        let browser = make_browser(install.clone());
+        let cdm = make_cached_cdm(&tmp.path().join("cache"), "4.10.0.0");
+        let patcher = MockPatcher::default();
+
+        let error = patch_browser(&browser, &cdm, &patcher, &ownership_options(&tmp, false))
+            .expect_err("external CDM must be preserved");
+
+        assert_eq!(error.category, crate::ErrorCategory::ExternalCdm);
+        assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fs::read(
+                install
+                    .join("WidevineCdm")
+                    .join("_platform_specific")
+                    .join(test_platform_dir())
+                    .join(test_library_name())
+            )
+            .expect("installed library"),
+            b"external"
+        );
+    }
+
+    #[test]
+    fn explicit_external_replacement_commits_a_valid_marker() {
+        let tmp = TempDir::new().expect("tempdir");
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).expect("install");
+        write_installed_cdm(&install, "9.9.9", b"external");
+        let browser = make_browser(install.clone());
+        let cdm = make_cached_cdm(&tmp.path().join("cache"), "4.10.0.0");
+        let patcher = MockPatcher::default();
+
+        patch_browser(&browser, &cdm, &patcher, &ownership_options(&tmp, true))
+            .expect("explicit replacement");
+
+        let marker =
+            crate::widevine::ownership::validate_installed_marker(&install.join("WidevineCdm"))
+                .expect("committed marker");
+        assert_eq!(marker.cdm_version, "4.10.0.0");
+        assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn explicit_targeted_replacement_repairs_an_invalid_marker() {
+        let tmp = TempDir::new().expect("tempdir");
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).expect("install");
+        write_installed_cdm(&install, "4.10.0.0", b"candidate");
+        fs::write(
+            install
+                .join("WidevineCdm")
+                .join(crate::widevine::ownership::MANAGED_MARKER_FILENAME),
+            b"not json",
+        )
+        .expect("bad marker");
+        let browser = make_browser(install.clone());
+        let cdm = make_cached_cdm(&tmp.path().join("cache"), "4.10.0.0");
+        let patcher = MockPatcher::default();
+
+        patch_browser(&browser, &cdm, &patcher, &ownership_options(&tmp, true))
+            .expect("explicit replacement repairs invalid provenance");
+
+        crate::widevine::ownership::validate_installed_marker(&install.join("WidevineCdm"))
+            .expect("replacement marker");
+        assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn marker_commit_failure_rolls_back_the_browser_snapshot() {
+        let tmp = TempDir::new().expect("tempdir");
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).expect("install");
+        fs::write(install.join("original"), b"keep").expect("seed");
+        let browser = make_browser(install.clone());
+        let cdm = make_cached_cdm(&tmp.path().join("cache"), "4.10.0.0");
+
+        let error = patch_browser(
+            &browser,
+            &cdm,
+            &MarkerPoisonMock,
+            &ownership_options(&tmp, false),
+        )
+        .expect_err("marker commit must fail");
+
+        assert_eq!(error.category, crate::ErrorCategory::InvalidMarker);
+        assert_eq!(
+            fs::read(install.join("original")).expect("original"),
+            b"keep"
+        );
+        assert!(!install.join("WidevineCdm").exists());
+    }
+    #[test]
+    fn finalizer_payload_mutation_rolls_back_before_commit() {
+        let tmp = TempDir::new().expect("tempdir");
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).expect("install");
+        fs::write(install.join("original"), b"keep").expect("seed");
+        let browser = make_browser(install.clone());
+        let cdm = make_cached_cdm(&tmp.path().join("cache"), "4.10.0.0");
+
+        let error = patch_browser(
+            &browser,
+            &cdm,
+            &FinalizeMutationMock,
+            &ownership_options(&tmp, false),
+        )
+        .expect_err("finalizer mutation must invalidate the transaction");
+
+        assert_eq!(error.category, crate::ErrorCategory::InvalidMarker);
+        assert_eq!(fs::read(install.join("original")).unwrap(), b"keep");
+        assert!(!install.join("WidevineCdm").exists());
     }
 
     #[test]
@@ -1001,6 +1436,7 @@ mod tests {
         let patcher = MockPatcher::with_version("v1");
         let opts = PatchOptions {
             force_while_running: true,
+            replace_external_cdm: false,
             dry_run: true,
             lock_path: Some(tmp.path().join("patch.lock")),
             backups_dir: Some(tmp.path().join("backups")),
@@ -1027,6 +1463,7 @@ mod tests {
         patcher.write_should_fail = true;
         let opts = PatchOptions {
             force_while_running: true,
+            replace_external_cdm: false,
             dry_run: false,
             lock_path: Some(tmp.path().join("patch.lock")),
             backups_dir: Some(tmp.path().join("backups")),
@@ -1084,6 +1521,7 @@ mod tests {
         patcher.verify_should_fail = true;
         let opts = PatchOptions {
             force_while_running: true,
+            replace_external_cdm: false,
             dry_run: false,
             lock_path: Some(tmp.path().join("patch.lock")),
             backups_dir: Some(tmp.path().join("backups")),
@@ -1146,6 +1584,7 @@ mod tests {
         let cdm = make_cached_cdm(&cache_root, "4.10.0.0");
         let opts = PatchOptions {
             force_while_running: true,
+            replace_external_cdm: false,
             dry_run: false,
             lock_path: Some(blocker.join("inside.lock")),
             backups_dir: Some(tmp.path().join("backups")),
@@ -1170,6 +1609,7 @@ mod tests {
         let cdm = make_cached_cdm(&cache_root, "4.10.0.0");
         let opts = PatchOptions {
             force_while_running: true,
+            replace_external_cdm: false,
             dry_run: false,
             lock_path: Some(blocker.join("inside.lock")),
             backups_dir: Some(tmp.path().join("backups")),
@@ -1222,6 +1662,7 @@ mod tests {
         let patcher = MockPatcher::with_version("128.0.6613.119");
         let opts = PatchOptions {
             force_while_running: true,
+            replace_external_cdm: false,
             dry_run: false,
             lock_path: Some(tmp.path().join("patch.lock")),
             backups_dir: Some(tmp.path().join("backups")),
@@ -1237,6 +1678,7 @@ mod tests {
     fn patch_options_defaults_are_safe() {
         let opts = PatchOptions::default();
         assert!(!opts.force_while_running);
+        assert!(!opts.replace_external_cdm);
         assert!(!opts.dry_run);
         assert!(opts.lock_path.is_none());
         assert!(opts.backups_dir.is_none());
@@ -1320,6 +1762,7 @@ mod tests {
         let browser = make_browser(install.clone());
         let opts = PatchOptions {
             force_while_running: true,
+            replace_external_cdm: false,
             dry_run: false,
             lock_path: Some(tmp.path().join("patch.lock")),
             backups_dir: Some(tmp.path().join("explicit-backups")),
@@ -1344,6 +1787,7 @@ mod tests {
         let browser = make_browser(install.clone());
         let opts = PatchOptions {
             force_while_running: true,
+            replace_external_cdm: false,
             dry_run: false,
             lock_path: Some(tmp.path().join("patch.lock")),
             backups_dir: None,
@@ -1357,7 +1801,64 @@ mod tests {
             .starts_with(".silvervine-TestBrowser-v1-")));
         let _ = handle.commit();
     }
+    #[cfg(unix)]
+    #[test]
+    fn privileged_snapshot_parent_rejects_group_or_world_writable_directory() {
+        use std::os::unix::fs::PermissionsExt;
 
+        let tmp = TempDir::new().expect("tempdir");
+        let install = tmp.path().join("install");
+        fs::create_dir(&install).expect("install");
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = validate_privileged_snapshot_parent(&install, tmp.path())
+            .expect_err("writable parent must not be trusted across elevation");
+
+        assert_eq!(error.category, crate::ErrorCategory::PermissionDenied);
+    }
+
+    /// Legacy writers can mutate anywhere inside the browser bundle before
+    /// returning any error category, so even an `UnknownBundleStructure`
+    /// failure must trigger the caller's snapshot restore.
+    #[test]
+    fn perform_patch_treats_unknown_bundle_as_possibly_modified() {
+        let tmp = TempDir::new().expect("tempdir");
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).expect("mkdir install");
+        let browser = make_browser(install.clone());
+        let cache = tmp.path().join("widevine");
+        let cdm = make_cached_cdm(&cache, "1.0");
+        let marker = ownership::marker_for_cached(&cdm).expect("marker");
+        let outcome = perform_patch(
+            &browser,
+            &cdm,
+            &UnknownBundleMock,
+            &install.join("WidevineCdm"),
+            &marker,
+        );
+        assert!(matches!(outcome, PatchAttempt::ModifiedOriginal(_)));
+        assert!(!install.join("WidevineCdm").exists());
+    }
+
+    /// The same conservative classification applies when the exact
+    /// platform-resolved CDM target exists after the failed write.
+    #[test]
+    fn perform_patch_classifies_nested_platform_write_as_modified_original() {
+        let tmp = TempDir::new().expect("tempdir");
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).expect("mkdir install");
+        let partial = install
+            .join("Contents/Frameworks/Test.framework/Versions/1/Libraries")
+            .join("WidevineCdm");
+        fs::create_dir_all(&partial).expect("mkdir nested WidevineCdm");
+        fs::write(partial.join("partial.txt"), b"oops").expect("seed");
+        let browser = make_browser(install.clone());
+        let cache = tmp.path().join("widevine");
+        let cdm = make_cached_cdm(&cache, "1.0");
+        let marker = ownership::marker_for_cached(&cdm).expect("marker");
+        let outcome = perform_patch(&browser, &cdm, &PartialFailMock, &partial, &marker);
+        assert!(matches!(outcome, PatchAttempt::ModifiedOriginal(_)));
+    }
     /// When the install path is not writable AND `as_root` is `false`,
     /// `run_patch` escalates via `platform::run_as_root`. With
     /// `SILVERVINE_TEST_ESCALATE_NOOP=1` the escalation is a stub that returns
@@ -1388,6 +1889,7 @@ mod tests {
 
         let opts = PatchOptions {
             force_while_running: true,
+            replace_external_cdm: false,
             dry_run: false,
             lock_path: Some(tmp.path().join("patch.lock")),
             backups_dir: None,
@@ -1441,13 +1943,17 @@ mod tests {
         let cdm = make_cached_cdm(&cdm_root, "9.8.7.6");
         let mut browser = make_browser(install.clone());
         browser.name = "Parent Custom".into();
+        browser.kind = BrowserKind::Known;
         browser.framework_name = Some("Exact Framework".into());
+        let marker = ownership::marker_for_cached(&cdm).unwrap();
         let argv = privileged_patch_argv(
             "/bin/silvervine",
             &browser,
             &cdm,
+            &marker,
             &PatchOptions {
                 force_while_running: true,
+                replace_external_cdm: true,
                 ..Default::default()
             },
         )
@@ -1459,16 +1965,26 @@ mod tests {
         assert!(argv
             .windows(2)
             .any(|v| v == ["--cdm-dir", cdm.cdm_dir().to_str().unwrap()]));
-        assert!(argv.windows(2).any(|v| v == ["--cdm-version", "9.8.7.6"]));
+        let serialized_marker = argv
+            .windows(2)
+            .find(|pair| pair[0] == "--managed-marker")
+            .map(|pair| &pair[1])
+            .expect("managed marker");
+        assert_eq!(
+            serde_json::from_str::<ManagedMarker>(serialized_marker).unwrap(),
+            marker
+        );
         assert!(argv
             .windows(2)
             .any(|v| v == ["--browser-name", "Parent Custom"]));
+        assert!(argv.windows(2).any(|v| v == ["--browser-kind", "known"]));
         assert!(argv
             .windows(2)
             .any(|v| v == ["--framework-name", "Exact Framework"]));
         #[cfg(target_os = "macos")]
         assert!(argv.windows(2).any(|v| v == ["--framework-version", "2.0"]));
         assert!(argv.contains(&"--force".to_string()));
+        assert!(argv.contains(&"--replace-external-cdm".to_string()));
     }
 
     #[cfg(target_os = "macos")]
@@ -1484,10 +2000,12 @@ mod tests {
         let mut browser = make_browser(install);
         browser.framework_name = None;
 
+        let marker = ownership::marker_for_cached(&cdm).unwrap();
         let argv = privileged_patch_argv(
             "/usr/local/bin/silvervine",
             &browser,
             &cdm,
+            &marker,
             &PatchOptions::default(),
         )
         .unwrap();
@@ -1497,6 +2015,31 @@ mod tests {
         assert!(argv
             .windows(2)
             .any(|args| args == ["--framework-version", "1.0"]));
+    }
+
+    #[test]
+    fn privileged_handoff_preserves_known_browser_kind_token() {
+        let tmp = TempDir::new().unwrap();
+        let install = tmp.path().join("helium");
+        fs::create_dir_all(&install).unwrap();
+        let cdm = make_cached_cdm(&tmp.path().join("cache"), "1.2.3");
+        let mut browser = make_browser(install);
+        browser.kind = BrowserKind::Known;
+
+        let marker = ownership::marker_for_cached(&cdm).unwrap();
+        let argv = privileged_patch_argv(
+            "/usr/bin/silvervine",
+            &browser,
+            &cdm,
+            &marker,
+            &PatchOptions::default(),
+        )
+        .unwrap();
+
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair == ["--browser-kind", "known"]));
+        assert!(!argv.iter().any(|arg| arg.contains("Known")));
     }
 
     #[test]
@@ -1511,6 +2054,7 @@ mod tests {
         let patcher = MockPatcher::with_version("v1");
         let opts = PatchOptions {
             force_while_running: true,
+            replace_external_cdm: false,
             dry_run: false,
             lock_path: Some(tmp.path().join("patch.lock")),
             // Don't override backups_dir so the as_root path uses the
@@ -1521,6 +2065,13 @@ mod tests {
         let outcome = patch_browser(&browser, &cdm, &patcher, &opts).expect("ok");
         assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 1);
         assert_eq!(patcher.verify_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            patcher.version_calls.load(Ordering::SeqCst),
+            0,
+            "privileged filesystem-only child must not execute browser binaries"
+        );
+        assert_eq!(outcome.version_before, None);
+        assert_eq!(outcome.version_after, None);
         assert!(!outcome.dry_run);
     }
     #[test]

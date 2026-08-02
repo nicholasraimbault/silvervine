@@ -72,7 +72,7 @@ Silvervine tests heavily on Linux + macOS in CI (matrix: `ubuntu-latest`, `macos
 | `SILVERVINE_TEST_POWER_NOOP=1` | `daemon::power::subscribe_wake_events` (NSWorkspace / logind D-Bus) |
 | `SILVERVINE_TEST_NOTIFY_NOOP=1` | `notify::notify_*` (libnotify / NSUserNotificationCenter) |
 | `SILVERVINE_TEST_DAEMON_PATCH_NOOP=1` | `daemon::drive_patch_flow` (the patch dispatcher) |
-| `SILVERVINE_TEST_BROWSER_TEST_NOOP=1` | `cli::test::Plan::execute_real_browser` (headless browser spawn) |
+| `SILVERVINE_TEST_BROWSER_TEST_NOOP=1` | manual and automated `silvervine test` browser launches |
 | `SILVERVINE_TEST_LAUNCH_NOOP=1` | `cli::launch::spawn_detached` (browser launch) |
 
 Tests set these via the `ScopedEnv` RAII guard pattern — see existing tests in `src/migration.rs` and `src/daemon/mod.rs` for the pattern. Env-mutating tests guard with a process-wide `Mutex` to avoid clobbering each other across `cargo test`'s default thread-per-test execution model.
@@ -175,7 +175,7 @@ The codebase is split into module-level slices of `src/`:
 | `src/daemon/{lifecycle,power}/` | LaunchAgent / systemd / wake hooks |
 | `src/notify.rs` + `src/hooks.rs` | Notifications + post-patch hooks |
 | `src/cli/` | Every subcommand impl |
-| `src/eme/` | EME error code translation |
+| `src/eme/` + `src/diagnostics/` | EME translation/live probe + source-labeled passive diagnostics |
 | `src/log.rs` + `src/config.rs` | Tracing + TOML config |
 | `src/main.rs` | Clap dispatcher |
 | `src/lib.rs`, `src/error.rs`, `src/lockfile.rs` | Library surface, error type, flock |

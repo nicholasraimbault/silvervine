@@ -26,7 +26,9 @@
 //!   lapsed" or "this title isn't licensed for your region" are out
 //!   of scope — silvervine can't help with those.
 
+pub mod browser_probe;
 mod codes;
+pub mod probe;
 
 pub use codes::{translate_error_code, EmeDiagnosis};
 

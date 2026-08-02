@@ -48,13 +48,16 @@
 //! Before publication we re-sign that clone ad hoc:
 //!
 //! ```sh
-//! codesign --force --deep -s - <staged-bundle>
+//! codesign --force -s - <staged-libwidevinecdm.dylib>
+//! # Silvervine hashes the signed dylib and writes its ownership marker.
+//! xattr -cr <staged-bundle>
+//! codesign --force -s - <staged-framework>
+//! codesign --force -s - <staged-bundle>
 //! ```
 //!
-//! The `-s -` (sign with the ad-hoc identity) is what produces an
-//! unsigned-but-self-consistent bundle. `--deep` is **deprecated** by
-//! Apple as of macOS 13 but still works for ad-hoc; the spec defers
-//! migrating to inside-out signing to V2.
+//! The `-s -` identity produces an ad-hoc signature. Signing inside-out,
+//! without `--deep`, keeps the finalized dylib bytes stable after their digest
+//! is committed to the ownership marker.
 //!
 //! ## Test mode
 //!
@@ -69,10 +72,8 @@ use std::process::Command;
 
 use crate::error::{Error, Result};
 use crate::patch::PlatformPatcher;
-use crate::widevine::{
-    platform_directory, platform_library, Platform, CDM_BUNDLE_DIRECTORY,
-    PLATFORM_SPECIFIC_DIRECTORY,
-};
+use crate::widevine::ownership::{self, ManagedMarker};
+use crate::widevine::CDM_BUNDLE_DIRECTORY;
 
 /// macOS platform patcher.
 ///
@@ -111,18 +112,39 @@ impl PlatformPatcher for MacosPatcher {
         )?;
         let framework_name = framework_name_from_path(&layout.framework)?;
         let framework_version = layout.version;
+        write_bundle_transactionally(target, cdm_source, &framework_name, &framework_version)
+    }
 
-        replace_bundle_transactionally(target, |staged_bundle| {
-            let staged_layout = resolve_bundle_layout_for(
-                staged_bundle,
-                Some(&framework_name),
-                Some(&framework_version),
-            )?;
-            write_cdm_into(&staged_layout, cdm_source)?;
-            run_xattr_clear(staged_bundle)?;
-            run_codesign_adhoc(staged_bundle)?;
-            verify_cdm_at(&staged_layout)
-        })
+    fn write_managed_cdm(
+        &self,
+        target: &Path,
+        cdm_source: &Path,
+        parent_marker: &ManagedMarker,
+    ) -> Result<crate::patch::ManagedWrite> {
+        let layout = resolve_bundle_layout_for(
+            target,
+            self.framework_name.as_deref(),
+            self.framework_version.as_deref(),
+        )?;
+        let framework_name = framework_name_from_path(&layout.framework)?;
+        let framework_version = layout.version;
+        let finalized = write_managed_bundle_transactionally(
+            target,
+            cdm_source,
+            parent_marker,
+            &framework_name,
+            &framework_version,
+        )?;
+        Ok(crate::patch::ManagedWrite::MarkerCommitted(finalized))
+    }
+
+    fn cdm_target(&self, target: &Path) -> Result<PathBuf> {
+        Ok(resolve_bundle_layout_for(
+            target,
+            self.framework_name.as_deref(),
+            self.framework_version.as_deref(),
+        )?
+        .cdm_target)
     }
 
     fn verify_post_patch(&self, target: &Path) -> Result<()> {
@@ -405,9 +427,70 @@ fn active_version_dir(versions: &Path) -> Result<PathBuf> {
     }
 }
 
-fn replace_bundle_transactionally<F>(bundle: &Path, prepare: F) -> Result<()>
+fn write_bundle_transactionally(
+    target: &Path,
+    cdm_source: &Path,
+    framework_name: &str,
+    framework_version: &str,
+) -> Result<()> {
+    replace_bundle_transactionally(target, |staged_bundle| {
+        let staged_layout = resolve_bundle_layout_for(
+            staged_bundle,
+            Some(framework_name),
+            Some(framework_version),
+        )?;
+        write_cdm_into(&staged_layout, cdm_source)?;
+        run_codesign_adhoc(&cdm_library_path(&staged_layout))?;
+        run_xattr_clear(staged_bundle)?;
+        run_codesign_adhoc(&staged_layout.framework)?;
+        run_codesign_adhoc(staged_bundle)?;
+        verify_cdm_at(&staged_layout)
+    })
+}
+
+fn write_managed_bundle_transactionally(
+    target: &Path,
+    cdm_source: &Path,
+    parent_marker: &ManagedMarker,
+    framework_name: &str,
+    framework_version: &str,
+) -> Result<ManagedMarker> {
+    replace_bundle_transactionally(target, |staged_bundle| {
+        let staged_layout = resolve_bundle_layout_for(
+            staged_bundle,
+            Some(framework_name),
+            Some(framework_version),
+        )?;
+        write_cdm_into(&staged_layout, cdm_source)?;
+        let copied =
+            ownership::marker_for_finalized_payload(&staged_layout.cdm_target, parent_marker)?;
+        if &copied != parent_marker {
+            return Err(Error::invalid_marker(
+                "macOS CDM copy changed the parent-selected payload",
+            ));
+        }
+
+        run_codesign_adhoc(&cdm_library_path(&staged_layout))?;
+        let finalized =
+            ownership::marker_for_finalized_payload(&staged_layout.cdm_target, parent_marker)?;
+        ownership::write_marker(&staged_layout.cdm_target, &finalized)?;
+        run_xattr_clear(staged_bundle)?;
+        run_codesign_adhoc(&staged_layout.framework)?;
+        run_codesign_adhoc(staged_bundle)?;
+        verify_cdm_at(&staged_layout)?;
+        let installed = ownership::validate_installed_cdm(&staged_layout.cdm_target)?;
+        if installed.marker() != &finalized {
+            return Err(Error::invalid_marker(
+                "macOS staging committed an unexpected ownership marker",
+            ));
+        }
+        Ok(finalized)
+    })
+}
+
+fn replace_bundle_transactionally<F, T>(bundle: &Path, prepare: F) -> Result<T>
 where
-    F: FnOnce(&Path) -> Result<()>,
+    F: FnOnce(&Path) -> Result<T>,
 {
     let parent = bundle.parent().ok_or_else(|| {
         Error::unknown_bundle_structure(format!(
@@ -432,7 +515,7 @@ where
         })?;
     let staged_bundle = staging.path().join(bundle_name);
     clone_bundle(bundle, &staged_bundle)?;
-    prepare(&staged_bundle)?;
+    let prepared = prepare(&staged_bundle)?;
     crate::platform::atomic_rename(&staged_bundle, bundle)?;
 
     if let Err(error) = staging.close() {
@@ -442,7 +525,7 @@ where
             "could not remove retired macOS bundle staging directory"
         );
     }
-    Ok(())
+    Ok(prepared)
 }
 
 fn clone_bundle(source: &Path, destination: &Path) -> Result<()> {
@@ -561,29 +644,38 @@ fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+fn cdm_library_path(layout: &BundleLayout) -> PathBuf {
+    let platform = if cfg!(target_arch = "aarch64") {
+        "mac_arm64"
+    } else {
+        "mac_x64"
+    };
+    layout
+        .cdm_target
+        .join("_platform_specific")
+        .join(platform)
+        .join("libwidevinecdm.dylib")
+}
+
 fn verify_cdm_at(layout: &BundleLayout) -> Result<()> {
-    let dylib = layout
-        .cdm_target
-        .join(PLATFORM_SPECIFIC_DIRECTORY)
-        .join(platform_directory(Platform::DarwinX86_64))
-        .join(platform_library(Platform::DarwinX86_64));
-    let dylib_arm = layout
-        .cdm_target
-        .join(PLATFORM_SPECIFIC_DIRECTORY)
-        .join(platform_directory(Platform::DarwinAarch64))
-        .join(platform_library(Platform::DarwinAarch64));
-    let chosen = if dylib.exists() { &dylib } else { &dylib_arm };
-    if !chosen.exists() {
+    let chosen = cdm_library_path(layout);
+    let meta = fs::metadata(&chosen).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Error::unknown_bundle_structure(format!(
+                "post-patch verify: missing {}",
+                chosen.display()
+            ))
+            .with_source(error)
+        } else {
+            ctx_err(
+                error,
+                format!("post-patch verify: stat {}", chosen.display()),
+            )
+        }
+    })?;
+    if !meta.is_file() || meta.len() == 0 {
         return Err(Error::unknown_bundle_structure(format!(
-            "post-patch verify: missing libwidevinecdm.dylib under {}",
-            layout.cdm_target.display()
-        )));
-    }
-    let meta = fs::metadata(chosen)
-        .map_err(|e| ctx_err(e, format!("post-patch verify: stat {}", chosen.display())))?;
-    if meta.len() == 0 {
-        return Err(Error::unknown_bundle_structure(format!(
-            "post-patch verify: {} is empty",
+            "post-patch verify: {} is missing, empty, or not a regular file",
             chosen.display()
         )));
     }
@@ -617,25 +709,25 @@ fn run_xattr_clear(bundle: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Ad-hoc codesign the bundle.
+/// Ad-hoc sign one code object without recursively re-signing nested code.
 ///
 /// Honors `SILVERVINE_TEST_PATCH_NOOP=1`.
 fn run_codesign_adhoc(bundle: &Path) -> Result<()> {
     if std::env::var_os("SILVERVINE_TEST_PATCH_NOOP").is_some() {
         return Ok(());
     }
-    let bundle_str = bundle
+    let path_str = bundle
         .to_str()
-        .ok_or_else(|| Error::other(format!("bundle path not UTF-8: {}", bundle.display())))?;
+        .ok_or_else(|| Error::other(format!("code path not UTF-8: {}", bundle.display())))?;
     let output = Command::new("codesign")
-        .args(["--force", "--deep", "-s", "-", bundle_str])
+        .args(["--force", "-s", "-", path_str])
         .output()
         .map_err(|e| ctx_err(e, "spawn codesign".into()))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(Error::other(format!(
-            "codesign --force --deep -s - {} failed (exit {:?}): {}",
-            bundle_str,
+            "codesign --force -s - {} failed (exit {:?}): {}",
+            path_str,
             output.status.code(),
             stderr.trim()
         )));
@@ -891,7 +983,7 @@ mod tests {
 
         let _guard = crate::test_support::env_lock();
         unsafe { std::env::set_var("SILVERVINE_TEST_PATCH_NOOP", "1") };
-        let result = replace_bundle_transactionally(&app, |staged| {
+        let result: Result<()> = replace_bundle_transactionally(&app, |staged| {
             fs::write(staged.join("live-marker"), b"modified").unwrap();
             Err(Error::other("injected bundle staging failure"))
         });

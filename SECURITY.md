@@ -61,7 +61,12 @@ Both prompt the user. Both require user consent each time (Silvervine does not c
 
 User-installed browsers in `~/Applications` (macOS) or `~/.local/...` (Linux) don't require escalation. Custom-path browsers configured in `~/.config/silvervine/config.toml` follow the path's actual permissions.
 
-Silvervine ships **no** telemetry or error-reporting endpoint. The binary never POSTs failure metadata anywhere — bug reports go through GitHub Issues, full stop.
+Silvervine ships **no telemetry or remote error-reporting endpoint**. The
+explicit `silvervine test` command POSTs its browser capability result only to
+an ephemeral server bound to `127.0.0.1`; the endpoint requires a random
+single-use URL token and same-origin request, caps request size and count, and
+expires after a fixed timeout. No probe result is sent off-device. Bug reports
+go through GitHub Issues only when the user chooses to share them.
 
 ## Known limitations
 

@@ -40,6 +40,8 @@ fs2 = "0.4"
 parking_lot = "0.12"
 # SHA-512 verification for Widevine CRX3 downloads.
 sha2 = "0.11"
+# Cryptographically random single-use loopback probe tokens.
+getrandom = "0.3"
 # CRX3 ZIP body extraction. Select only flate2-based deflate decoding;
 # zip's umbrella `deflate` feature also enables the unused Zopfli encoder.
 zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"] }

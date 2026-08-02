@@ -31,6 +31,7 @@ pub mod browsers;
 pub mod cli;
 pub mod config;
 pub mod daemon;
+pub mod diagnostics;
 pub mod eme;
 pub mod error;
 pub mod hooks;

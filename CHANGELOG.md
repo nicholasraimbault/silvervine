@@ -10,6 +10,22 @@ Future entries are generated from
 
 ## [Unreleased]
 
+### Added
+
+- Added `doctor --media-stack [--browser]` passive browser/CDM provenance,
+  binary architecture, codec, VA-API/Vulkan, and macOS graphics diagnostics
+  with stable JSON evidence sources and failure domains. The passive path
+  performs no migration, log initialization, network access, or browser launch.
+- Added an explicit `test --browser <name>` normal-profile EME probe for
+  temporary Widevine key-system access, SW/HW robustness, cenc/cbcs schemes,
+  AVC/HEVC/VP9/AV1 codec matrix (720p/1080p/4K), MSE/direct playback,
+  MediaCapabilities, and HDCP 1.4/2.2 policy evidence. Rust returns one
+  bounded assessment to the page and terminal. Automatic `test --json` emits
+  exactly one `StoredProbeReport`; cache write failures are warnings with a
+  null cache path. `test --url` remains a manual page launcher.
+- Added `BrowserProbeFailed` error category/exit code for live probe timeout,
+  malformed transport, and software-playback baseline failure.
+
 ### Changed
 
 - Batched patching now resolves the CDM, acquires the patch lock, and snapshots
@@ -19,6 +35,10 @@ Future entries are generated from
   layout constants, and aligned the macOS Objective-C dependency graph.
 - Raised the minimum supported Rust version from 1.85 to 1.88 so the locked
   dependency graph can include current security fixes.
+- Browser patching now records and validates a Silvervine ownership marker
+  bound to the installed manifest, platform, version, and CDM library SHA-512.
+  Existing unmarked CDMs are preserved unless the user passes the explicit
+  `--replace-external-cdm` override.
 
 ### Fixed
 
@@ -35,6 +55,11 @@ Future entries are generated from
 - Updated `time` to 0.3.54, resolving
   [RUSTSEC-2026-0009](https://rustsec.org/advisories/RUSTSEC-2026-0009.html)
   in the notification and rolling-log dependency graph.
+- The live EME probe uses an ephemeral IPv4 loopback server with a random
+  single-use token, strict same-origin POST validation, CSP, bounded request
+  size/count/output, and a fixed timeout. Probe data never leaves the device.
+- Privileged patch children now inherit the parent's exact CDM replacement
+  consent, and invalid ownership markers cannot bypass provenance checks.
 
 ## [2.0.1] - 2026-07-31
 

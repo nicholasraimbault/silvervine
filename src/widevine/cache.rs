@@ -602,7 +602,7 @@ fn write_cache_metadata(cdm: &CachedCdm, platform: Platform) -> Result<()> {
         version: cdm.version().to_string(),
         platform: platform_identifier(platform).to_string(),
         library_size,
-        library_sha512: download::sha512_file(&library_path)?,
+        library_sha512: download::sha512_file_hex(&library_path)?,
     };
     let path = cdm.cdm_dir().join(CACHE_METADATA_FILENAME);
     let mut body = serde_json::to_vec_pretty(&metadata)?;
@@ -652,7 +652,7 @@ fn verify_cached_integrity(cdm: &CachedCdm, platform: Platform) -> Result<()> {
             actual_size
         )));
     }
-    let actual_hash = download::sha512_file(&library_path)?;
+    let actual_hash = download::sha512_file_hex(&library_path)?;
     if !actual_hash.eq_ignore_ascii_case(&expected.library_sha512) {
         return Err(Error::hash_mismatch(format!(
             "{} SHA-512 does not match persisted cache metadata",

@@ -11,6 +11,7 @@ pub mod cache;
 pub mod download;
 pub mod extract;
 pub mod manifest;
+pub mod ownership;
 
 /// CDM directory installed into a Chromium-family browser.
 pub(crate) const CDM_BUNDLE_DIRECTORY: &str = "WidevineCdm";

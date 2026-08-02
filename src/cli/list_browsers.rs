@@ -48,11 +48,7 @@ impl ListEntry {
 }
 
 fn source_label(kind: BrowserKind) -> &'static str {
-    match kind {
-        BrowserKind::Known => "known",
-        BrowserKind::Detected => "detected",
-        BrowserKind::Custom => "custom",
-    }
+    kind.as_str()
 }
 
 /// Build the list of entries to display, given a snapshot of detected

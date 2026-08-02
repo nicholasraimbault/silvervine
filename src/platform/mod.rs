@@ -38,6 +38,8 @@ use std::process::Output;
 
 use crate::error::{Error, Result};
 
+pub mod process;
+
 #[cfg(target_os = "linux")]
 use linux as imp;
 

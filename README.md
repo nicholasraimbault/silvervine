@@ -55,14 +55,24 @@ Silvervine refuses to patch a running browser unless forced. It creates an exclu
 | `silvervine patch [browser]` | Patch one or all detected browsers |
 | `silvervine status` | Show browser and daemon status |
 | `silvervine list-browsers` | List detected browsers |
-| `silvervine doctor [error-code]` | Run diagnostics or explain an EME error |
-| `silvervine test` | Open the playback health check |
+| `silvervine doctor [error-code] [--media]` | Run diagnostics, collect passive media evidence, or explain an EME error |
+| `silvervine test [--browser <name>]` | Run an explicit browser-reported EME capability check |
 | `silvervine update widevine` | Update or roll back the CDM |
 | `silvervine launch <browser>` | Verify, patch if needed, then launch |
 | `silvervine repair` | Rebuild Silvervine's local state |
 | `silvervine uninstall [--purge]` | Remove the daemon and cache; `--purge` also removes config; the binary and browser changes remain |
 
 Run `silvervine --help` or `silvervine <command> --help` for all options, JSON output, shell completions, and man-page generation.
+
+`silvervine doctor --media-stack` does not launch a browser or access the network. It
+inspects local browser/CDM versions, binary architecture, Silvervine ownership
+and digest provenance, and a fixed allowlist of optional graphics utilities.
+`silvervine test` is the explicit live mode: it opens the selected browser with
+its normal profile against a tokenized `127.0.0.1` page, then caches the result
+only for the exact browser version and verified CDM digest. Use
+`silvervine test --url <url>` to open a manual test page without an automated
+result. Browser capability evidence is not proof of certified L1, HD/4K access,
+or streaming-service entitlement.
 
 ## Upgrading an existing installation
 

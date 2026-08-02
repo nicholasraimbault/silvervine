@@ -18,14 +18,14 @@
 
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// High-level category of a Silvervine error.
 ///
 /// Categories drive UX (notification copy, doctor advice) and analytics
 /// (opt-in reporter payload). The string form of each variant is committed
 /// API; renaming a variant is a breaking change for the Worker schema.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorCategory {
     /// Filesystem write was rejected; we likely need privilege escalation.
     PermissionDenied,
@@ -51,6 +51,15 @@ pub enum ErrorCategory {
     StateCorrupted,
     /// Running on a platform we don't (yet) support — e.g. ARM64 Linux in V1.
     UnsupportedPlatform,
+    /// An existing CDM lacks valid Silvervine provenance and must be preserved
+    /// unless the caller explicitly authorizes replacement.
+    ExternalCdm,
+    /// A Silvervine ownership marker is malformed, unsafe, or no longer
+    /// matches the installed payload.
+    InvalidMarker,
+    /// Live browser EME probe timed out, returned malformed evidence, or failed
+    /// the software-playback baseline.
+    BrowserProbeFailed,
     /// Anything not yet categorized. **Avoid in new code** — add a variant.
     Other,
 }
@@ -74,6 +83,9 @@ impl ErrorCategory {
             Self::DaemonNotRunning => "DaemonNotRunning",
             Self::StateCorrupted => "StateCorrupted",
             Self::UnsupportedPlatform => "UnsupportedPlatform",
+            Self::ExternalCdm => "ExternalCdm",
+            Self::InvalidMarker => "InvalidMarker",
+            Self::BrowserProbeFailed => "BrowserProbeFailed",
             Self::Other => "Other",
         }
     }
@@ -185,6 +197,21 @@ impl Error {
         Self::new(ErrorCategory::UnsupportedPlatform, message)
     }
 
+    /// Construct a [`ErrorCategory::ExternalCdm`] error.
+    pub fn external_cdm(message: impl Into<String>) -> Self {
+        Self::new(ErrorCategory::ExternalCdm, message)
+    }
+
+    /// Construct a [`ErrorCategory::InvalidMarker`] error.
+    pub fn invalid_marker(message: impl Into<String>) -> Self {
+        Self::new(ErrorCategory::InvalidMarker, message)
+    }
+
+    /// Construct a [`ErrorCategory::BrowserProbeFailed`] error.
+    pub fn browser_probe_failed(message: impl Into<String>) -> Self {
+        Self::new(ErrorCategory::BrowserProbeFailed, message)
+    }
+
     /// Construct a [`ErrorCategory::Other`] error. Prefer a more specific
     /// variant when one exists — `Other` is the catch-all for unclassified
     /// causes and shows up in dashboards as the "we should categorize this"
@@ -285,6 +312,9 @@ mod tests {
             (ErrorCategory::DaemonNotRunning, "DaemonNotRunning"),
             (ErrorCategory::StateCorrupted, "StateCorrupted"),
             (ErrorCategory::UnsupportedPlatform, "UnsupportedPlatform"),
+            (ErrorCategory::ExternalCdm, "ExternalCdm"),
+            (ErrorCategory::InvalidMarker, "InvalidMarker"),
+            (ErrorCategory::BrowserProbeFailed, "BrowserProbeFailed"),
             (ErrorCategory::Other, "Other"),
         ];
         for (cat, expected) in all {
@@ -333,6 +363,18 @@ mod tests {
         assert_eq!(
             Error::browser_running("Helium").category,
             ErrorCategory::BrowserRunning
+        );
+        assert_eq!(
+            Error::external_cdm("vendor install").category,
+            ErrorCategory::ExternalCdm
+        );
+        assert_eq!(
+            Error::invalid_marker("stale marker").category,
+            ErrorCategory::InvalidMarker
+        );
+        assert_eq!(
+            Error::browser_probe_failed("probe timeout").category,
+            ErrorCategory::BrowserProbeFailed
         );
         assert_eq!(Error::other("oops").category, ErrorCategory::Other);
     }

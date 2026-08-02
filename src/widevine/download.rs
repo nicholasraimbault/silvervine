@@ -187,7 +187,7 @@ pub fn verify_file(path: &Path, expected_hash: &str, expected_size: Option<u64>)
 }
 
 /// Stream an on-disk file into SHA-512 and return the lowercase digest.
-pub(crate) fn sha512_file(path: &Path) -> Result<String> {
+pub(crate) fn sha512_file_hex(path: &Path) -> Result<String> {
     let mut file = File::open(path).map_err(Error::from)?;
     sha512_reader(&mut file)
 }
@@ -260,7 +260,7 @@ fn hashes_equal(a: &str, b: &str) -> bool {
 }
 
 /// Hex-encode a byte slice as lowercase ASCII.
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

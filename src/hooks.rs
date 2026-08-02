@@ -369,6 +369,7 @@ mod tests {
             version_after: Some("128".into()),
             dry_run: false,
             error: None,
+            error_category: None,
         };
         let context = post_patch_context(&success);
         assert_eq!(context["SILVERVINE_BROWSER"], "Helium");
@@ -384,6 +385,7 @@ mod tests {
             version_after: None,
             dry_run: false,
             error: Some("failed".into()),
+            error_category: Some(crate::ErrorCategory::Other),
         };
         let context = post_patch_context(&failure);
         assert_eq!(context["SILVERVINE_OUTCOME"], "failure");
