@@ -17,6 +17,12 @@ Future entries are generated from
   integrity validation, while preserving deterministic output and synchronous
   resource-pressure fallbacks.
 
+### Fixed
+
+- Restricted macOS browser auto-discovery to patchable
+  `<app> Framework.framework/Versions/<version>/Libraries` layouts so setup no
+  longer attempts to patch unrelated Qt, Python, or application frameworks.
+
 ## [2.1.0] - 2026-08-02
 
 ### Added
