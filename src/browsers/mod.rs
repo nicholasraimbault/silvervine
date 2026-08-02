@@ -308,9 +308,9 @@ mod tests {
         let frameworks = app.join("Contents").join("Frameworks");
         let fw_dir = frameworks.join(format!("{framework}.framework"));
         let versions = fw_dir.join("Versions").join("128.0.6613.119");
-        fs::create_dir_all(&versions).expect("mkdir versions");
-        // Detection only needs the Chromium framework shape; patching later
-        // resolves the active version under `Versions/<n>/Libraries/`.
+        fs::create_dir_all(versions.join("Libraries")).expect("mkdir Libraries");
+        // Detection requires the same Chromium framework shape that the
+        // patcher resolves under `Versions/<n>/Libraries/`.
         app
     }
 

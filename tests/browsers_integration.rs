@@ -31,7 +31,8 @@ fn make_macos_chrome_app(parent: &std::path::Path, app: &str, framework: &str) -
             .join("Frameworks")
             .join(format!("{framework}.framework"))
             .join("Versions")
-            .join("128.0.6613.119"),
+            .join("128.0.6613.119")
+            .join("Libraries"),
     )
     .expect("mkdir framework versions");
     app_dir

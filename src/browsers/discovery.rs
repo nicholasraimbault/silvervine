@@ -154,10 +154,10 @@ fn has_chromium_sandbox(dir: &Path) -> bool {
         || dir.join("chromium-browser").exists()
 }
 
-/// macOS discovery: walk each of `roots.macos_applications` one level
-/// deep, looking at `*.app` bundles whose
-/// `Contents/Frameworks/<X>.framework/Versions/` contains at least one
-/// numeric-style versioned directory (Chromium framework convention).
+/// macOS discovery: walk each of `roots.macos_applications` one level deep,
+/// looking for Chromium's `<app> Framework.framework` convention with a
+/// numeric version directory and the `Libraries` directory required by the
+/// patcher. A numeric Qt, Python, or application framework is not sufficient.
 fn discover_macos(roots: &FilesystemRoots) -> Vec<Browser> {
     let mut out = Vec::new();
     for root in &roots.macos_applications {
@@ -173,61 +173,58 @@ fn discover_macos(roots: &FilesystemRoots) -> Vec<Browser> {
             if !path.is_dir() {
                 continue;
             }
-            let frameworks = path.join("Contents").join("Frameworks");
-            let Some(framework) = first_chromium_framework(&frameworks) else {
+            let Some(app_name) = path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+            else {
                 continue;
             };
-            let app_name = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map_or_else(|| path.display().to_string(), str::to_string);
-            let framework_name = framework
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(str::to_string);
+            let framework_name = format!("{app_name} Framework");
+            let framework = path
+                .join("Contents")
+                .join("Frameworks")
+                .join(format!("{framework_name}.framework"));
+            if !has_patchable_version_subdir(&framework.join("Versions")) {
+                continue;
+            }
             out.push(Browser {
                 name: app_name,
                 install_path: path,
                 kind: BrowserKind::Detected,
-                framework_name,
+                framework_name: Some(framework_name),
             });
         }
     }
     out
 }
 
-/// Find the first `*.framework` child of `frameworks_dir` whose
-/// `Versions/` directory contains a numeric-prefixed version directory.
-/// Returns the path to the `.framework` directory.
-fn first_chromium_framework(frameworks_dir: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(frameworks_dir).ok()?;
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("framework") {
-            continue;
-        }
-        if has_versioned_subdir(&p.join("Versions")) {
-            return Some(p);
-        }
-    }
-    None
-}
-
-/// Returns true if `versions_dir` contains a child directory whose name
-/// starts with a digit (e.g. `128.0.6613.119`). Chromium framework
-/// version names follow the `<major>.<minor>.<build>.<patch>` shape.
-fn has_versioned_subdir(versions_dir: &Path) -> bool {
+/// Returns true when `versions_dir` contains a real numeric version directory
+/// with the `Libraries` directory required by the macOS patch layout.
+fn has_patchable_version_subdir(versions_dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(versions_dir) else {
         return false;
     };
-    for e in entries.flatten() {
-        if !e.path().is_dir() {
-            continue;
-        }
-        let Some(name) = e.file_name().to_str().map(str::to_string) else {
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
             continue;
         };
-        if name.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        if !kind.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit())
+        {
+            continue;
+        }
+        if std::fs::symlink_metadata(entry.path().join("Libraries"))
+            .is_ok_and(|metadata| metadata.file_type().is_dir())
+        {
             return true;
         }
     }
@@ -480,7 +477,7 @@ mod tests {
             .join("WeirdChromium Framework.framework")
             .join("Versions")
             .join("128.0.6613.119");
-        fs::create_dir_all(&versions).expect("mkdir versions");
+        fs::create_dir_all(versions.join("Libraries")).expect("mkdir browser Libraries");
 
         let roots = FilesystemRoots {
             macos_applications: vec![apps.clone()],
@@ -496,6 +493,38 @@ mod tests {
         );
         assert_eq!(found[0].install_path, app);
         assert_eq!(found[0].kind, BrowserKind::Detected);
+    }
+
+    #[test]
+    fn macos_discovery_rejects_unrelated_versioned_frameworks() {
+        let tmp = TempDir::new().expect("tempdir");
+        let apps = tmp.path().join("Applications");
+        for (app_name, framework_name) in [
+            ("ClipGrab", "Python"),
+            ("Macs Fan Control", "QtCore"),
+            ("ChatGPT", "Codex Framework"),
+            ("LibreOffice", "LibreOfficePython"),
+        ] {
+            let version = apps
+                .join(format!("{app_name}.app"))
+                .join("Contents")
+                .join("Frameworks")
+                .join(format!("{framework_name}.framework"))
+                .join("Versions")
+                .join("1.2.3");
+            fs::create_dir_all(version.join("Libraries")).expect("mkdir unrelated framework");
+        }
+
+        let roots = FilesystemRoots {
+            macos_applications: vec![apps],
+            linux_search: vec![],
+            sandbox_root: None,
+        };
+
+        assert!(
+            discover_filesystem(Os::Macos, &roots).is_empty(),
+            "numeric Qt, Python, and application frameworks are not Chromium browsers"
+        );
     }
 
     #[test]
