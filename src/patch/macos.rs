@@ -128,14 +128,14 @@ impl PlatformPatcher for MacosPatcher {
         )?;
         let framework_name = framework_name_from_path(&layout.framework)?;
         let framework_version = layout.version;
-        let finalized = write_managed_bundle_transactionally(
+        write_managed_bundle_transactionally(
             target,
             cdm_source,
             parent_marker,
             &framework_name,
             &framework_version,
         )?;
-        Ok(crate::patch::ManagedWrite::MarkerCommitted(finalized))
+        Ok(crate::patch::ManagedWrite::MarkerCommitted)
     }
 
     fn cdm_target(&self, target: &Path) -> Result<PathBuf> {
@@ -433,19 +433,30 @@ fn write_bundle_transactionally(
     framework_name: &str,
     framework_version: &str,
 ) -> Result<()> {
-    replace_bundle_transactionally(target, |staged_bundle| {
-        let staged_layout = resolve_bundle_layout_for(
-            staged_bundle,
-            Some(framework_name),
-            Some(framework_version),
-        )?;
-        write_cdm_into(&staged_layout, cdm_source)?;
-        run_codesign_adhoc(&cdm_library_path(&staged_layout))?;
-        run_xattr_clear(staged_bundle)?;
-        run_codesign_adhoc(&staged_layout.framework)?;
-        run_codesign_adhoc(staged_bundle)?;
-        verify_cdm_at(&staged_layout)
-    })
+    replace_bundle_transactionally(
+        target,
+        |staged_bundle| {
+            let staged_layout = resolve_bundle_layout_for(
+                staged_bundle,
+                Some(framework_name),
+                Some(framework_version),
+            )?;
+            write_cdm_into(&staged_layout, cdm_source)?;
+            run_codesign_adhoc(&cdm_library_path(&staged_layout))?;
+            run_xattr_clear(staged_bundle)?;
+            run_codesign_adhoc(&staged_layout.framework)?;
+            run_codesign_adhoc(staged_bundle)?;
+            verify_cdm_at(&staged_layout)
+        },
+        |live_bundle, &()| {
+            let live_layout = resolve_bundle_layout_for(
+                live_bundle,
+                Some(framework_name),
+                Some(framework_version),
+            )?;
+            verify_cdm_at(&live_layout)
+        },
+    )
 }
 
 fn write_managed_bundle_transactionally(
@@ -455,42 +466,61 @@ fn write_managed_bundle_transactionally(
     framework_name: &str,
     framework_version: &str,
 ) -> Result<ManagedMarker> {
-    replace_bundle_transactionally(target, |staged_bundle| {
-        let staged_layout = resolve_bundle_layout_for(
-            staged_bundle,
-            Some(framework_name),
-            Some(framework_version),
-        )?;
-        write_cdm_into(&staged_layout, cdm_source)?;
-        let copied =
-            ownership::marker_for_finalized_payload(&staged_layout.cdm_target, parent_marker)?;
-        if &copied != parent_marker {
-            return Err(Error::invalid_marker(
-                "macOS CDM copy changed the parent-selected payload",
-            ));
-        }
+    replace_bundle_transactionally(
+        target,
+        |staged_bundle| {
+            let staged_layout = resolve_bundle_layout_for(
+                staged_bundle,
+                Some(framework_name),
+                Some(framework_version),
+            )?;
+            write_cdm_into(&staged_layout, cdm_source)?;
+            let copied =
+                ownership::marker_for_finalized_payload(&staged_layout.cdm_target, parent_marker)?;
+            if &copied != parent_marker {
+                return Err(Error::invalid_marker(
+                    "macOS CDM copy changed the parent-selected payload",
+                ));
+            }
 
-        run_codesign_adhoc(&cdm_library_path(&staged_layout))?;
-        let finalized =
-            ownership::marker_for_finalized_payload(&staged_layout.cdm_target, parent_marker)?;
-        ownership::write_marker(&staged_layout.cdm_target, &finalized)?;
-        run_xattr_clear(staged_bundle)?;
-        run_codesign_adhoc(&staged_layout.framework)?;
-        run_codesign_adhoc(staged_bundle)?;
-        verify_cdm_at(&staged_layout)?;
-        let installed = ownership::validate_installed_cdm(&staged_layout.cdm_target)?;
-        if installed.marker() != &finalized {
-            return Err(Error::invalid_marker(
-                "macOS staging committed an unexpected ownership marker",
-            ));
-        }
-        Ok(finalized)
-    })
+            run_codesign_adhoc(&cdm_library_path(&staged_layout))?;
+            let finalized =
+                ownership::marker_for_finalized_payload(&staged_layout.cdm_target, parent_marker)?;
+            ownership::write_marker(&staged_layout.cdm_target, &finalized)?;
+            run_xattr_clear(staged_bundle)?;
+            run_codesign_adhoc(&staged_layout.framework)?;
+            run_codesign_adhoc(staged_bundle)?;
+            verify_cdm_at(&staged_layout)?;
+            let installed = ownership::validate_installed_cdm(&staged_layout.cdm_target)?;
+            if installed.marker() != &finalized {
+                return Err(Error::invalid_marker(
+                    "macOS staging committed an unexpected ownership marker",
+                ));
+            }
+            Ok(finalized)
+        },
+        |live_bundle, finalized| {
+            let live_layout = resolve_bundle_layout_for(
+                live_bundle,
+                Some(framework_name),
+                Some(framework_version),
+            )?;
+            verify_cdm_at(&live_layout)?;
+            let installed = ownership::validate_installed_cdm(&live_layout.cdm_target)?;
+            if installed.marker() != finalized {
+                return Err(Error::invalid_marker(
+                    "macOS live publication committed an unexpected ownership marker",
+                ));
+            }
+            Ok(())
+        },
+    )
 }
 
-fn replace_bundle_transactionally<F, T>(bundle: &Path, prepare: F) -> Result<T>
+fn replace_bundle_transactionally<F, V, T>(bundle: &Path, prepare: F, validate_live: V) -> Result<T>
 where
     F: FnOnce(&Path) -> Result<T>,
+    V: FnOnce(&Path, &T) -> Result<()>,
 {
     let parent = bundle.parent().ok_or_else(|| {
         Error::unknown_bundle_structure(format!(
@@ -517,6 +547,20 @@ where
     clone_bundle(bundle, &staged_bundle)?;
     let prepared = prepare(&staged_bundle)?;
     crate::platform::atomic_rename(&staged_bundle, bundle)?;
+
+    if let Err(validation_error) = validate_live(bundle, &prepared) {
+        if let Err(rollback_error) = crate::platform::atomic_rename(&staged_bundle, bundle) {
+            let recovery = staging.keep();
+            let category = validation_error.category;
+            let message = format!(
+                "{}; rollback failed and the retired application was preserved at {}",
+                validation_error.message,
+                recovery.display()
+            );
+            return Err(Error::new(category, message).with_source(rollback_error));
+        }
+        return Err(validation_error);
+    }
 
     if let Err(error) = staging.close() {
         tracing::warn!(
@@ -983,10 +1027,36 @@ mod tests {
 
         let _guard = crate::test_support::env_lock();
         unsafe { std::env::set_var("SILVERVINE_TEST_PATCH_NOOP", "1") };
-        let result: Result<()> = replace_bundle_transactionally(&app, |staged| {
-            fs::write(staged.join("live-marker"), b"modified").unwrap();
-            Err(Error::other("injected bundle staging failure"))
-        });
+        let result: Result<()> = replace_bundle_transactionally(
+            &app,
+            |staged| {
+                fs::write(staged.join("live-marker"), b"modified").unwrap();
+                Err(Error::other("injected bundle staging failure"))
+            },
+            |_, ()| Ok(()),
+        );
+        unsafe { std::env::remove_var("SILVERVINE_TEST_PATCH_NOOP") };
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(app.join("live-marker")).unwrap(), b"original");
+    }
+
+    #[test]
+    fn live_validation_failure_restores_retired_application() {
+        let tmp = TempDir::new().unwrap();
+        let app = make_app_bundle(tmp.path(), "Helium", "Helium Framework", "1.0.0.0");
+        fs::write(app.join("live-marker"), b"original").unwrap();
+
+        let _guard = crate::test_support::env_lock();
+        unsafe { std::env::set_var("SILVERVINE_TEST_PATCH_NOOP", "1") };
+        let result = replace_bundle_transactionally(
+            &app,
+            |staged| {
+                fs::write(staged.join("live-marker"), b"modified").unwrap();
+                Ok(())
+            },
+            |_, ()| Err(Error::invalid_marker("injected live validation failure")),
+        );
         unsafe { std::env::remove_var("SILVERVINE_TEST_PATCH_NOOP") };
 
         assert!(result.is_err());

@@ -1457,6 +1457,7 @@ mod tests {
     /// don't actually shell out.
     #[test]
     fn remove_legacy_under_noop_short_circuit() {
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let roots = synthesize_full_legacy(tmp.path());
         // SAFETY: env mutations happen in serial test threads; we
@@ -1496,6 +1497,7 @@ mod tests {
 
     #[test]
     fn remove_legacy_drops_redundant_cdm_when_v2_cache_exists() {
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let roots = synthesize_full_legacy(tmp.path());
         // Pre-create the V2 destination so migrate_legacy_cdm sees it.
@@ -1936,6 +1938,7 @@ mod tests {
 
     #[test]
     fn remove_legacy_skips_package_managed_units_with_pacman_hint() {
+        let _guard = crate::test_support::env_lock();
         let tmp = TempDir::new().unwrap();
         let system_root = tmp.path().join("system");
         fs::create_dir_all(system_root.join("usr/lib/systemd/system")).unwrap();

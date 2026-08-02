@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use crate::diagnostics::{DiagnosticCheck, DiagnosticStatus, EvidenceSource, FailureDomain};
 use crate::platform::process::{find_executable, run_output_with_timeout};
-use crate::widevine::download::sha512_file_hex;
 
 const UTILITY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -22,10 +21,27 @@ pub fn collect_host_checks() -> Vec<DiagnosticCheck> {
     checks
 }
 
-/// Collect dependency evidence for a verified CDM library only.
+/// Report the deliberate boundary around executable dependency inspection.
+///
+/// `ldd <library>` can execute code from a crafted ELF, so Silvervine never
+/// invokes it on browser-controlled CDM bytes.
 #[must_use]
-pub fn collect_verified_library_deps(library: &Path) -> DiagnosticCheck {
-    ldd_check(library, true)
+pub fn collect_library_dependency_limit(library: &Path) -> DiagnosticCheck {
+    DiagnosticCheck {
+        id: "cdm.dependencies".into(),
+        status: DiagnosticStatus::Unavailable,
+        source: EvidenceSource::HostProbe,
+        failure_domain: FailureDomain::Silvervine,
+        summary: "CDM dependency execution probing is disabled for safety.".into(),
+        action: None,
+        details: BTreeMap::from([
+            ("path".into(), library.display().to_string()),
+            (
+                "reason".into(),
+                "ldd can execute code from mutable browser-controlled ELF files".into(),
+            ),
+        ]),
+    }
 }
 
 fn session_check() -> DiagnosticCheck {
@@ -263,27 +279,33 @@ fn glibc_check() -> DiagnosticCheck {
     match run_output_with_timeout(&ldd, &["--version"], UTILITY_TIMEOUT) {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let version = parse_ldd_version(&stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let version = parse_ldd_version(&stdout).or_else(|| parse_ldd_version(&stderr));
             let mut details = BTreeMap::from([
                 ("utility".into(), "ldd".into()),
                 ("exit_status".into(), output.status.to_string()),
             ]);
             if let Some(version) = &version {
                 details.insert("glibc_version".into(), version.clone());
+            } else if let Some(evidence) = first_interesting_lines(&stdout, &stderr, 8) {
+                details.insert("evidence".into(), evidence);
             }
-            let status = if output.timed_out || !output.status.success() {
-                DiagnosticStatus::Warn
-            } else {
-                DiagnosticStatus::Pass
-            };
+            let passed = !output.timed_out && output.status.success() && version.is_some();
             DiagnosticCheck {
                 id: "host.glibc".into(),
-                status,
+                status: if passed {
+                    DiagnosticStatus::Pass
+                } else {
+                    DiagnosticStatus::Warn
+                },
                 source: EvidenceSource::HostProbe,
                 failure_domain: FailureDomain::BrowserMediaStack,
                 summary: match version {
-                    Some(version) => format!("glibc version {version} reported by ldd."),
-                    None => "ldd --version completed without a parseable glibc version.".into(),
+                    Some(version) if passed => format!("glibc version {version} reported by ldd."),
+                    Some(version) => {
+                        format!("ldd reported glibc {version}, but the command did not complete successfully.")
+                    }
+                    None => "ldd did not provide verified GNU libc version evidence.".into(),
                 },
                 action: None,
                 details,
@@ -297,109 +319,6 @@ fn glibc_check() -> DiagnosticCheck {
             summary: "ldd --version could not run.".into(),
             action: None,
             details: BTreeMap::from([("error".into(), error.message)]),
-        },
-    }
-}
-
-fn ldd_check(library: &Path, verified: bool) -> DiagnosticCheck {
-    if !verified {
-        return DiagnosticCheck {
-            id: "cdm.dependencies".into(),
-            status: DiagnosticStatus::Unavailable,
-            source: EvidenceSource::HostProbe,
-            failure_domain: FailureDomain::BrowserMediaStack,
-            summary: "ldd is only run against verified Silvervine-managed CDM libraries.".into(),
-            action: None,
-            details: BTreeMap::from([("path".into(), library.display().to_string())]),
-        };
-    }
-    // Cheap integrity gate before spawning ldd.
-    if sha512_file_hex(library).is_err() {
-        return DiagnosticCheck {
-            id: "cdm.dependencies".into(),
-            status: DiagnosticStatus::Warn,
-            source: EvidenceSource::HostProbe,
-            failure_domain: FailureDomain::Silvervine,
-            summary: "Verified CDM library could not be hashed before dependency inspection."
-                .into(),
-            action: None,
-            details: BTreeMap::from([("path".into(), library.display().to_string())]),
-        };
-    }
-    let Some(ldd) = find_executable("ldd") else {
-        return DiagnosticCheck {
-            id: "cdm.dependencies".into(),
-            status: DiagnosticStatus::Unavailable,
-            source: EvidenceSource::HostProbe,
-            failure_domain: FailureDomain::BrowserMediaStack,
-            summary: "CDM dependency probe unavailable because `ldd` is not installed.".into(),
-            action: None,
-            details: BTreeMap::from([("path".into(), library.display().to_string())]),
-        };
-    };
-    match run_output_with_timeout(&ldd, &[&library.to_string_lossy()], UTILITY_TIMEOUT) {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let missing = parse_ldd_missing(&stdout);
-            let mut details = BTreeMap::from([
-                ("path".into(), library.display().to_string()),
-                ("exit_status".into(), output.status.to_string()),
-            ]);
-            if !missing.is_empty() {
-                details.insert("missing".into(), missing.join(","));
-            }
-            if let Some(evidence) = first_interesting_lines(&stdout, "", 40) {
-                details.insert("evidence".into(), evidence);
-            }
-            if !missing.is_empty() {
-                DiagnosticCheck {
-                    id: "cdm.dependencies".into(),
-                    status: DiagnosticStatus::Fail,
-                    source: EvidenceSource::VerifiedFile,
-                    failure_domain: FailureDomain::Silvervine,
-                    summary: format!(
-                        "Verified CDM library is missing shared dependencies: {}.",
-                        missing.join(", ")
-                    ),
-                    action: Some(
-                        "Install the missing libraries or reinstall the matching CDM payload."
-                            .into(),
-                    ),
-                    details,
-                }
-            } else if output.timed_out || !output.status.success() {
-                DiagnosticCheck {
-                    id: "cdm.dependencies".into(),
-                    status: DiagnosticStatus::Warn,
-                    source: EvidenceSource::VerifiedFile,
-                    failure_domain: FailureDomain::Silvervine,
-                    summary: "ldd could not fully inspect the verified CDM library.".into(),
-                    action: None,
-                    details,
-                }
-            } else {
-                DiagnosticCheck {
-                    id: "cdm.dependencies".into(),
-                    status: DiagnosticStatus::Pass,
-                    source: EvidenceSource::VerifiedFile,
-                    failure_domain: FailureDomain::Silvervine,
-                    summary: "Verified CDM library dependencies resolve.".into(),
-                    action: None,
-                    details,
-                }
-            }
-        }
-        Err(error) => DiagnosticCheck {
-            id: "cdm.dependencies".into(),
-            status: DiagnosticStatus::Warn,
-            source: EvidenceSource::HostProbe,
-            failure_domain: FailureDomain::Silvervine,
-            summary: "ldd could not run against the verified CDM library.".into(),
-            action: None,
-            details: BTreeMap::from([
-                ("path".into(), library.display().to_string()),
-                ("error".into(), error.message),
-            ]),
         },
     }
 }
@@ -431,7 +350,10 @@ pub fn parse_vainfo_codecs(output: &str) -> Vec<String> {
 #[must_use]
 pub fn parse_ldd_version(output: &str) -> Option<String> {
     let first = output.lines().next()?.trim();
-    // e.g. "ldd (GNU libc) 2.40" or "ldd (Ubuntu GLIBC 2.39-0ubuntu8.3) 2.39"
+    let lower = first.to_ascii_lowercase();
+    if !lower.contains("gnu libc") && !lower.contains("glibc") {
+        return None;
+    }
     let version = first
         .split_whitespace()
         .rev()
@@ -443,23 +365,6 @@ pub fn parse_ldd_version(output: &str) -> Option<String> {
     (!clean.is_empty()).then_some(clean)
 }
 
-/// Extract `=> not found` dependency names from ldd output.
-#[must_use]
-pub fn parse_ldd_missing(output: &str) -> Vec<String> {
-    let mut missing = Vec::new();
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if !trimmed.contains("not found") {
-            continue;
-        }
-        let name = trimmed.split_whitespace().next().unwrap_or_default();
-        if !name.is_empty() && name.len() <= 128 {
-            missing.push(name.to_owned());
-        }
-    }
-    missing
-}
-
 fn first_interesting_lines(stdout: &str, stderr: &str, limit: usize) -> Option<String> {
     let keys = [
         "va-api",
@@ -469,6 +374,7 @@ fn first_interesting_lines(stdout: &str, stderr: &str, limit: usize) -> Option<S
         "profile",
         "entrypoint",
         "glibc",
+        "musl",
         "not found",
     ];
     let mut retained = Vec::new();
@@ -498,7 +404,7 @@ fn first_interesting_lines(stdout: &str, stderr: &str, limit: usize) -> Option<S
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_ldd_missing, parse_ldd_version, parse_vainfo_codecs};
+    use super::{collect_library_dependency_limit, parse_ldd_version, parse_vainfo_codecs};
 
     #[test]
     fn vainfo_codec_parser_extracts_families() {
@@ -508,6 +414,7 @@ VAProfileHEVCMain
 VAProfileVP9Profile0
 VAProfileAV1Profile0
 ";
+
         assert_eq!(
             parse_vainfo_codecs(output),
             vec!["H.264", "HEVC", "VP9", "AV1"]
@@ -527,8 +434,21 @@ VAProfileAV1Profile0
     }
 
     #[test]
-    fn ldd_missing_parser_collects_not_found_rows() {
-        let output = "\tlibfoo.so.1 => not found\n\tlibc.so.6 => /lib/libc.so.6\n";
-        assert_eq!(parse_ldd_missing(output), vec!["libfoo.so.1".to_string()]);
+    fn dependency_probe_never_executes_the_library() {
+        let check = collect_library_dependency_limit(std::path::Path::new("/tmp/untrusted.so"));
+        assert_eq!(
+            check.status,
+            crate::diagnostics::DiagnosticStatus::Unavailable
+        );
+        assert!(check
+            .details
+            .get("reason")
+            .is_some_and(|reason| reason.contains("ldd can execute code")));
+    }
+
+    #[test]
+    fn ldd_version_parser_rejects_non_glibc_output() {
+        assert_eq!(parse_ldd_version("musl libc (x86_64)\nVersion 1.2.5"), None);
+        assert_eq!(parse_ldd_version("custom ldd 9.9"), None);
     }
 }

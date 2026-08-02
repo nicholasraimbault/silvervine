@@ -167,7 +167,7 @@ enum Command {
         #[arg(long)]
         cdm_dir: PathBuf,
         #[arg(long, value_parser = parse_managed_marker)]
-        managed_marker: silvervine::widevine::ownership::ManagedMarker,
+        managed_marker: Box<silvervine::widevine::ownership::ManagedMarker>,
         #[arg(long)]
         browser_name: String,
         /// Closed ownership classification token from the locked parent.
@@ -219,7 +219,7 @@ fn main() -> ExitCode {
             framework_version: framework_version.clone(),
             backup_parent: backup_parent.clone(),
             cdm_dir: cdm_dir.clone(),
-            managed_marker: managed_marker.clone(),
+            managed_marker: managed_marker.as_ref().clone(),
             browser_name: browser_name.clone(),
             browser_kind: *browser_kind,
             force: *force,
@@ -291,8 +291,10 @@ fn parse_browser_kind_token(value: &str) -> Result<silvervine::browsers::Browser
 }
 fn parse_managed_marker(
     value: &str,
-) -> Result<silvervine::widevine::ownership::ManagedMarker, String> {
-    serde_json::from_str(value).map_err(|error| format!("invalid managed marker: {error}"))
+) -> Result<Box<silvervine::widevine::ownership::ManagedMarker>, String> {
+    serde_json::from_str(value)
+        .map(Box::new)
+        .map_err(|error| format!("invalid managed marker: {error}"))
 }
 
 fn prepare_startup_migration() -> silvervine::Result<Vec<silvervine::migration::DataMigrationEntry>>

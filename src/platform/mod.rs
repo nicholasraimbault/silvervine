@@ -11,8 +11,8 @@
 //! * [`run_as_root`] — execute an arbitrary command with elevated privileges.
 //!   Returns the captured [`Output`] regardless of exit status; callers
 //!   inspect `status.success()` and the stderr text for diagnostics.
-//! * [`atomic_rename`] — APFS / ext4-aware directory swap with a two-step
-//!   fallback on filesystems without native exchange support.
+//! * [`atomic_rename`] — crash-atomic APFS / ext4 directory exchange that
+//!   fails closed when the filesystem lacks native swap support.
 //! * `atomic_write` — same-directory temporary-file replacement for internal
 //!   state and registration files.
 //!
@@ -151,6 +151,36 @@ pub fn run_as_root(command: &[&str]) -> Result<Output> {
     }
     imp::run_as_root(command)
 }
+/// Run an executable under elevation while binding macOS execution to the
+/// exact image digest selected by the unprivileged parent.
+///
+/// Linux callers pass `/proc/<pid>/exe`, which is already inode-pinned. On
+/// macOS the elevated shell opens the path once, verifies `expected_sha512`
+/// through that descriptor, then executes `/dev/fd/9`; a path swap during the
+/// authorization prompt therefore cannot change the elevated image.
+///
+/// # Errors
+///
+/// Returns an error for empty commands, malformed SHA-512 digests, unsupported
+/// platforms, or elevation-tool failures.
+pub(crate) fn run_pinned_as_root(command: &[&str], expected_sha512: &str) -> Result<Output> {
+    if command.is_empty() {
+        return Err(Error::other("run_pinned_as_root called with empty command"));
+    }
+    if expected_sha512.len() != 128
+        || !expected_sha512
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(Error::other(
+            "run_pinned_as_root requires a lowercase SHA-512 digest",
+        ));
+    }
+    if std::env::var_os("SILVERVINE_TEST_ESCALATE_NOOP").is_some() {
+        return Ok(noop_output());
+    }
+    imp::run_pinned_as_root(command, expected_sha512)
+}
 
 /// Run a shell script under a single elevated invocation.
 ///
@@ -180,133 +210,25 @@ pub fn run_as_root_script(script: &str) -> Result<Output> {
     if std::env::var_os("SILVERVINE_TEST_ESCALATE_NOOP").is_some() {
         return Ok(noop_output());
     }
-    imp::run_as_root(&["sh", "-c", script])
+    imp::run_as_root(&["/bin/sh", "-c", script])
 }
 
 /// Exchange two existing filesystem entries.
 ///
 /// Linux uses `renameat2(RENAME_EXCHANGE)` and macOS uses
-/// `renameatx_np(RENAME_SWAP)`. On filesystems without native exchange support,
-/// a recoverable three-rename fallback preserves the same successful result:
-///
-/// 1. `dst` moves to an exclusively-created sibling scratch directory.
-/// 2. `src` moves to `dst`.
-/// 3. the saved destination moves to `src`.
-///
-/// The fallback is not crash-atomic. Errors trigger best-effort restoration;
-/// if restoration itself fails, the returned error identifies the preserved
-/// scratch path.
-///
-/// If `dst` does not exist, this performs a plain `rename(src, dst)`.
+/// `renameatx_np(RENAME_SWAP)`. When the destination does not exist, a plain
+/// rename is already atomic. When native exchange is unsupported, this fails
+/// without moving either path; transactional patch writers must never fall
+/// back to a crash-vulnerable multi-rename sequence.
 ///
 /// # Errors
 ///
 /// * [`crate::ErrorCategory::PermissionDenied`] if writes to either path
 ///   are rejected.
-/// * [`crate::ErrorCategory::Other`] for any other I/O failure.
+/// * [`crate::ErrorCategory::Other`] if native atomic exchange is unavailable
+///   or any other I/O failure occurs.
 pub fn atomic_rename(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     imp::atomic_rename(src, dst)
-}
-
-fn fallback_exchange(src: &Path, dst: &Path) -> Result<()> {
-    let parent = dst
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let scratch = tempfile::Builder::new()
-        .prefix(".silvervine-swap-")
-        .tempdir_in(parent)
-        .map_err(|error| {
-            Error::from(error).with_context(format!(
-                "could not create exchange scratch directory beside {}",
-                dst.display()
-            ))
-        })?
-        .keep();
-    let backup = scratch.join("destination");
-
-    if let Err(error) = std::fs::rename(dst, &backup) {
-        cleanup_exchange_scratch(&scratch);
-        return Err(Error::from(error).with_context(format!(
-            "fallback exchange could not move {} aside",
-            dst.display()
-        )));
-    }
-
-    if let Err(exchange_error) = std::fs::rename(src, dst) {
-        return match std::fs::rename(&backup, dst) {
-            Ok(()) => {
-                cleanup_exchange_scratch(&scratch);
-                Err(Error::from(exchange_error).with_context(format!(
-                    "fallback exchange could not move {} into {}",
-                    src.display(),
-                    dst.display()
-                )))
-            }
-            Err(restore_error) => Err(Error::from(restore_error)
-                .with_context(format!(
-                    "fallback exchange failed and could not restore {}; the original remains at {}",
-                    dst.display(),
-                    backup.display()
-                ))
-                .with_source(exchange_error)),
-        };
-    }
-
-    if let Err(finish_error) = std::fs::rename(&backup, src) {
-        if let Err(rollback_error) = std::fs::rename(dst, src) {
-            return Err(Error::from(rollback_error)
-                .with_context(format!(
-                    "fallback exchange could not roll back; the original destination remains at {} and the new destination at {}",
-                    backup.display(),
-                    dst.display()
-                ))
-                .with_source(finish_error));
-        }
-
-        return match std::fs::rename(&backup, dst) {
-            Ok(()) => {
-                cleanup_exchange_scratch(&scratch);
-                Err(Error::from(finish_error).with_context(format!(
-                    "fallback exchange could not move the original destination into {}; original paths were restored",
-                    src.display()
-                )))
-            }
-            Err(restore_error) => {
-                if let Err(republish_error) = std::fs::rename(src, dst) {
-                    return Err(Error::from(republish_error)
-                        .with_context(format!(
-                            "fallback exchange recovery failed; the original destination remains at {}, the new source at {}, and {} is missing",
-                            backup.display(),
-                            src.display(),
-                            dst.display()
-                        ))
-                        .with_source(restore_error));
-                }
-                Err(Error::from(restore_error)
-                    .with_context(format!(
-                        "fallback exchange could not restore the original destination; it remains at {}, while the new destination is valid at {}",
-                        backup.display(),
-                        dst.display()
-                    ))
-                    .with_source(finish_error))
-            }
-        };
-    }
-
-    cleanup_exchange_scratch(&scratch);
-    Ok(())
-}
-
-fn cleanup_exchange_scratch(path: &Path) {
-    if let Err(error) = std::fs::remove_dir(path) {
-        tracing::warn!(
-            target: "silvervine::platform",
-            path = %path.display(),
-            error = %error,
-            "could not remove empty exchange scratch directory"
-        );
-    }
 }
 
 /// Replace a file from a same-directory temporary file.
@@ -432,6 +354,11 @@ mod unsupported {
             "run_as_root is only implemented on Linux and macOS",
         ))
     }
+    pub(super) fn run_pinned_as_root(_command: &[&str], _expected_sha512: &str) -> Result<Output> {
+        Err(Error::unsupported_platform(
+            "run_pinned_as_root is only implemented on Linux and macOS",
+        ))
+    }
     pub(super) fn atomic_rename(_src: &Path, _dst: &Path) -> Result<()> {
         Err(Error::unsupported_platform(
             "atomic_rename is only implemented on Linux and macOS",
@@ -447,6 +374,7 @@ mod tests {
     /// points so CI never prompts for a password.
     #[test]
     fn noop_short_circuit_in_test_mode() {
+        let _guard = crate::test_support::env_lock();
         // SAFETY: setting an env var is a process-wide mutation; this
         // test takes a small risk of interfering with parallel tests in
         // the same module, but `cargo test` runs each `#[test]` in its

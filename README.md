@@ -55,7 +55,7 @@ Silvervine refuses to patch a running browser unless forced. It creates an exclu
 | `silvervine patch [browser]` | Patch one or all detected browsers |
 | `silvervine status` | Show browser and daemon status |
 | `silvervine list-browsers` | List detected browsers |
-| `silvervine doctor [error-code] [--media]` | Run diagnostics, collect passive media evidence, or explain an EME error |
+| `silvervine doctor [error-code] [--media-stack]` | Run diagnostics, collect passive media evidence, or explain an EME error |
 | `silvervine test [--browser <name>]` | Run an explicit browser-reported EME capability check |
 | `silvervine update widevine` | Update or roll back the CDM |
 | `silvervine launch <browser>` | Verify, patch if needed, then launch |

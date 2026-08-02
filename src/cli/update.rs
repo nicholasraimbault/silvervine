@@ -141,7 +141,7 @@ fn fetch_from_custom(url: &str) -> Result<widevine::Manifest> {
     widevine::fetch_manifest_with(
         std::slice::from_ref(&parsed),
         widevine::cached_manifest_path().as_deref(),
-        std::time::Duration::from_secs(0), // no cache fallback for explicit overrides
+        std::time::Duration::ZERO, // retained signature; snapshots are write-only
     )
 }
 

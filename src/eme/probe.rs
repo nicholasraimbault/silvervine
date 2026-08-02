@@ -180,6 +180,34 @@ pub struct MediaCapabilitiesFacts {
     pub key_system_access: Option<bool>,
 }
 
+/// Closed `HTMLMediaElement.canPlayType` result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CanPlayStatus {
+    /// The browser returned the empty string.
+    #[serde(rename = "")]
+    Unsupported,
+    /// The browser reported uncertain support.
+    #[serde(rename = "maybe")]
+    Maybe,
+    /// The browser reported affirmative support.
+    #[serde(rename = "probably")]
+    Probably,
+}
+
+impl CanPlayStatus {
+    const fn is_supported(self) -> bool {
+        matches!(self, Self::Probably)
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsupported => "",
+            Self::Maybe => "maybe",
+            Self::Probably => "probably",
+        }
+    }
+}
+
 /// Result of probing one codec at one resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -196,8 +224,8 @@ pub struct CodecCapability {
     pub framerate: u32,
     /// Whether `MediaSource.isTypeSupported` accepted the content type.
     pub mse_supported: bool,
-    /// Raw `HTMLMediaElement.canPlayType` result.
-    pub direct_playback: String,
+    /// Closed `HTMLMediaElement.canPlayType` result.
+    pub direct_playback: CanPlayStatus,
     /// Optional MediaCapabilities facts for this configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_capabilities: Option<MediaCapabilitiesFacts>,
@@ -320,7 +348,7 @@ impl RawProbeResult {
                     row.width, row.height, row.framerate
                 )));
             }
-            if row.content_type.len() > MAX_ERROR_LEN || row.direct_playback.len() > 64 {
+            if row.content_type.len() > MAX_ERROR_LEN {
                 return Err(crate::Error::state_corrupted(
                     "browser returned oversized codec fields",
                 ));
@@ -364,106 +392,119 @@ impl RawProbeResult {
                 self.codecs.len()
             )));
         }
-
-        let expected_robustness = approved_robustness_keys();
-        let mut seen_robustness = std::collections::BTreeSet::new();
-        for row in &self.robustness {
-            let Some(level) = RobustnessLevel::from_eme(&row.robustness) else {
-                return Err(crate::Error::state_corrupted(format!(
-                    "browser returned unknown robustness {}",
-                    row.robustness
-                )));
-            };
-            let key = (row.media_kind, level);
-            if !expected_robustness.contains(&key) {
-                return Err(crate::Error::state_corrupted(
-                    "browser returned unexpected robustness matrix key",
-                ));
-            }
-            if !seen_robustness.insert(key) {
-                return Err(crate::Error::state_corrupted(
-                    "browser returned duplicate robustness matrix key",
-                ));
-            }
-        }
-        if seen_robustness != expected_robustness {
-            return Err(crate::Error::state_corrupted(
-                "browser robustness matrix is missing required media_kind × level pairs",
-            ));
-        }
-
-        let expected_schemes: std::collections::BTreeSet<&str> =
-            ["cenc", "cbcs"].into_iter().collect();
-        let mut seen_schemes = std::collections::BTreeSet::new();
-        for row in &self.encryption_schemes {
-            if !expected_schemes.contains(row.scheme.as_str()) {
-                return Err(crate::Error::state_corrupted(format!(
-                    "browser returned unexpected encryption scheme {}",
-                    row.scheme
-                )));
-            }
-            if !seen_schemes.insert(row.scheme.as_str()) {
-                return Err(crate::Error::state_corrupted(
-                    "browser returned duplicate encryption scheme",
-                ));
-            }
-        }
-        if seen_schemes != expected_schemes {
-            return Err(crate::Error::state_corrupted(
-                "browser encryption-scheme matrix is missing cenc/cbcs",
-            ));
-        }
-
-        let expected_hdcp: std::collections::BTreeSet<&str> = ["1.4", "2.2"].into_iter().collect();
-        let mut seen_hdcp = std::collections::BTreeSet::new();
-        for row in &self.hdcp {
-            if !expected_hdcp.contains(row.min_version.as_str()) {
-                return Err(crate::Error::state_corrupted(format!(
-                    "browser returned unexpected HDCP version {}",
-                    row.min_version
-                )));
-            }
-            if !seen_hdcp.insert(row.min_version.as_str()) {
-                return Err(crate::Error::state_corrupted(
-                    "browser returned duplicate HDCP version",
-                ));
-            }
-        }
-        if seen_hdcp != expected_hdcp {
-            return Err(crate::Error::state_corrupted(
-                "browser HDCP matrix is missing 1.4/2.2",
-            ));
-        }
-
-        let expected_codecs = approved_codec_keys();
-        let mut seen_codecs = std::collections::BTreeSet::new();
-        for row in &self.codecs {
-            let key = (row.codec.as_str(), row.width, row.height, row.framerate);
-            let Some(expected_content_type) = expected_codecs.get(&key) else {
-                return Err(crate::Error::state_corrupted(format!(
-                    "browser returned unexpected codec matrix key {} {}x{}@{}",
-                    row.codec, row.width, row.height, row.framerate
-                )));
-            };
-            if row.content_type != *expected_content_type {
-                return Err(crate::Error::state_corrupted(format!(
-                    "browser codec {} content_type mismatch",
-                    row.codec
-                )));
-            }
-            if !seen_codecs.insert(key) {
-                return Err(crate::Error::state_corrupted(
-                    "browser returned duplicate codec matrix key",
-                ));
-            }
-        }
-        if seen_codecs.len() != expected_codecs.len() {
-            return Err(crate::Error::state_corrupted(
-                "browser codec matrix is missing required codec × size pairs",
-            ));
-        }
-        Ok(())
+        validate_live_robustness(&self.robustness)?;
+        validate_live_schemes(&self.encryption_schemes)?;
+        validate_live_hdcp(&self.hdcp)?;
+        validate_live_codecs(&self.codecs)
     }
+}
+fn validate_live_robustness(rows: &[RobustnessResult]) -> crate::Result<()> {
+    let expected = approved_robustness_keys();
+    let mut seen = std::collections::BTreeSet::new();
+    for row in rows {
+        let Some(level) = RobustnessLevel::from_eme(&row.robustness) else {
+            return Err(crate::Error::state_corrupted(format!(
+                "browser returned unknown robustness {}",
+                row.robustness
+            )));
+        };
+        let key = (row.media_kind, level);
+        if !expected.contains(&key) {
+            return Err(crate::Error::state_corrupted(
+                "browser returned unexpected robustness matrix key",
+            ));
+        }
+        if !seen.insert(key) {
+            return Err(crate::Error::state_corrupted(
+                "browser returned duplicate robustness matrix key",
+            ));
+        }
+    }
+    if seen != expected {
+        return Err(crate::Error::state_corrupted(
+            "browser robustness matrix is missing required media_kind × level pairs",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_live_schemes(rows: &[EncryptionSchemeResult]) -> crate::Result<()> {
+    let expected: std::collections::BTreeSet<&str> = ["cenc", "cbcs"].into_iter().collect();
+    let mut seen = std::collections::BTreeSet::new();
+    for row in rows {
+        if !expected.contains(row.scheme.as_str()) {
+            return Err(crate::Error::state_corrupted(format!(
+                "browser returned unexpected encryption scheme {}",
+                row.scheme
+            )));
+        }
+        if !seen.insert(row.scheme.as_str()) {
+            return Err(crate::Error::state_corrupted(
+                "browser returned duplicate encryption scheme",
+            ));
+        }
+    }
+    if seen != expected {
+        return Err(crate::Error::state_corrupted(
+            "browser encryption-scheme matrix is missing cenc/cbcs",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_live_hdcp(rows: &[HdcpResult]) -> crate::Result<()> {
+    let expected: std::collections::BTreeSet<&str> = ["1.4", "2.2"].into_iter().collect();
+    let mut seen = std::collections::BTreeSet::new();
+    for row in rows {
+        if !expected.contains(row.min_version.as_str()) {
+            return Err(crate::Error::state_corrupted(format!(
+                "browser returned unexpected HDCP version {}",
+                row.min_version
+            )));
+        }
+        if !seen.insert(row.min_version.as_str()) {
+            return Err(crate::Error::state_corrupted(
+                "browser returned duplicate HDCP version",
+            ));
+        }
+    }
+    if seen != expected {
+        return Err(crate::Error::state_corrupted(
+            "browser HDCP matrix is missing 1.4/2.2",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_live_codecs(rows: &[CodecCapability]) -> crate::Result<()> {
+    let expected = approved_codec_keys();
+    let mut seen = std::collections::BTreeSet::new();
+    for row in rows {
+        let key = (row.codec.as_str(), row.width, row.height, row.framerate);
+        let Some(expected_content_type) = expected.get(&key) else {
+            return Err(crate::Error::state_corrupted(format!(
+                "browser returned unexpected codec matrix key {} {}x{}@{}",
+                row.codec, row.width, row.height, row.framerate
+            )));
+        };
+        if row.content_type != *expected_content_type {
+            return Err(crate::Error::state_corrupted(format!(
+                "browser codec {} content_type mismatch",
+                row.codec
+            )));
+        }
+        if !seen.insert(key) {
+            return Err(crate::Error::state_corrupted(
+                "browser returned duplicate codec matrix key",
+            ));
+        }
+    }
+    if seen.len() != expected.len() {
+        return Err(crate::Error::state_corrupted(
+            "browser codec matrix is missing required codec × size pairs",
+        ));
+    }
+    Ok(())
 }
 
 fn approved_robustness_keys() -> std::collections::BTreeSet<(MediaKind, RobustnessLevel)> {
@@ -596,10 +637,9 @@ pub fn assess_with_baseline(
     });
     // Baseline codec evidence is MSE / canPlayType only. MediaCapabilities is
     // optional and never alone decides SoftwarePlayback failure.
-    let has_video_codec = result
-        .codecs
-        .iter()
-        .any(|codec| codec.width > 0 && (codec.mse_supported || !codec.direct_playback.is_empty()));
+    let has_video_codec = result.codecs.iter().any(|codec| {
+        codec.width > 0 && (codec.mse_supported || codec.direct_playback.is_supported())
+    });
     // Baseline-required: EME API, temporary key-system access, software
     // robustness, and at least one supported video codec configuration.
     let required_ok = result.eme_api
@@ -869,7 +909,8 @@ fn build_codec_checks(result: &RawProbeResult) -> impl Iterator<Item = Diagnosti
             .media_capabilities
             .as_ref()
             .is_some_and(|facts| facts.supported)
-            || codec.mse_supported;
+            || codec.mse_supported
+            || codec.direct_playback.is_supported();
         // Only the first successful software path is baseline-required; individual
         // codec/size rows remain optional evidence.
         let status = if supported {
@@ -886,7 +927,10 @@ fn build_codec_checks(result: &RawProbeResult) -> impl Iterator<Item = Diagnosti
             ("height".into(), codec.height.to_string()),
             ("framerate".into(), codec.framerate.to_string()),
             ("mse_supported".into(), codec.mse_supported.to_string()),
-            ("direct_playback".into(), codec.direct_playback.clone()),
+            (
+                "direct_playback".into(),
+                codec.direct_playback.as_str().into(),
+            ),
         ]);
         if let Some(facts) = &codec.media_capabilities {
             details.insert("mc_supported".into(), facts.supported.to_string());
@@ -995,7 +1039,7 @@ fn build_findings(
         .iter()
         .filter(|codec| {
             codec.mse_supported
-                || !codec.direct_playback.is_empty()
+                || codec.direct_playback.is_supported()
                 || codec
                     .media_capabilities
                     .as_ref()
@@ -1158,9 +1202,9 @@ mod tests {
                     framerate,
                     mse_supported: codec.0 == "avc1.640028" && width <= 1920,
                     direct_playback: if codec.0 == "avc1.640028" {
-                        "probably".into()
+                        CanPlayStatus::Probably
                     } else {
-                        "".into()
+                        CanPlayStatus::Unsupported
                     },
                     media_capabilities: Some(MediaCapabilitiesFacts {
                         supported: codec.0 == "avc1.640028" && width <= 1920,
@@ -1322,10 +1366,29 @@ mod tests {
         for codec in &mut result.codecs {
             codec.media_capabilities = None;
             codec.mse_supported = true;
-            codec.direct_playback = "probably".into();
+            codec.direct_playback = CanPlayStatus::Probably;
         }
         let assessment = assess(&result, &managed_ownership());
         assert_eq!(assessment.status, DiagnosticStatus::Pass);
+    }
+
+    #[test]
+    fn software_baseline_requires_affirmative_codec_support() {
+        let mut result = baseline_result();
+        for codec in &mut result.codecs {
+            codec.mse_supported = false;
+            codec.direct_playback = CanPlayStatus::Maybe;
+            codec.media_capabilities = Some(MediaCapabilitiesFacts {
+                supported: true,
+                smooth: Some(true),
+                power_efficient: Some(true),
+                key_system_access: Some(true),
+            });
+        }
+
+        let assessment = assess(&result, &managed_ownership());
+        assert_eq!(assessment.status, DiagnosticStatus::Fail);
+        assert_eq!(assessment.domain, FailureDomain::BrowserMediaStack);
     }
 
     #[test]
@@ -1333,7 +1396,7 @@ mod tests {
         let mut result = baseline_result();
         for codec in &mut result.codecs {
             codec.mse_supported = true;
-            codec.direct_playback = "maybe".into();
+            codec.direct_playback = CanPlayStatus::Maybe;
             codec.media_capabilities = Some(MediaCapabilitiesFacts {
                 supported: false,
                 smooth: Some(false),

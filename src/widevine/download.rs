@@ -7,30 +7,26 @@
 //!
 //! * `file_url` — primary download URL.
 //! * `mirror_urls` — Mozilla-supplied mirrors, tried after the primary.
-//! * `filesize` — expected size in bytes (advisory only; we trust the hash).
+//! * `filesize` — optional exact size in bytes, bounded before allocation.
 //! * `hash_value` — SHA-512 hex digest the downloaded bytes must match.
 //!
-//! ## Output
+//! Security-sensitive callers receive a [`VerifiedCrx`] containing the exact
+//! authenticated bytes plus a best-effort on-disk cache path. The default
+//! cache path is `~/.cache/silvervine/downloads/<sha-prefix>.crx3`.
 //!
-//! A path to the verified `.crx3` file on disk. In production this is
-//! typically `~/.cache/silvervine/downloads/<sha-prefix>.crx3`; tests pass a
-//! `tempfile::TempDir`.
-//!
-//! ## Hash mismatch handling
-//!
-//! On hash mismatch we **delete the file** before returning the error so
-//! the caller can retry without an in-progress half-downloaded file
-//! lurking. The error category is [`crate::ErrorCategory::HashMismatch`].
+//! Invalid cached files are removed before a fresh download. Downloads are
+//! bounded, written to private temporary files, verified through the same open
+//! descriptor, and atomically promoted. Hash and size mismatches use
+//! [`crate::ErrorCategory::HashMismatch`].
 //!
 //! ## What this module does NOT do
 //!
 //! * No CRX3 parsing — that's [`crate::widevine::extract`].
 //! * No cache management or symlink updates — that's [`crate::widevine::cache`].
-//! * No retry policy beyond the URL fallback — Phase 2 deliberately keeps
-//!   things simple. A jitter+backoff retry loop is V1.1 work.
+//! * No retry policy beyond the ordered URL fallback chain.
 
-use std::fs::File;
-use std::io::{Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -41,6 +37,49 @@ use crate::widevine::manifest::PlatformEntry;
 
 /// HTTP transport timeout per URL. Mirrors the manifest fetcher's value.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+/// Hard ceiling for any CRX held in memory or written to the download cache.
+pub const MAX_CRX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// SHA-512-authenticated CRX bytes and their best-effort cache location.
+///
+/// The path is not an authenticity boundary: another same-user process may
+/// replace it after verification. Security-sensitive consumers must parse
+/// [`Self::bytes`] instead of reopening [`Self::path`].
+pub struct VerifiedCrx {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for VerifiedCrx {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedCrx")
+            .field("path", &self.path)
+            .field("bytes_len", &self.bytes.len())
+            .finish()
+    }
+}
+
+impl VerifiedCrx {
+    /// Return the best-effort on-disk cache path.
+    ///
+    /// This path may change after verification; do not reopen it when the
+    /// authenticated content is required.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Return the exact CRX bytes that passed manifest verification.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn into_path(self) -> PathBuf {
+        self.path
+    }
+}
 
 /// Default download cache directory: `~/.cache/silvervine/downloads/`.
 ///
@@ -56,6 +95,10 @@ pub fn default_download_dir() -> Option<PathBuf> {
 /// file is named after the first 16 hex characters of the expected hash —
 /// stable across re-downloads, so a second call for the same hash short-
 /// circuits if the file already exists and verifies.
+///
+/// This compatibility API verifies the path only at return time. Consumers
+/// that must retain authenticity across extraction must use
+/// [`download_verified`] and consume [`VerifiedCrx::bytes`].
 ///
 /// # Errors
 ///
@@ -79,10 +122,26 @@ pub fn download_to_cache(entry: &PlatformEntry) -> Result<PathBuf> {
 /// `<sha-prefix>.crx3` so multiple platforms (each with a different hash)
 /// don't collide.
 ///
+/// The returned path is mutable after verification. Security-sensitive
+/// consumers must use [`download_verified`] instead.
+///
 /// # Errors
 ///
 /// See [`download_to_cache`].
 pub fn download_to(entry: &PlatformEntry, dir: &Path) -> Result<PathBuf> {
+    download_verified(entry, dir).map(VerifiedCrx::into_path)
+}
+
+/// Download a CRX and retain the exact bytes that passed manifest SHA-512
+/// verification.
+///
+/// Unlike [`download_to`], this API lets a caller extract the authenticated
+/// buffer without reopening a user-writable cache pathname.
+///
+/// # Errors
+///
+/// See [`download_to_cache`].
+pub fn download_verified(entry: &PlatformEntry, dir: &Path) -> Result<VerifiedCrx> {
     let (urls, expected_hash, expected_size) = match entry {
         PlatformEntry::Concrete {
             file_url,
@@ -97,61 +156,56 @@ pub fn download_to(entry: &PlatformEntry, dir: &Path) -> Result<PathBuf> {
         }
         PlatformEntry::Alias { alias } => {
             return Err(Error::unknown_bundle_structure(format!(
-                "download_to called on an alias entry pointing at '{alias}'; \
+                "download_verified called on an alias entry pointing at '{alias}'; \
                  caller should have followed the alias before invoking this"
             )));
         }
     };
+    validate_expected_hash(&expected_hash)?;
+    let max_size = validated_max_size(expected_size)?;
 
     std::fs::create_dir_all(dir).map_err(Error::from)?;
 
-    // Stable filename per hash so a re-download finds the file by name.
-    let prefix = expected_hash
-        .get(..16)
-        .ok_or_else(|| Error::hash_mismatch("manifest hash too short"))?;
+    let prefix = &expected_hash[..16];
     let path = dir.join(format!("{prefix}.crx3"));
 
-    // Short-circuit: if the file is already on disk and verifies, return it.
-    if path.exists() {
-        match verify_file(&path, &expected_hash, expected_size) {
-            Ok(()) => return Ok(path),
-            Err(_) => {
-                // Don't return the error directly — try a fresh download.
-                let _ = std::fs::remove_file(&path);
-            }
-        }
+    match read_verified_path(&path, &expected_hash, expected_size, max_size) {
+        Ok(bytes) => return Ok(VerifiedCrx { path, bytes }),
+        Err(_) => remove_download_entry(&path)?,
     }
 
     let client = reqwest::blocking::Client::builder()
         .timeout(HTTP_TIMEOUT)
         .build()
-        .map_err(|e| Error::network("failed to construct HTTP client").with_source(e))?;
+        .map_err(|error| Error::network("failed to construct HTTP client").with_source(error))?;
 
-    let mut last_err: Option<Error> = None;
+    let mut last_network_error = None;
     for url in &urls {
-        match download_one(&client, url, &path) {
-            Ok(()) => match verify_file(&path, &expected_hash, expected_size) {
-                Ok(()) => return Ok(path),
-                Err(e) => {
-                    let _ = std::fs::remove_file(&path);
-                    return Err(e);
-                }
-            },
-            Err(e) => {
-                let _ = std::fs::remove_file(&path);
-                last_err = Some(e);
+        match download_one(
+            &client,
+            url,
+            dir,
+            &path,
+            &expected_hash,
+            expected_size,
+            max_size,
+        ) {
+            Ok(download) => return Ok(download),
+            Err(error) if error.category == crate::ErrorCategory::NetworkError => {
+                last_network_error = Some(error);
             }
+            Err(error) => return Err(error),
         }
     }
 
-    let mut err = Error::network(format!(
+    let mut error = Error::network(format!(
         "every URL in the {}-entry chain failed",
         urls.len()
     ));
-    if let Some(prev) = last_err {
-        err.source = Some(Box::new(prev));
+    if let Some(source) = last_network_error {
+        error.source = Some(Box::new(source));
     }
-    Err(err)
+    Err(error)
 }
 
 /// Verify an on-disk file matches the expected SHA-512 (and optional size).
@@ -162,28 +216,125 @@ pub fn download_to(entry: &PlatformEntry, dir: &Path) -> Result<PathBuf> {
 /// [`crate::ErrorCategory::Other`] / `PermissionDenied` if the file
 /// cannot be read.
 pub fn verify_file(path: &Path, expected_hash: &str, expected_size: Option<u64>) -> Result<()> {
-    let mut file = File::open(path).map_err(Error::from)?;
+    validate_expected_hash(expected_hash)?;
+    let max_size = validated_max_size(expected_size)?;
+    read_verified_path(path, expected_hash, expected_size, max_size).map(drop)
+}
+
+fn validate_expected_hash(expected_hash: &str) -> Result<()> {
+    if expected_hash.len() != 128 || !expected_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::hash_mismatch(
+            "manifest SHA-512 must contain exactly 128 hexadecimal characters",
+        ));
+    }
+    Ok(())
+}
+
+fn validated_max_size(expected_size: Option<u64>) -> Result<u64> {
     if let Some(size) = expected_size {
-        let actual_size = file.metadata().map_err(Error::from)?.len();
-        if actual_size != size {
+        if size > MAX_CRX_BYTES {
+            return Err(Error::hash_mismatch(format!(
+                "manifest CRX size {size} bytes exceeds the {MAX_CRX_BYTES} byte limit"
+            )));
+        }
+    }
+    Ok(expected_size.unwrap_or(MAX_CRX_BYTES))
+}
+
+fn read_verified_path(
+    path: &Path,
+    expected_hash: &str,
+    expected_size: Option<u64>,
+    max_size: u64,
+) -> Result<Vec<u8>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(Error::from)?;
+    read_verified_file(&mut file, path, expected_hash, expected_size, max_size)
+}
+
+fn read_verified_file(
+    file: &mut File,
+    display_path: &Path,
+    expected_hash: &str,
+    expected_size: Option<u64>,
+    max_size: u64,
+) -> Result<Vec<u8>> {
+    let metadata = file.metadata().map_err(Error::from)?;
+    if !metadata.is_file() {
+        return Err(Error::hash_mismatch(format!(
+            "{} is not a regular CRX file",
+            display_path.display()
+        )));
+    }
+    if metadata.len() > max_size {
+        return Err(Error::hash_mismatch(format!(
+            "{} size {} bytes exceeds the {} byte limit",
+            display_path.display(),
+            metadata.len(),
+            max_size
+        )));
+    }
+    if let Some(size) = expected_size {
+        if metadata.len() != size {
             return Err(Error::hash_mismatch(format!(
                 "{} size {} bytes != manifest {} bytes",
-                path.display(),
-                actual_size,
+                display_path.display(),
+                metadata.len(),
                 size
             )));
         }
     }
-    let actual = sha512_reader(&mut file)?;
-    if !hashes_equal(&actual, expected_hash) {
+
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| Error::hash_mismatch("CRX size cannot fit in memory"))?;
+    file.seek(SeekFrom::Start(0)).map_err(Error::from)?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max_size.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(Error::from)?;
+    if bytes.len() as u64 > max_size {
         return Err(Error::hash_mismatch(format!(
-            "{}: SHA-512 mismatch (expected {}, got {})",
-            path.display(),
-            expected_hash,
-            actual
+            "{} grew beyond the {} byte limit while being read",
+            display_path.display(),
+            max_size
         )));
     }
-    Ok(())
+    if expected_size.is_some_and(|size| bytes.len() as u64 != size) {
+        return Err(Error::hash_mismatch(format!(
+            "{} changed size while being read",
+            display_path.display()
+        )));
+    }
+
+    let actual_hash = sha512_hex(&bytes);
+    if !hashes_equal(&actual_hash, expected_hash) {
+        return Err(Error::hash_mismatch(format!(
+            "{}: SHA-512 mismatch (expected {}, got {})",
+            display_path.display(),
+            expected_hash,
+            actual_hash
+        )));
+    }
+    Ok(bytes)
+}
+
+fn remove_download_entry(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(Error::from(error)),
+    };
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(path).map_err(Error::from)
+    } else {
+        std::fs::remove_file(path).map_err(Error::from)
+    }
 }
 
 /// Stream an on-disk file into SHA-512 and return the lowercase digest.
@@ -192,7 +343,7 @@ pub(crate) fn sha512_file_hex(path: &Path) -> Result<String> {
     sha512_reader(&mut file)
 }
 
-fn sha512_reader(reader: &mut impl Read) -> Result<String> {
+pub(crate) fn sha512_reader(mut reader: impl Read) -> Result<String> {
     let mut hasher = Sha512::new();
     // 64 KiB on the heap keeps the stack frame small for release targets.
     let mut buffer = vec![0u8; 64 * 1024];
@@ -214,31 +365,78 @@ pub fn sha512_hex(bytes: &[u8]) -> String {
     hex_lower(&hasher.finalize())
 }
 
-/// Download one URL into `path`, streaming bytes to disk.
-fn download_one(client: &reqwest::blocking::Client, url: &str, path: &Path) -> Result<()> {
+/// Download one URL to a private temporary file, authenticate the exact open
+/// file, atomically publish a cache copy, and return the authenticated bytes.
+fn download_one(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    dir: &Path,
+    destination: &Path,
+    expected_hash: &str,
+    expected_size: Option<u64>,
+    max_size: u64,
+) -> Result<VerifiedCrx> {
     let mut response = client
         .get(url)
         .send()
-        .map_err(|e| Error::network(format!("GET {url} failed")).with_source(e))?;
+        .map_err(|error| Error::network(format!("GET {url} failed")).with_source(error))?;
     if !response.status().is_success() {
         return Err(Error::network(format!(
             "GET {url} returned HTTP {}",
             response.status()
         )));
     }
-    let mut file = File::create(path).map_err(Error::from)?;
-    let mut buf = vec![0u8; 64 * 1024];
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > max_size)
+    {
+        return Err(Error::hash_mismatch(format!(
+            "GET {url} declared a {max_size}-byte limit violation"
+        )));
+    }
+
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".silvervine-download-")
+        .tempfile_in(dir)
+        .map_err(Error::from)?;
+    let mut total = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
-        let n = response
-            .read(&mut buf)
-            .map_err(|e| Error::network(format!("read body from {url}")).with_source(e))?;
-        if n == 0 {
+        let read = response
+            .read(&mut buffer)
+            .map_err(|error| Error::network(format!("read body from {url}")).with_source(error))?;
+        if read == 0 {
             break;
         }
-        file.write_all(&buf[..n]).map_err(Error::from)?;
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| Error::hash_mismatch("downloaded CRX size overflowed"))?;
+        if total > max_size {
+            return Err(Error::hash_mismatch(format!(
+                "GET {url} exceeded the {max_size} byte CRX limit"
+            )));
+        }
+        temporary
+            .as_file_mut()
+            .write_all(&buffer[..read])
+            .map_err(Error::from)?;
     }
-    file.flush().map_err(Error::from)?;
-    Ok(())
+    temporary.as_file_mut().flush().map_err(Error::from)?;
+
+    let bytes = read_verified_file(
+        temporary.as_file_mut(),
+        destination,
+        expected_hash,
+        expected_size,
+        max_size,
+    )?;
+    temporary
+        .persist(destination)
+        .map_err(|error| Error::from(error.error))?;
+    Ok(VerifiedCrx {
+        path: destination.to_path_buf(),
+        bytes,
+    })
 }
 
 /// Constant-time hex comparison.
@@ -404,6 +602,73 @@ mod tests {
     }
 
     #[test]
+    fn verified_download_keeps_the_authenticated_bytes_after_path_replacement() {
+        let body = vec![7u8; 32];
+        let entry = PlatformEntry::Concrete {
+            file_url: spawn_stub(body.clone()).0,
+            mirror_urls: vec![],
+            filesize: Some(body.len() as u64),
+            hash_value: sha512_hex(&body),
+        };
+        let tmp = TempDir::new().expect("tempdir");
+        let verified =
+            download_verified(&entry, &tmp.path().join("downloads")).expect("verified download");
+
+        std::fs::write(verified.path(), b"attacker replacement").expect("replace cached path");
+
+        assert_eq!(verified.bytes(), body);
+    }
+
+    #[test]
+    fn verified_download_rejects_oversized_manifest_entry_before_network() {
+        let entry = PlatformEntry::Concrete {
+            file_url: "http://127.0.0.1:1/not-requested".into(),
+            mirror_urls: vec![],
+            filesize: Some(MAX_CRX_BYTES + 1),
+            hash_value: "0".repeat(128),
+        };
+        let tmp = TempDir::new().expect("tempdir");
+
+        let error = download_verified(&entry, tmp.path())
+            .expect_err("oversized CRX must be rejected before download");
+
+        assert_eq!(error.category, crate::ErrorCategory::HashMismatch);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_download_replaces_a_preseeded_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let body = vec![11_u8; 32];
+        let expected_hash = sha512_hex(&body);
+        let (url, attempts) = spawn_stub(body.clone());
+        let entry = PlatformEntry::Concrete {
+            file_url: url,
+            mirror_urls: vec![],
+            filesize: Some(body.len() as u64),
+            hash_value: expected_hash.clone(),
+        };
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("downloads");
+        std::fs::create_dir_all(&dir).expect("download dir");
+        let outside = tmp.path().join("outside.crx3");
+        std::fs::write(&outside, &body).expect("outside file");
+        let cached_path = dir.join(format!("{}.crx3", &expected_hash[..16]));
+        symlink(&outside, &cached_path).expect("preseed symlink");
+
+        let verified = download_verified(&entry, &dir).expect("verified download");
+
+        assert_eq!(verified.bytes(), body);
+        assert!(attempts.load(Ordering::SeqCst) >= 1);
+        assert!(!std::fs::symlink_metadata(verified.path())
+            .expect("cached metadata")
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(outside).expect("outside content"), body);
+    }
+
+    #[test]
     fn download_to_falls_through_to_mirror_on_first_url_failure() {
         let body = vec![42u8; 64];
         let expected = sha512_hex(&body);
@@ -488,6 +753,21 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let err = download_to(&entry, tmp.path()).expect_err("short hash");
         assert_eq!(err.category, crate::ErrorCategory::HashMismatch);
+    }
+
+    #[test]
+    fn download_to_rejects_non_hex_hash_before_path_resolution() {
+        let entry = PlatformEntry::Concrete {
+            file_url: "http://127.0.0.1:1/not-requested".into(),
+            mirror_urls: vec![],
+            filesize: None,
+            hash_value: format!("../outside{}", "0".repeat(118)),
+        };
+        let tmp = TempDir::new().expect("tempdir");
+
+        let error = download_to(&entry, tmp.path()).expect_err("non-hex hash");
+
+        assert_eq!(error.category, crate::ErrorCategory::HashMismatch);
     }
 
     /// `download_to_cache` (the public default-path variant) doesn't panic;

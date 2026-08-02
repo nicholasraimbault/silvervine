@@ -1,6 +1,6 @@
 //! Passive, local-only browser, CDM, codec, and graphics diagnostics.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
 
-use crate::browsers::{runtime, Browser, BrowserKind};
+use crate::browsers::{runtime, Browser};
 use crate::diagnostics::binary::{self, BinaryArchitecture, BinaryFormat};
 #[cfg(target_os = "linux")]
 use crate::diagnostics::linux;
@@ -19,10 +19,8 @@ use crate::diagnostics::{DiagnosticCheck, DiagnosticStatus, EvidenceSource, Fail
 use crate::error::{Error, Result};
 use crate::patch;
 use crate::widevine::download::sha512_file_hex;
-use crate::widevine::ownership::{
-    self, OwnershipAssessment, OwnershipKind, MANAGED_MARKER_FILENAME,
-};
-use crate::widevine::{current_cdm, CachedCdm};
+use crate::widevine::ownership::{self, OwnershipAssessment, OwnershipKind};
+use crate::widevine::CachedCdm;
 
 /// Origin of an external/component CDM hint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,8 +84,26 @@ pub struct BrowserDiagnostics {
 /// its processes, dumping profiles, or making network requests.
 #[must_use]
 pub fn collect_browser(browser: &Browser) -> BrowserDiagnostics {
-    let candidate = current_cdm().ok().flatten();
-    collect_browser_with_candidate(browser, candidate.as_ref())
+    match crate::widevine::cache::validated_current_readonly() {
+        Ok(candidate) => collect_browser_with_candidate(browser, candidate.as_ref()),
+        Err(error) => {
+            let mut diagnostics = collect_browser_with_candidate(browser, None);
+            diagnostics.fingerprint = None;
+            diagnostics.checks.push(DiagnosticCheck {
+                id: "cdm.cache".into(),
+                status: DiagnosticStatus::Warn,
+                source: EvidenceSource::HostProbe,
+                failure_domain: FailureDomain::Silvervine,
+                summary: "The current Silvervine CDM cache failed integrity validation.".into(),
+                action: Some("Run `silvervine update widevine`, then retry.".into()),
+                details: BTreeMap::from([
+                    ("error_category".into(), error.category.as_str().into()),
+                    ("error".into(), error.message),
+                ]),
+            });
+            diagnostics
+        }
+    }
 }
 
 /// Collect passive browser evidence using an explicit cached CDM candidate.
@@ -130,7 +146,7 @@ fn collect_browser_at(
     #[cfg(target_os = "linux")]
     if cdm.ownership.kind == OwnershipKind::Managed {
         if let Some(library) = cdm.library.as_ref() {
-            checks.push(linux::collect_verified_library_deps(library));
+            checks.push(linux::collect_library_dependency_limit(library));
         }
     }
     #[cfg(target_os = "macos")]
@@ -138,16 +154,23 @@ fn collect_browser_at(
         checks.push(macos::codesign_check(browser.install_path()));
     }
 
-    let fingerprint = browser_executable.as_ref().and_then(|path| {
-        let mut entries = Vec::new();
-        if let Some(entry) = cdm.fingerprint_entry.clone() {
-            entries.push(entry);
-        }
-        for hint in &external.hints {
-            entries.push(hint_to_fingerprint_entry(hint));
-        }
-        ProbeFingerprint::from_executable(path, browser_version.clone(), entries).ok()
-    });
+    let fingerprint = if external.profile_scope_complete {
+        browser_executable.as_ref().and_then(|path| {
+            let mut entries = Vec::new();
+            if let Some(entry) = cdm.fingerprint_entry.clone() {
+                entries.push(entry);
+            }
+            for hint in &external.hints {
+                entries.push(hint_to_fingerprint_entry(hint));
+            }
+            // Do not discard undigested hints here. `from_executable` deliberately
+            // refuses the entire cache key when any relevant CDM identity cannot
+            // be bound to bytes; omitting that hint would make stale evidence look exact.
+            ProbeFingerprint::from_executable(path, browser_version.clone(), entries).ok()
+        })
+    } else {
+        None
+    };
 
     BrowserDiagnostics {
         browser: browser.name().into(),
@@ -317,7 +340,12 @@ fn classify_passive(
     target: &Path,
     candidate: Option<&CachedCdm>,
 ) -> OwnershipAssessment {
-    match candidate {
+    // Unverified cache handles (metadata/drift-only) must not participate in
+    // marker construction or ownership classification.
+    let verified_candidate = candidate.filter(|cdm| {
+        cdm.verified_library_sha512().is_some() && cdm.verified_manifest_sha512().is_some()
+    });
+    match verified_candidate {
         Some(candidate) => match ownership::marker_for_cached(candidate) {
             Ok(marker) => {
                 ownership::classify(browser, target, candidate, &marker).unwrap_or_else(|error| {
@@ -335,132 +363,39 @@ fn classify_passive(
                 }
                 })
             }
-            Err(error) => OwnershipAssessment {
+            Err(_) => {
+                // marker_for_cached refuses unverified/drifted handles. Treat as
+                // no authenticated candidate rather than InvalidMarker noise.
+                ownership::classify_without_candidate(browser, target).unwrap_or_else(|error| {
+                    OwnershipAssessment {
+                        kind: OwnershipKind::InvalidMarker,
+                        summary: "The CDM target could not be classified safely.".into(),
+                        action: Some(
+                            "Inspect the browser CDM path and retry `silvervine doctor --media-stack`."
+                                .into(),
+                        ),
+                        details: BTreeMap::from([
+                            ("error_category".into(), error.category.as_str().into()),
+                            ("error".into(), error.message),
+                        ]),
+                    }
+                })
+            }
+        },
+        None => ownership::classify_without_candidate(browser, target).unwrap_or_else(|error| {
+            OwnershipAssessment {
                 kind: OwnershipKind::InvalidMarker,
-                summary: "The cached Silvervine CDM candidate is not usable for classification."
-                    .into(),
-                action: Some("Run `silvervine update widevine`, then retry.".into()),
+                summary: "The CDM target could not be classified safely.".into(),
+                action: Some(
+                    "Inspect the browser CDM path and retry `silvervine doctor --media-stack`."
+                        .into(),
+                ),
                 details: BTreeMap::from([
                     ("error_category".into(), error.category.as_str().into()),
                     ("error".into(), error.message),
                 ]),
-            },
-        },
-        None => classify_without_candidate(browser, target),
-    }
-}
-
-fn classify_without_candidate(browser: &Browser, target: &Path) -> OwnershipAssessment {
-    let metadata = match fs::symlink_metadata(target) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return OwnershipAssessment {
-                kind: OwnershipKind::Missing,
-                summary: "No Widevine CDM is installed at the patch target.".into(),
-                action: Some("Run `silvervine setup` or `silvervine patch`.".into()),
-                details: BTreeMap::new(),
-            };
-        }
-        Err(error) => {
-            return OwnershipAssessment {
-                kind: OwnershipKind::InvalidMarker,
-                summary: "The CDM target could not be inspected.".into(),
-                action: Some("Inspect filesystem permissions on the browser CDM path.".into()),
-                details: BTreeMap::from([("error".into(), error.to_string())]),
-            };
-        }
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return OwnershipAssessment {
-            kind: OwnershipKind::InvalidMarker,
-            summary: "The existing CDM root is not a regular directory.".into(),
-            action: Some(
-                "Remove the unsafe CDM path only after verifying ownership, then retry.".into(),
-            ),
-            details: BTreeMap::new(),
-        };
-    }
-
-    classify_existing_target_without_candidate(browser, target)
-}
-
-fn classify_existing_target_without_candidate(
-    browser: &Browser,
-    target: &Path,
-) -> OwnershipAssessment {
-    let marker = target.join(MANAGED_MARKER_FILENAME);
-    match fs::symlink_metadata(&marker) {
-        Ok(_) => classify_installed_marker(target),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            classify_unmarked_target(browser, target)
-        }
-        Err(error) => OwnershipAssessment {
-            kind: OwnershipKind::InvalidMarker,
-            summary: "The ownership marker could not be inspected.".into(),
-            action: Some("Inspect filesystem permissions on the browser CDM path.".into()),
-            details: BTreeMap::from([("error".into(), error.to_string())]),
-        },
-    }
-}
-
-fn classify_installed_marker(target: &Path) -> OwnershipAssessment {
-    match ownership::validate_installed_marker(target) {
-        Ok(installed) => OwnershipAssessment {
-            kind: OwnershipKind::Managed,
-            summary: "The installed CDM has valid Silvervine provenance.".into(),
-            action: None,
-            details: BTreeMap::from([
-                ("cdm_version".into(), installed.cdm_version),
-                ("platform".into(), installed.platform),
-                ("library_sha512".into(), installed.library_sha512),
-                ("silvervine_version".into(), installed.silvervine_version),
-            ]),
-        },
-        Err(error) => OwnershipAssessment {
-            kind: OwnershipKind::InvalidMarker,
-            summary: "The Silvervine ownership marker is invalid; the CDM was preserved.".into(),
-            action: Some(
-                "Remove the stale marker only after verifying CDM ownership, then run Silvervine again."
-                    .into(),
-            ),
-            details: BTreeMap::from([("reason".into(), error.message)]),
-        },
-    }
-}
-
-fn classify_unmarked_target(browser: &Browser, target: &Path) -> OwnershipAssessment {
-    // Without a candidate payload, diagnostics cannot prove the exact-match
-    // condition required by ownership::classify. Every unmarked target remains
-    // external and preserved, even for a known browser.
-    let identity = inspect_cdm_identity(target);
-    let browser_kind = match browser.kind {
-        BrowserKind::Known => "known",
-        BrowserKind::Detected => "detected",
-        BrowserKind::Custom => "custom",
-    };
-    let mut details = BTreeMap::from([("browser_kind".into(), browser_kind.into())]);
-    if let Some(version) = &identity.version {
-        details.insert("cdm_version".into(), version.clone());
-    }
-    if let Some(digest) = &identity.library_sha512 {
-        details.insert("library_sha512".into(), digest.clone());
-    }
-
-    let valid_layout = identity.version.is_some() && identity.library.is_some();
-
-    let summary = if valid_layout {
-        "The unmarked CDM may be managed by the browser, platform, or user."
-    } else {
-        "The unmarked CDM does not match a safe Silvervine layout."
-    };
-    OwnershipAssessment {
-        kind: OwnershipKind::External,
-        summary: summary.into(),
-        action: Some(format!(
-            "Preserved existing CDM. Re-run `silvervine patch --browser \"{}\" --replace-external-cdm` to replace it explicitly.",
-            browser.name()
-        )),
-        details,
+            }
+        }),
     }
 }
 
@@ -613,89 +548,580 @@ fn is_contained(root: &Path, candidate: &Path) -> bool {
 struct ExternalEvidence {
     hints: Vec<ExternalCdmHint>,
     checks: Vec<DiagnosticCheck>,
+    profile_scope_complete: bool,
 }
 
+/// Maximum normal profile directories inspected under one user-data root.
+const MAX_PROFILES_PER_USER_DATA_ROOT: usize = 16;
+/// Maximum directory entries examined while discovering profile folders.
+const MAX_USER_DATA_DIR_ENTRIES: usize = 64;
+/// Maximum `profile.info_cache` entries accepted from Local State.
+const MAX_LOCAL_STATE_PROFILE_ENTRIES: usize = 16;
+/// Local State / Preferences size cap for bounded metadata reads.
+const MAX_PROFILE_METADATA_BYTES: u64 = 1024 * 1024;
+
 fn collect_external_cdms(browser: &Browser, profile_roots: Option<&[PathBuf]>) -> ExternalEvidence {
-    let roots = match profile_roots {
-        Some(roots) => roots.to_vec(),
-        None => default_profile_roots(browser),
+    let (roots, mut profile_scope_complete) = match profile_roots {
+        // Explicit roots (including empty) are a deliberate test/production seam:
+        // completeness still depends on successful bounded inspection of each root.
+        Some(roots) => (roots.to_vec(), true),
+        None => match default_profile_roots(browser) {
+            Some(roots) => (roots, true),
+            None => (Vec::new(), false),
+        },
     };
     let mut hints = Vec::new();
-    let mut checks = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen = BTreeSet::new();
 
     for root in roots {
-        if !root.is_dir() {
-            continue;
-        }
-        // Profile WidevineCdm (direct or Default/ profile).
-        for candidate in [
-            root.join("WidevineCdm"),
-            root.join("Default").join("WidevineCdm"),
-        ] {
-            if let Some(hint) =
-                inspect_external_hint(&root, &candidate, ExternalCdmOrigin::ProfileWidevineCdm)
-            {
-                let key = hint.path.display().to_string();
-                if seen.insert(key) {
-                    hints.push(hint);
-                }
+        match collect_from_user_data_root(&root) {
+            UserDataCollection::Missing => {}
+            UserDataCollection::Incomplete { hints: root_hints } => {
+                profile_scope_complete = false;
+                merge_external_hints(&mut hints, &mut seen, root_hints);
             }
-        }
-
-        // Bounded reads of Local State / Preferences for
-        // latest-component-updated-widevine-cdm (no recursive profile dump).
-        for relative in [
-            Path::new("Local State"),
-            Path::new("Preferences"),
-            Path::new("Default/Preferences"),
-        ] {
-            let prefs = root.join(relative);
-            if let Some(paths) = read_latest_component_widevine_paths(&root, &prefs) {
-                for path in paths {
-                    if let Some(hint) =
-                        inspect_external_hint(&root, &path, ExternalCdmOrigin::ComponentUpdater)
-                    {
-                        let key = hint.path.display().to_string();
-                        if seen.insert(key) {
-                            hints.push(hint);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Known component location under the profile.
-        let component_dir = root
-            .join("Default")
-            .join("WidevineCdm")
-            .join("_platform_specific");
-        if component_dir.is_dir() {
-            if let Some(hint) = inspect_external_hint(
-                &root,
-                &root.join("Default").join("WidevineCdm"),
-                ExternalCdmOrigin::KnownComponentLocation,
-            ) {
-                let key = hint.path.display().to_string();
-                if seen.insert(key) {
-                    hints.push(hint);
-                }
+            UserDataCollection::Complete { hints: root_hints } => {
+                merge_external_hints(&mut hints, &mut seen, root_hints);
             }
         }
     }
 
+    let checks = external_checks(&hints, profile_scope_complete);
+
+    ExternalEvidence {
+        hints,
+        checks,
+        profile_scope_complete,
+    }
+}
+
+enum UserDataCollection {
+    /// User-data root is absent; alternate install locations may legitimately miss.
+    Missing,
+    Complete {
+        hints: Vec<ExternalCdmHint>,
+    },
+    Incomplete {
+        hints: Vec<ExternalCdmHint>,
+    },
+}
+
+fn merge_external_hints(
+    hints: &mut Vec<ExternalCdmHint>,
+    seen: &mut BTreeSet<String>,
+    incoming: Vec<ExternalCdmHint>,
+) {
+    for hint in incoming {
+        push_unique_hint(hints, seen, hint);
+    }
+}
+
+fn canonical_user_data_root(root: &Path) -> std::result::Result<Option<PathBuf>, ()> {
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(());
+    }
+    fs::canonicalize(root).map(Some).map_err(|_| ())
+}
+
+fn collect_from_user_data_root(root: &Path) -> UserDataCollection {
+    let canonical_root = match canonical_user_data_root(root) {
+        Ok(Some(root)) => root,
+        Ok(None) => return UserDataCollection::Missing,
+        Err(()) => return UserDataCollection::Incomplete { hints: Vec::new() },
+    };
+
+    let mut complete = true;
+    let mut hints = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    // Root-level evidence (component caches occasionally live beside profiles).
+    if !collect_profile_dir_evidence(&canonical_root, &canonical_root, &mut hints, &mut seen) {
+        complete = false;
+    }
+
+    let local_state_path = canonical_root.join("Local State");
+    let mut named_profiles: BTreeSet<String> = BTreeSet::new();
+    let mut required_profiles: BTreeSet<String> = BTreeSet::new();
+
+    match read_bounded_metadata_file(&canonical_root, &local_state_path) {
+        MetadataFile::Absent => {}
+        MetadataFile::Invalid => complete = false,
+        MetadataFile::Present(bytes) => match parse_local_state_profiles(&bytes) {
+            LocalStateProfiles::Invalid => complete = false,
+            LocalStateProfiles::Parsed(profiles) => {
+                if profiles.truncated {
+                    complete = false;
+                }
+                for name in &profiles.names {
+                    named_profiles.insert(name.clone());
+                    required_profiles.insert(name.clone());
+                }
+                if let Some(last_used) = profiles.last_used.as_ref() {
+                    if is_plausible_profile_dir_name(last_used) {
+                        named_profiles.insert(last_used.clone());
+                        required_profiles.insert(last_used.clone());
+                    } else {
+                        complete = false;
+                    }
+                }
+                for name in &profiles.last_active {
+                    if is_plausible_profile_dir_name(name) {
+                        named_profiles.insert(name.clone());
+                        required_profiles.insert(name.clone());
+                    } else {
+                        complete = false;
+                    }
+                }
+                match collect_component_hints_from_metadata(
+                    &canonical_root,
+                    &bytes,
+                    &mut hints,
+                    &mut seen,
+                ) {
+                    MetadataComponentRead::Ok => {}
+                    MetadataComponentRead::Invalid => complete = false,
+                }
+            }
+        },
+    }
+
+    match scan_normal_profile_dir_names(&canonical_root) {
+        ProfileDirScan::Failed => complete = false,
+        ProfileDirScan::Scanned {
+            names: dir_names,
+            truncated,
+        } => {
+            if truncated {
+                complete = false;
+            }
+            named_profiles.extend(dir_names);
+        }
+    }
+
+    // Always consider Default when present so single-profile installs stay complete
+    // even without Local State profile metadata.
+    if canonical_root.join("Default").is_dir() {
+        named_profiles.insert("Default".into());
+    }
+
+    for name in named_profiles {
+        match inspect_named_profile(&canonical_root, &name, &mut hints, &mut seen) {
+            ProfileInspect::Collected => {}
+            ProfileInspect::Missing => {
+                if required_profiles.contains(&name) {
+                    complete = false;
+                }
+            }
+            ProfileInspect::Failed => complete = false,
+        }
+    }
+
+    let root_preferences = canonical_root.join("Preferences");
+    match read_and_collect_component_hints(
+        &canonical_root,
+        &root_preferences,
+        &mut hints,
+        &mut seen,
+    ) {
+        MetadataComponentRead::Ok => {}
+        MetadataComponentRead::Invalid => complete = false,
+    }
+
+    if complete {
+        UserDataCollection::Complete { hints }
+    } else {
+        UserDataCollection::Incomplete { hints }
+    }
+}
+
+struct LocalStateProfileSet {
+    names: BTreeSet<String>,
+    last_used: Option<String>,
+    last_active: Vec<String>,
+    truncated: bool,
+}
+
+enum LocalStateProfiles {
+    Invalid,
+    Parsed(LocalStateProfileSet),
+}
+
+fn parse_local_state_profiles(bytes: &[u8]) -> LocalStateProfiles {
+    let value: serde_json::Value = match serde_json::from_slice(bytes) {
+        Ok(value) => value,
+        Err(_) => return LocalStateProfiles::Invalid,
+    };
+    let Some(profile) = value.get("profile") else {
+        // Brand-new or minimal Local State may omit profile metadata; directory
+        // inspection remains authoritative for Default / Profile N.
+        return LocalStateProfiles::Parsed(LocalStateProfileSet {
+            names: BTreeSet::new(),
+            last_used: None,
+            last_active: Vec::new(),
+            truncated: false,
+        });
+    };
+    if !profile.is_object() {
+        return LocalStateProfiles::Invalid;
+    }
+
+    let mut names = BTreeSet::new();
+    let mut truncated = false;
+    if let Some(info_cache) = profile.get("info_cache") {
+        let Some(map) = info_cache.as_object() else {
+            return LocalStateProfiles::Invalid;
+        };
+        for (idx, key) in map.keys().enumerate() {
+            if idx >= MAX_LOCAL_STATE_PROFILE_ENTRIES {
+                truncated = true;
+                break;
+            }
+            if !is_plausible_profile_dir_name(key) {
+                return LocalStateProfiles::Invalid;
+            }
+            names.insert(key.clone());
+        }
+        if map.len() > MAX_LOCAL_STATE_PROFILE_ENTRIES {
+            truncated = true;
+        }
+    }
+
+    let last_used = match profile.get("last_used") {
+        None => None,
+        Some(serde_json::Value::String(name)) => {
+            let name = name.trim();
+            if name.is_empty() || name.len() > 64 {
+                return LocalStateProfiles::Invalid;
+            }
+            Some(name.to_owned())
+        }
+        Some(_) => return LocalStateProfiles::Invalid,
+    };
+
+    let mut last_active = Vec::new();
+    if let Some(active) = profile.get("last_active_profiles") {
+        let Some(items) = active.as_array() else {
+            return LocalStateProfiles::Invalid;
+        };
+        for (idx, item) in items.iter().enumerate() {
+            if idx >= MAX_LOCAL_STATE_PROFILE_ENTRIES {
+                truncated = true;
+                break;
+            }
+            match item.as_str().map(str::trim) {
+                Some(name) if !name.is_empty() && name.len() <= 64 => {
+                    last_active.push(name.to_owned());
+                }
+                _ => return LocalStateProfiles::Invalid,
+            }
+        }
+        if items.len() > MAX_LOCAL_STATE_PROFILE_ENTRIES {
+            truncated = true;
+        }
+    }
+
+    LocalStateProfiles::Parsed(LocalStateProfileSet {
+        names,
+        last_used,
+        last_active,
+        truncated,
+    })
+}
+
+enum ProfileDirScan {
+    Failed,
+    Scanned {
+        names: BTreeSet<String>,
+        truncated: bool,
+    },
+}
+
+fn scan_normal_profile_dir_names(root: &Path) -> ProfileDirScan {
+    let Ok(entries) = fs::read_dir(root) else {
+        return ProfileDirScan::Failed;
+    };
+    let mut names = BTreeSet::new();
+    let mut examined = 0_usize;
+    let mut truncated = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return ProfileDirScan::Failed;
+        };
+        examined += 1;
+        if examined > MAX_USER_DATA_DIR_ENTRIES {
+            truncated = true;
+            break;
+        }
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        if !is_plausible_profile_dir_name(name) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            return ProfileDirScan::Failed;
+        };
+        if metadata.file_type().is_symlink() {
+            // Profile directory symlinks are not followed; presence makes scope incomplete.
+            truncated = true;
+            continue;
+        }
+        if metadata.is_dir() {
+            if names.len() >= MAX_PROFILES_PER_USER_DATA_ROOT {
+                truncated = true;
+                break;
+            }
+            names.insert(name.to_owned());
+        }
+    }
+    ProfileDirScan::Scanned { names, truncated }
+}
+
+fn is_plausible_profile_dir_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 || name.contains('/') || name.contains('\\') {
+        return false;
+    }
+    if name == "Default" || name == "Guest Profile" || name == "System Profile" {
+        return true;
+    }
+    let Some(suffix) = name.strip_prefix("Profile ") else {
+        return false;
+    };
+    !suffix.is_empty() && suffix.len() <= 8 && suffix.chars().all(|c| c.is_ascii_digit())
+}
+
+enum ProfileInspect {
+    Collected,
+    Missing,
+    Failed,
+}
+
+fn inspect_named_profile(
+    user_data_root: &Path,
+    name: &str,
+    hints: &mut Vec<ExternalCdmHint>,
+    seen: &mut BTreeSet<String>,
+) -> ProfileInspect {
+    let profile_dir = user_data_root.join(name);
+    let metadata = match fs::symlink_metadata(&profile_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ProfileInspect::Missing;
+        }
+        Err(_) => return ProfileInspect::Failed,
+    };
+    if metadata.file_type().is_symlink() {
+        return ProfileInspect::Failed;
+    }
+    if !metadata.is_dir() {
+        return ProfileInspect::Failed;
+    }
+    let Ok(canonical_profile) = fs::canonicalize(&profile_dir) else {
+        return ProfileInspect::Failed;
+    };
+    if !canonical_profile.starts_with(user_data_root) {
+        return ProfileInspect::Failed;
+    }
+
+    if !collect_profile_dir_evidence(user_data_root, &canonical_profile, hints, seen) {
+        return ProfileInspect::Failed;
+    }
+
+    let prefs = canonical_profile.join("Preferences");
+    match read_and_collect_component_hints(user_data_root, &prefs, hints, seen) {
+        MetadataComponentRead::Ok => ProfileInspect::Collected,
+        MetadataComponentRead::Invalid => ProfileInspect::Failed,
+    }
+}
+
+fn collect_profile_dir_evidence(
+    containment_root: &Path,
+    profile_dir: &Path,
+    hints: &mut Vec<ExternalCdmHint>,
+    seen: &mut BTreeSet<String>,
+) -> bool {
+    let widevine = profile_dir.join("WidevineCdm");
+    let metadata = match fs::symlink_metadata(&widevine) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
+        return false;
+    }
+
+    let Some(hint) = inspect_external_hint(
+        containment_root,
+        &widevine,
+        ExternalCdmOrigin::ProfileWidevineCdm,
+    ) else {
+        return false;
+    };
+    push_unique_hint(hints, seen, hint);
+    true
+}
+
+fn push_unique_hint(
+    hints: &mut Vec<ExternalCdmHint>,
+    seen: &mut BTreeSet<String>,
+    hint: ExternalCdmHint,
+) {
+    let key = canonicalize_path(&hint.path).map_or_else(
+        |_| hint.path.display().to_string(),
+        |path| path.display().to_string(),
+    );
+    if seen.insert(key) {
+        hints.push(hint);
+    }
+}
+
+enum MetadataFile {
+    Absent,
+    Invalid,
+    Present(Vec<u8>),
+}
+
+fn read_bounded_metadata_file(containment_root: &Path, path: &Path) -> MetadataFile {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return MetadataFile::Absent,
+        Err(_) => return MetadataFile::Invalid,
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_PROFILE_METADATA_BYTES
+        || !is_contained(containment_root, path)
+    {
+        return MetadataFile::Invalid;
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let Ok(mut file) = options.open(path) else {
+        return MetadataFile::Invalid;
+    };
+    let Ok(opened) = file.metadata() else {
+        return MetadataFile::Invalid;
+    };
+    if !opened.is_file() || opened.len() > MAX_PROFILE_METADATA_BYTES {
+        return MetadataFile::Invalid;
+    }
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(opened.len())
+            .unwrap_or(0)
+            .min(usize::try_from(MAX_PROFILE_METADATA_BYTES).unwrap_or(usize::MAX)),
+    );
+    if (&mut file)
+        .take(MAX_PROFILE_METADATA_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > MAX_PROFILE_METADATA_BYTES
+    {
+        return MetadataFile::Invalid;
+    }
+    MetadataFile::Present(bytes)
+}
+
+enum MetadataComponentRead {
+    Ok,
+    Invalid,
+}
+
+fn read_and_collect_component_hints(
+    containment_root: &Path,
+    prefs_path: &Path,
+    hints: &mut Vec<ExternalCdmHint>,
+    seen: &mut BTreeSet<String>,
+) -> MetadataComponentRead {
+    match read_bounded_metadata_file(containment_root, prefs_path) {
+        MetadataFile::Absent => MetadataComponentRead::Ok,
+        MetadataFile::Invalid => MetadataComponentRead::Invalid,
+        MetadataFile::Present(bytes) => {
+            collect_component_hints_from_metadata(containment_root, &bytes, hints, seen)
+        }
+    }
+}
+
+fn collect_component_hints_from_metadata(
+    containment_root: &Path,
+    bytes: &[u8],
+    hints: &mut Vec<ExternalCdmHint>,
+    seen: &mut BTreeSet<String>,
+) -> MetadataComponentRead {
+    let value: serde_json::Value = match serde_json::from_slice(bytes) {
+        Ok(value) => value,
+        Err(_) => return MetadataComponentRead::Invalid,
+    };
+    let mut paths = Vec::new();
+    let mut complete = collect_component_paths_from_json(&value, containment_root, &mut paths, 0);
+    for path in paths {
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+            Ok(_) => {}
+        }
+        if let Some(hint) =
+            inspect_external_hint(containment_root, &path, ExternalCdmOrigin::ComponentUpdater)
+        {
+            push_unique_hint(hints, seen, hint);
+        } else {
+            complete = false;
+        }
+    }
+    if complete {
+        MetadataComponentRead::Ok
+    } else {
+        MetadataComponentRead::Invalid
+    }
+}
+
+fn external_checks(
+    hints: &[ExternalCdmHint],
+    profile_scope_complete: bool,
+) -> Vec<DiagnosticCheck> {
     if hints.is_empty() {
-        checks.push(DiagnosticCheck {
+        let (summary, details) = if profile_scope_complete {
+            (
+                "No external profile/component Widevine CDM hints were found.".into(),
+                BTreeMap::new(),
+            )
+        } else {
+            (
+                "External profile/component roots are unknown for this browser; persistent probe caching is disabled."
+                    .into(),
+                BTreeMap::from([("profile_scope_complete".into(), "false".into())]),
+            )
+        };
+        return vec![DiagnosticCheck {
             id: "cdm.external_components".into(),
             status: DiagnosticStatus::Unavailable,
             source: EvidenceSource::HostProbe,
             failure_domain: FailureDomain::BrowserMediaStack,
-            summary: "No external profile/component Widevine CDM hints were found.".into(),
+            summary,
             action: None,
-            details: BTreeMap::new(),
-        });
-    } else {
-        for hint in &hints {
+            details,
+        }];
+    }
+
+    hints
+        .iter()
+        .map(|hint| {
             let mut details = BTreeMap::from([
                 ("path".into(), hint.path.display().to_string()),
                 ("origin".into(), external_origin_name(hint.origin).into()),
@@ -706,7 +1132,7 @@ fn collect_external_cdms(browser: &Browser, profile_roots: Option<&[PathBuf]>) -
             if let Some(digest) = &hint.library_sha512 {
                 details.insert("library_sha512".into(), digest.clone());
             }
-            checks.push(DiagnosticCheck {
+            DiagnosticCheck {
                 id: "cdm.external_components".into(),
                 status: DiagnosticStatus::Pass,
                 source: EvidenceSource::HostProbe,
@@ -720,11 +1146,9 @@ fn collect_external_cdms(browser: &Browser, profile_roots: Option<&[PathBuf]>) -
                         .into(),
                 ),
                 details,
-            });
-        }
-    }
-
-    ExternalEvidence { hints, checks }
+            }
+        })
+        .collect()
 }
 
 fn external_origin_name(origin: ExternalCdmOrigin) -> &'static str {
@@ -793,58 +1217,42 @@ fn inspect_external_hint(
     None
 }
 
-fn read_latest_component_widevine_paths(
-    profile_root: &Path,
-    prefs_path: &Path,
-) -> Option<Vec<PathBuf>> {
-    let metadata = fs::symlink_metadata(prefs_path).ok()?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 1024 * 1024 {
-        return None;
-    }
-    if !is_contained(profile_root, prefs_path) {
-        return None;
-    }
-    let bytes = fs::read(prefs_path).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let mut paths = Vec::new();
-    collect_component_paths_from_json(&value, profile_root, &mut paths, 0);
-    (!paths.is_empty()).then_some(paths)
-}
-
 fn collect_component_paths_from_json(
     value: &serde_json::Value,
     profile_root: &Path,
     out: &mut Vec<PathBuf>,
     depth: usize,
-) {
+) -> bool {
     if depth > 8 || out.len() >= 8 {
-        return;
+        return false;
     }
     match value {
         serde_json::Value::Object(map) => {
+            let mut complete = true;
             for (key, child) in map {
                 let key_l = key.to_ascii_lowercase();
-                if key_l.contains("latest-component-updated-widevine-cdm")
-                    || key_l == "latest-component-updated-widevine-cdm"
-                    || (key_l.contains("widevine") && key_l.contains("component"))
+                if (key_l.contains("latest-component-updated-widevine-cdm")
+                    || (key_l.contains("widevine") && key_l.contains("component")))
+                    && !push_component_path_value(child, profile_root, out)
                 {
-                    push_component_path_value(child, profile_root, out);
+                    complete = false;
                 }
-                collect_component_paths_from_json(child, profile_root, out, depth + 1);
-                if out.len() >= 8 {
-                    return;
+                if !collect_component_paths_from_json(child, profile_root, out, depth + 1) {
+                    complete = false;
                 }
             }
+            complete
         }
         serde_json::Value::Array(items) => {
-            for item in items.iter().take(32) {
-                collect_component_paths_from_json(item, profile_root, out, depth + 1);
-                if out.len() >= 8 {
-                    return;
+            let mut complete = true;
+            for item in items {
+                if !collect_component_paths_from_json(item, profile_root, out, depth + 1) {
+                    complete = false;
                 }
             }
+            complete
         }
-        _ => {}
+        _ => true,
     }
 }
 
@@ -852,16 +1260,16 @@ fn push_component_path_value(
     value: &serde_json::Value,
     profile_root: &Path,
     out: &mut Vec<PathBuf>,
-) {
+) -> bool {
     match value {
         serde_json::Value::String(text) => {
             let trimmed = text.trim();
             if trimmed.is_empty() || trimmed.len() > 512 {
-                return;
+                return true;
             }
             // Ignore pure version tokens.
             if trimmed.chars().all(|c| c.is_ascii_digit() || c == '.') {
-                return;
+                return true;
             }
             let path = if trimmed.starts_with('/')
                 || (trimmed.len() > 2 && trimmed.as_bytes()[1] == b':')
@@ -870,49 +1278,61 @@ fn push_component_path_value(
             } else {
                 profile_root.join(trimmed)
             };
-            if out.len() < 8 {
-                out.push(path);
+            if out.contains(&path) {
+                return true;
             }
+            if out.len() >= 8 {
+                return false;
+            }
+            out.push(path);
+            true
         }
         serde_json::Value::Object(map) => {
+            let mut complete = true;
             for key in ["path", "full_path", "install_full_path", "component_path"] {
                 if let Some(child) = map.get(key) {
-                    push_component_path_value(child, profile_root, out);
+                    complete &= push_component_path_value(child, profile_root, out);
                 }
             }
             // Sometimes the value is just { "version": "x", ... } beside a path sibling;
             // also accept nested path-like strings.
             for (key, child) in map {
-                let key_l = key.to_ascii_lowercase();
-                if key_l.contains("path") {
-                    push_component_path_value(child, profile_root, out);
+                if key.to_ascii_lowercase().contains("path") {
+                    complete &= push_component_path_value(child, profile_root, out);
                 }
             }
+            complete
         }
         serde_json::Value::Array(items) => {
-            for item in items.iter().take(8) {
-                push_component_path_value(item, profile_root, out);
+            let mut complete = true;
+            for item in items {
+                complete &= push_component_path_value(item, profile_root, out);
             }
+            complete
         }
-        _ => {}
+        _ => true,
     }
 }
 
-fn default_profile_roots(browser: &Browser) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    let home = dirs::home_dir();
-    let config = dirs::config_dir();
+fn default_profile_roots(browser: &Browser) -> Option<Vec<PathBuf>> {
+    if browser.kind != crate::browsers::BrowserKind::Known {
+        return None;
+    }
     let name = browser.name().to_ascii_lowercase();
 
     #[cfg(target_os = "linux")]
     {
-        if let Some(config) = config {
-            for suffix in profile_config_suffixes(&name) {
-                roots.push(config.join(suffix));
-            }
+        let config = dirs::config_dir()?;
+        let suffixes = profile_config_suffixes(&name);
+        if suffixes.is_empty() {
+            return None;
         }
-        if let Some(home) = &home {
-            // Snap / flatpak style locations (bounded known roots only).
+        let mut roots = suffixes
+            .into_iter()
+            .map(|suffix| config.join(suffix))
+            .collect::<Vec<_>>();
+        if name == "chromium" {
+            let home = dirs::home_dir()?;
             roots.push(
                 home.join("snap")
                     .join("chromium")
@@ -927,66 +1347,53 @@ fn default_profile_roots(browser: &Browser) -> Vec<PathBuf> {
                     .join("chromium"),
             );
         }
+        Some(roots)
     }
 
     #[cfg(target_os = "macos")]
     {
-        if let Some(home) = home {
-            let support = home.join("Library").join("Application Support");
-            for suffix in profile_support_suffixes(&name) {
-                roots.push(support.join(suffix));
-            }
+        let suffixes = profile_support_suffixes(&name);
+        if suffixes.is_empty() {
+            return None;
         }
+        let support = dirs::home_dir()?
+            .join("Library")
+            .join("Application Support");
+        Some(
+            suffixes
+                .into_iter()
+                .map(|suffix| support.join(suffix))
+                .collect(),
+        )
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (home, config, name);
+        let _ = name;
+        None
     }
-
-    roots
 }
 
 #[cfg(target_os = "linux")]
 fn profile_config_suffixes(name: &str) -> Vec<&'static str> {
-    let mut suffixes = Vec::new();
-    if name.contains("helium") {
-        suffixes.push("helium");
-        suffixes.push("Helium");
+    match name {
+        "helium" => vec!["helium", "Helium"],
+        "thorium" => vec!["thorium", "Thorium"],
+        "ungoogled-chromium" => vec!["ungoogled-chromium"],
+        "chromium" => vec!["chromium"],
+        _ => Vec::new(),
     }
-    if name.contains("thorium") {
-        suffixes.push("thorium");
-        suffixes.push("Thorium");
-    }
-    if name.contains("ungoogled") {
-        suffixes.push("ungoogled-chromium");
-        suffixes.push("chromium");
-    }
-    if name.contains("chromium") || suffixes.is_empty() {
-        suffixes.push("chromium");
-        suffixes.push("google-chrome");
-    }
-    suffixes
 }
 
 #[cfg(target_os = "macos")]
 fn profile_support_suffixes(name: &str) -> Vec<&'static str> {
-    let mut suffixes = Vec::new();
-    if name.contains("helium") {
-        suffixes.push("Helium");
+    match name {
+        "helium" => vec!["Helium"],
+        "thorium" => vec!["Thorium"],
+        "ungoogled-chromium" => vec!["ungoogled-chromium"],
+        "chromium" => vec!["Chromium"],
+        _ => Vec::new(),
     }
-    if name.contains("thorium") {
-        suffixes.push("Thorium");
-    }
-    if name.contains("ungoogled") {
-        suffixes.push("ungoogled-chromium");
-        suffixes.push("Chromium");
-    }
-    if name.contains("chromium") || suffixes.is_empty() {
-        suffixes.push("Chromium");
-        suffixes.push("Google/Chrome");
-    }
-    suffixes
 }
 
 fn hint_to_fingerprint_entry(hint: &ExternalCdmHint) -> CdmFingerprintEntry {
@@ -1200,9 +1607,16 @@ mod tests {
         let target = root.join("WidevineCdm");
         let platform = target.join("_platform_specific").join(test_platform_dir());
         fs::create_dir_all(&platform).expect("platform");
-        fs::write(target.join("manifest.json"), br#"{"version":"4.10.0.0"}"#).expect("manifest");
-        fs::write(platform.join(test_library_name()), test_library_bytes()).expect("library");
-        let cached = CachedCdm::new("4.10.0.0".into(), target.clone());
+        let manifest = br#"{"version":"4.10.0.0"}"#;
+        fs::write(target.join("manifest.json"), manifest).expect("manifest");
+        let library = test_library_bytes();
+        fs::write(platform.join(test_library_name()), &library).expect("library");
+        let cached = CachedCdm::from_verified_payload(
+            "4.10.0.0".into(),
+            target.clone(),
+            crate::widevine::sha512_hex(&library),
+            crate::widevine::sha512_hex(manifest),
+        );
         let marker = marker_for_cached(&cached).expect("marker");
         let digest = marker.library_sha512.clone();
         write_marker(&target, &marker).expect("write marker");
@@ -1302,7 +1716,32 @@ mod tests {
     }
 
     #[test]
-    fn missing_install_root_cdm_still_fingerprints_executable() {
+    fn detected_browser_without_authoritative_profile_roots_has_no_fingerprint() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (target, digest) = managed_cdm(tmp.path());
+
+        let diagnostics = collect_browser_at(
+            &browser(tmp.path(), BrowserKind::Detected),
+            Ok(std::env::current_exe().expect("test executable")),
+            Some("150.0.1".into()),
+            Ok(target),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            diagnostics.cdm_library_sha512.as_deref(),
+            Some(digest.as_str())
+        );
+        assert_eq!(diagnostics.ownership.kind, OwnershipKind::Managed);
+        assert!(
+            diagnostics.fingerprint.is_none(),
+            "partial profile scope must never persist as an exact cache key"
+        );
+    }
+
+    #[test]
+    fn missing_install_root_cdm_disables_probe_cache_fingerprint() {
         let tmp = TempDir::new().expect("tempdir");
         let target = tmp.path().join("WidevineCdm");
         let executable = std::env::current_exe().expect("test executable");
@@ -1313,10 +1752,10 @@ mod tests {
             Some("150.0.1".into()),
             Ok(target),
             None,
-            None,
+            Some(&[]),
         );
 
-        assert!(diagnostics.fingerprint.is_some());
+        assert!(diagnostics.fingerprint.is_none());
         assert_eq!(diagnostics.ownership.kind, OwnershipKind::Missing);
         let provenance = diagnostics
             .checks
@@ -1340,7 +1779,7 @@ mod tests {
             Some("150.0.1".into()),
             Ok(target),
             None,
-            None,
+            Some(&[]),
         );
 
         assert_eq!(diagnostics.ownership.kind, OwnershipKind::External);
@@ -1366,7 +1805,7 @@ mod tests {
             Some("150.0.1".into()),
             Ok(target),
             None,
-            None,
+            Some(&[]),
         );
 
         assert_eq!(diagnostics.ownership.kind, OwnershipKind::External);
@@ -1440,10 +1879,10 @@ mod tests {
             Some("150.0.1".into()),
             Ok(target),
             None,
-            None,
+            Some(&[]),
         );
         assert_eq!(diagnostics.ownership.kind, OwnershipKind::External);
-        assert!(diagnostics.fingerprint.is_some());
+        assert!(diagnostics.fingerprint.is_none());
     }
 
     #[test]
@@ -1519,7 +1958,7 @@ mod tests {
             Some("150.0.1".into()),
             Ok(tmp.path().join("WidevineCdm")),
             None,
-            None,
+            Some(&[]),
         );
         assert!(diagnostics.fingerprint.is_none());
     }
@@ -1530,5 +1969,311 @@ mod tests {
         let checks = super::collect_host_media_checks();
         assert!(!checks.is_empty() || cfg!(not(any(target_os = "linux", target_os = "macos"))));
         let _ = PathBuf::from(".");
+    }
+
+    fn write_profile_cdm(profile_dir: &std::path::Path, version: &str, library: &[u8]) {
+        let component = profile_dir.join("WidevineCdm");
+        let platform = component
+            .join("_platform_specific")
+            .join(test_platform_dir());
+        fs::create_dir_all(&platform).expect("platform");
+        fs::write(
+            component.join("manifest.json"),
+            format!(r#"{{"version":"{version}"}}"#),
+        )
+        .expect("manifest");
+        fs::write(platform.join(test_library_name()), library).expect("library");
+    }
+
+    #[test]
+    fn active_profile_one_cdm_joins_fingerprint_and_differs_from_default() {
+        let tmp = TempDir::new().expect("tempdir");
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).expect("install");
+        let target = install.join("WidevineCdm");
+        let user_data = tmp.path().join("chromium");
+        fs::create_dir_all(user_data.join("Default")).expect("default");
+        fs::create_dir_all(user_data.join("Profile 1")).expect("profile1");
+
+        let default_library = test_library_bytes();
+        let mut profile_library = test_library_bytes();
+        // Ensure Profile 1 library digest differs from Default.
+        if let Some(last) = profile_library.last_mut() {
+            *last ^= 0x5a;
+        }
+        write_profile_cdm(&user_data.join("Default"), "4.10.1.1", &default_library);
+        write_profile_cdm(&user_data.join("Profile 1"), "4.10.9.9", &profile_library);
+
+        let local_state = serde_json::json!({
+            "profile": {
+                "info_cache": {
+                    "Default": { "name": "Person 1" },
+                    "Profile 1": { "name": "Work" }
+                },
+                "last_used": "Profile 1",
+                "last_active_profiles": ["Profile 1"]
+            }
+        });
+        fs::write(
+            user_data.join("Local State"),
+            serde_json::to_vec_pretty(&local_state).expect("json"),
+        )
+        .expect("local state");
+
+        let diagnostics = collect_browser_for_test(
+            &browser(&install, BrowserKind::Detected),
+            Ok(std::env::current_exe().expect("exe")),
+            Some("150.0.1".into()),
+            Ok(target),
+            None,
+            &[user_data],
+        );
+
+        assert!(
+            diagnostics
+                .external_cdms
+                .iter()
+                .any(|hint| hint.version.as_deref() == Some("4.10.9.9")),
+            "Profile 1 Widevine evidence must participate: {:?}",
+            diagnostics.external_cdms
+        );
+        assert!(
+            diagnostics
+                .external_cdms
+                .iter()
+                .any(|hint| hint.version.as_deref() == Some("4.10.1.1")),
+            "Default Widevine evidence must still be collected"
+        );
+        let fingerprint = diagnostics
+            .fingerprint
+            .expect("complete multi-profile scope must remain fingerprintable");
+        assert!(fingerprint
+            .cdm_entries
+            .iter()
+            .any(|entry| entry.version.as_deref() == Some("4.10.9.9")));
+        assert!(fingerprint
+            .cdm_entries
+            .iter()
+            .any(|entry| entry.version.as_deref() == Some("4.10.1.1")));
+        let default_digest = diagnostics
+            .external_cdms
+            .iter()
+            .find(|hint| hint.version.as_deref() == Some("4.10.1.1"))
+            .and_then(|hint| hint.library_sha512.as_deref());
+        let profile_digest = diagnostics
+            .external_cdms
+            .iter()
+            .find(|hint| hint.version.as_deref() == Some("4.10.9.9"))
+            .and_then(|hint| hint.library_sha512.as_deref());
+        assert_ne!(default_digest, profile_digest);
+    }
+
+    #[test]
+    fn unreadable_or_malformed_profile_metadata_suppresses_fingerprint() {
+        let tmp = TempDir::new().expect("tempdir");
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).expect("install");
+        let target = install.join("WidevineCdm");
+        let executable = std::env::current_exe().expect("exe");
+
+        // Malformed Local State JSON.
+        let malformed_root = tmp.path().join("malformed");
+        fs::create_dir_all(malformed_root.join("Default")).expect("default");
+        write_profile_cdm(
+            &malformed_root.join("Default"),
+            "4.10.2.2",
+            &test_library_bytes(),
+        );
+        fs::write(malformed_root.join("Local State"), b"{not-json").expect("local state");
+        let malformed = collect_browser_for_test(
+            &browser(&install, BrowserKind::Detected),
+            Ok(executable.clone()),
+            Some("150.0.1".into()),
+            Ok(target.clone()),
+            None,
+            &[malformed_root],
+        );
+        assert!(
+            malformed.fingerprint.is_none(),
+            "malformed Local State must suppress exact fingerprint"
+        );
+
+        // Oversized Preferences under an active profile.
+        let oversized_root = tmp.path().join("oversized");
+        fs::create_dir_all(oversized_root.join("Profile 1")).expect("profile");
+        let local_state = serde_json::json!({
+            "profile": {
+                "info_cache": { "Profile 1": { "name": "Work" } },
+                "last_used": "Profile 1"
+            }
+        });
+        fs::write(
+            oversized_root.join("Local State"),
+            serde_json::to_vec_pretty(&local_state).expect("json"),
+        )
+        .expect("local state");
+        let big = vec![b'x'; 1024 * 1024 + 8];
+        fs::write(oversized_root.join("Profile 1").join("Preferences"), &big).expect("prefs");
+        let oversized = collect_browser_for_test(
+            &browser(&install, BrowserKind::Detected),
+            Ok(executable.clone()),
+            Some("150.0.1".into()),
+            Ok(target.clone()),
+            None,
+            &[oversized_root],
+        );
+        assert!(
+            oversized.fingerprint.is_none(),
+            "oversized profile Preferences must suppress exact fingerprint"
+        );
+
+        // Truncated info_cache enumeration (>16 profiles listed).
+        let truncated_root = tmp.path().join("truncated");
+        fs::create_dir_all(truncated_root.join("Default")).expect("default");
+        write_profile_cdm(
+            &truncated_root.join("Default"),
+            "4.10.3.3",
+            &test_library_bytes(),
+        );
+        let mut info_cache = serde_json::Map::new();
+        info_cache.insert("Default".into(), serde_json::json!({ "name": "Person 1" }));
+        for idx in 1..=17 {
+            let name = format!("Profile {idx}");
+            fs::create_dir_all(truncated_root.join(&name)).expect("profile dir");
+            info_cache.insert(name, serde_json::json!({ "name": format!("P{idx}") }));
+        }
+        let truncated_state = serde_json::json!({
+            "profile": {
+                "info_cache": info_cache,
+                "last_used": "Default"
+            }
+        });
+        fs::write(
+            truncated_root.join("Local State"),
+            serde_json::to_vec_pretty(&truncated_state).expect("json"),
+        )
+        .expect("local state");
+        let truncated = collect_browser_for_test(
+            &browser(&install, BrowserKind::Detected),
+            Ok(executable),
+            Some("150.0.1".into()),
+            Ok(target),
+            None,
+            &[truncated_root],
+        );
+        assert!(
+            truncated.fingerprint.is_none(),
+            "bounded Local State truncation must suppress exact fingerprint"
+        );
+    }
+
+    #[test]
+    fn unrecognized_profile_metadata_suppresses_fingerprint() {
+        let tmp = TempDir::new().expect("tempdir");
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).expect("install");
+        let user_data = tmp.path().join("chromium");
+        fs::create_dir_all(&user_data).expect("user data");
+        let local_state = serde_json::json!({
+            "profile": {
+                "info_cache": {
+                    "unrecognized-profile-directory": { "name": "Unknown" }
+                }
+            }
+        });
+        fs::write(
+            user_data.join("Local State"),
+            serde_json::to_vec_pretty(&local_state).expect("json"),
+        )
+        .expect("local state");
+
+        let diagnostics = collect_browser_for_test(
+            &browser(&install, BrowserKind::Detected),
+            Ok(std::env::current_exe().expect("exe")),
+            Some("150.0.1".into()),
+            Ok(install.join("WidevineCdm")),
+            None,
+            &[user_data],
+        );
+
+        assert!(
+            diagnostics.fingerprint.is_none(),
+            "an unrecognized profile directory in Local State makes scope incomplete"
+        );
+        assert_eq!(
+            diagnostics
+                .checks
+                .iter()
+                .find(|check| check.id == "cdm.external_components")
+                .and_then(|check| check.details.get("profile_scope_complete"))
+                .map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_profile_widevine_suppresses_fingerprint() {
+        let tmp = TempDir::new().expect("tempdir");
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).expect("install");
+        let user_data = tmp.path().join("chromium");
+        let default_profile = user_data.join("Default");
+        fs::create_dir_all(&default_profile).expect("default");
+        let outside = tmp.path().join("outside-widevine");
+        fs::create_dir_all(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, default_profile.join("WidevineCdm"))
+            .expect("widevine symlink");
+        fs::write(
+            user_data.join("Local State"),
+            br#"{"profile":{"info_cache":{"Default":{}},"last_used":"Default"}}"#,
+        )
+        .expect("local state");
+
+        let diagnostics = collect_browser_for_test(
+            &browser(&install, BrowserKind::Detected),
+            Ok(std::env::current_exe().expect("exe")),
+            Some("150.0.1".into()),
+            Ok(install.join("WidevineCdm")),
+            None,
+            &[user_data],
+        );
+
+        assert!(
+            diagnostics.fingerprint.is_none(),
+            "a profile CDM symlink must not be omitted from an exact fingerprint"
+        );
+        assert_eq!(
+            diagnostics
+                .checks
+                .iter()
+                .find(|check| check.id == "cdm.external_components")
+                .and_then(|check| check.details.get("profile_scope_complete"))
+                .map(String::as_str),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn unverified_cache_candidate_does_not_poison_ownership() {
+        let tmp = TempDir::new().expect("tempdir");
+        let target = unmarked_cdm(tmp.path());
+        let unverified = CachedCdm::new("4.10.0.0".into(), target.clone());
+        assert!(unverified.verified_library_sha512().is_none());
+
+        let diagnostics = collect_browser_at(
+            &browser(tmp.path(), BrowserKind::Known),
+            Ok(std::env::current_exe().expect("exe")),
+            Some("150.0.1".into()),
+            Ok(target),
+            Some(&unverified),
+            Some(&[]),
+        );
+
+        assert_eq!(
+            diagnostics.ownership.kind,
+            OwnershipKind::External,
+            "unverified cache handle must fall back to candidate-free classification"
+        );
     }
 }

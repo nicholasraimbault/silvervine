@@ -249,9 +249,9 @@ impl From<std::io::Error> for Error {
     }
 }
 
-/// Map JSON parse errors into a `StateCorrupted` category — the most
-/// common consumer of `serde_json` is the manifest cache and the state
-/// file, both of which are "corrupted" if they fail to parse.
+/// Map JSON parse errors into a `StateCorrupted` category. Manifests, state
+/// files, and persisted diagnostic reports are corrupted when they cannot be
+/// deserialized.
 impl From<serde_json::Error> for Error {
     fn from(err: serde_json::Error) -> Self {
         let message = err.to_string();

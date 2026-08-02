@@ -151,26 +151,8 @@ impl ProbeServer {
     fn handle(&mut self, stream: &mut TcpStream) -> Result<Option<ProbeOutcome>> {
         let request = match read_request(stream) {
             Ok(request) => request,
-            Err(RequestError::TooLarge) => {
-                respond(stream, 413, "text/plain", b"payload too large", None)?;
-                return Ok(None);
-            }
-            Err(RequestError::LengthRequired) => {
-                respond(stream, 411, "text/plain", b"length required", None)?;
-                return Ok(None);
-            }
-            Err(RequestError::TransferEncoding) => {
-                respond(
-                    stream,
-                    400,
-                    "text/plain",
-                    b"transfer-encoding not allowed",
-                    None,
-                )?;
-                return Ok(None);
-            }
-            Err(RequestError::Malformed) => {
-                respond(stream, 400, "text/plain", b"bad request", None)?;
+            Err(error) => {
+                respond_request_error(stream, &error)?;
                 return Ok(None);
             }
         };
@@ -195,50 +177,7 @@ impl ProbeServer {
                 )?;
                 Ok(None)
             }
-            ("POST", path) if path == result_path => {
-                if self.accepted_post {
-                    respond(stream, 409, "text/plain", b"result already accepted", None)?;
-                    return Ok(None);
-                }
-                let expected_origin = format!("http://{}", self.address);
-                if request.headers.get("origin").map(String::as_str)
-                    != Some(expected_origin.as_str())
-                {
-                    respond(stream, 403, "text/plain", b"forbidden", None)?;
-                    return Ok(None);
-                }
-                let content_type = request
-                    .headers
-                    .get("content-type")
-                    .and_then(|value| value.split(';').next())
-                    .map(str::trim);
-                if content_type != Some("application/json") {
-                    respond(
-                        stream,
-                        415,
-                        "text/plain",
-                        b"application/json required",
-                        None,
-                    )?;
-                    return Ok(None);
-                }
-                let raw: RawProbeResult =
-                    serde_json::from_slice(&request.body).map_err(|error| {
-                        Error::browser_probe_failed("browser returned malformed EME probe JSON")
-                            .with_source(error)
-                    })?;
-                raw.validate_live_matrix().map_err(|error| {
-                    Error::browser_probe_failed(error.message.clone()).with_source(error)
-                })?;
-                let assessment = assess(&raw, &self.ownership);
-                let body = serde_json::to_vec(&assessment).map_err(|error| {
-                    Error::browser_probe_failed("could not encode capability assessment")
-                        .with_source(error)
-                })?;
-                respond(stream, 200, "application/json; charset=utf-8", &body, None)?;
-                self.accepted_post = true;
-                Ok(Some(ProbeOutcome { raw, assessment }))
-            }
+            ("POST", path) if path == result_path => self.handle_result_post(stream, &request),
             ("GET" | "POST", _) => {
                 respond(stream, 404, "text/plain", b"not found", None)?;
                 Ok(None)
@@ -252,6 +191,51 @@ impl ProbeServer {
                 Ok(None)
             }
         }
+    }
+
+    fn handle_result_post(
+        &mut self,
+        stream: &mut TcpStream,
+        request: &HttpRequest,
+    ) -> Result<Option<ProbeOutcome>> {
+        if self.accepted_post {
+            respond(stream, 409, "text/plain", b"result already accepted", None)?;
+            return Ok(None);
+        }
+        let expected_origin = format!("http://{}", self.address);
+        if request.headers.get("origin").map(String::as_str) != Some(expected_origin.as_str()) {
+            respond(stream, 403, "text/plain", b"forbidden", None)?;
+            return Ok(None);
+        }
+        let content_type = request
+            .headers
+            .get("content-type")
+            .and_then(|value| value.split(';').next())
+            .map(str::trim);
+        if content_type != Some("application/json") {
+            respond(
+                stream,
+                415,
+                "text/plain",
+                b"application/json required",
+                None,
+            )?;
+            return Ok(None);
+        }
+        let raw: RawProbeResult = serde_json::from_slice(&request.body).map_err(|error| {
+            Error::browser_probe_failed("browser returned malformed EME probe JSON")
+                .with_source(error)
+        })?;
+        raw.validate_live_matrix().map_err(|error| {
+            Error::browser_probe_failed(error.message.clone()).with_source(error)
+        })?;
+        let assessment = assess(&raw, &self.ownership);
+        let body = serde_json::to_vec(&assessment).map_err(|error| {
+            Error::browser_probe_failed("could not encode capability assessment").with_source(error)
+        })?;
+        respond_strict(stream, 200, "application/json; charset=utf-8", &body, None)?;
+        self.accepted_post = true;
+        Ok(Some(ProbeOutcome { raw, assessment }))
     }
 
     fn csp(&self) -> String {
@@ -391,6 +375,16 @@ enum RequestError {
     /// `Transfer-Encoding` is forbidden; Content-Length only.
     TransferEncoding,
 }
+fn respond_request_error(stream: &mut TcpStream, error: &RequestError) -> Result<()> {
+    let (status, body): (u16, &[u8]) = match error {
+        RequestError::TooLarge => (413, b"payload too large"),
+        RequestError::LengthRequired => (411, b"length required"),
+        RequestError::TransferEncoding => (400, b"transfer-encoding not allowed"),
+        RequestError::Malformed => (400, b"bad request"),
+    };
+    respond(stream, status, "text/plain", body, None)
+}
+
 fn discard_declared_body(stream: &mut TcpStream, buffered: usize, content_length: usize) {
     let mut remaining = content_length.saturating_sub(buffered.min(content_length));
     let mut buffer = [0_u8; 4096];
@@ -505,6 +499,43 @@ fn respond(
     body: &[u8],
     csp: Option<String>,
 ) -> Result<()> {
+    match write_response(stream, status, content_type, body, csp) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::NotConnected
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(Error::from(error)),
+    }
+}
+
+fn respond_strict(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    csp: Option<String>,
+) -> Result<()> {
+    write_response(stream, status, content_type, body, csp).map_err(|error| {
+        Error::browser_probe_failed("browser disconnected before receiving the assessment")
+            .with_source(error)
+    })
+}
+
+fn write_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    csp: Option<String>,
+) -> io::Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -526,26 +557,9 @@ fn respond(
             .expect("writing to String cannot fail");
     }
     headers.push_str("\r\n");
-    let write_result = (|| -> io::Result<()> {
-        stream.write_all(headers.as_bytes())?;
-        stream.write_all(body)?;
-        stream.flush()
-    })();
-    match write_result {
-        Ok(()) => Ok(()),
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::BrokenPipe
-                    | io::ErrorKind::ConnectionAborted
-                    | io::ErrorKind::ConnectionReset
-                    | io::ErrorKind::NotConnected
-            ) =>
-        {
-            Ok(())
-        }
-        Err(error) => Err(Error::from(error)),
-    }
+    stream.write_all(headers.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
 }
 
 #[cfg(test)]
@@ -558,7 +572,7 @@ mod tests {
 
     use super::{ProbeServer, PROBE_SCRIPT};
     use crate::eme::probe::{
-        CapabilityStatus, CodecCapability, EncryptionSchemeResult, HdcpResult,
+        CanPlayStatus, CapabilityStatus, CodecCapability, EncryptionSchemeResult, HdcpResult,
         MediaCapabilitiesFacts, MediaKind, RawProbeResult, RobustnessResult, PROBE_SCHEMA_VERSION,
     };
     use crate::widevine::ownership::{OwnershipAssessment, OwnershipKind};
@@ -618,7 +632,7 @@ mod tests {
                     height,
                     framerate,
                     mse_supported: true,
-                    direct_playback: "probably".into(),
+                    direct_playback: CanPlayStatus::Probably,
                     media_capabilities: Some(MediaCapabilitiesFacts {
                         supported: true,
                         smooth: Some(true),
@@ -863,8 +877,20 @@ mod tests {
     fn probe_script_never_requests_forbidden_capabilities() {
         let script = PROBE_SCRIPT;
         assert!(!script.contains("persistent-license"));
+        assert!(!script.contains("distinctiveIdentifier: \"optional\""));
         assert!(!script.contains("distinctiveIdentifier: \"required\""));
+        assert!(!script.contains("persistentState: \"optional\""));
         assert!(!script.contains("persistentState: \"required\""));
+        assert_eq!(
+            script
+                .matches("distinctiveIdentifier: \"not-allowed\"")
+                .count(),
+            2
+        );
+        assert_eq!(
+            script.matches("persistentState: \"not-allowed\"").count(),
+            2
+        );
         assert!(script.contains("sessionTypes: [\"temporary\"]"));
         assert!(script.contains("avc1.640028"));
         assert!(script.contains("hvc1.1.6.L120.B0"));

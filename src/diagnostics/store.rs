@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::eme::probe::{CapabilityAssessment, RawProbeResult};
 use crate::error::{Error, Result};
-use crate::platform::atomic_rename;
+use crate::widevine::download::sha512_reader;
 use crate::widevine::sha512_hex;
 
 /// Current on-disk capability-report schema.
@@ -45,6 +45,18 @@ impl CdmFingerprintEntry {
             library_sha512,
         }
     }
+
+    fn is_complete(&self) -> bool {
+        Path::new(&self.canonical_path).is_absolute()
+            && self
+                .version
+                .as_deref()
+                .is_some_and(|version| !version.trim().is_empty())
+            && self
+                .library_sha512
+                .as_deref()
+                .is_some_and(|digest| !digest.is_empty())
+    }
 }
 
 /// Exact browser/CDM identity that makes cached evidence reusable.
@@ -60,6 +72,8 @@ pub struct ProbeFingerprint {
     pub executable_len: u64,
     /// Browser executable mtime in Unix seconds.
     pub executable_modified: u64,
+    /// SHA-512 of the exact browser executable bytes.
+    pub executable_sha512: String,
     /// Ordered set of relevant CDM identities (install-root and external/component).
     #[serde(default)]
     pub cdm_entries: Vec<CdmFingerprintEntry>,
@@ -77,6 +91,7 @@ impl ProbeFingerprint {
         browser_version: Option<String>,
         executable_len: u64,
         executable_modified: u64,
+        executable_sha512: impl Into<String>,
         mut cdm_entries: Vec<CdmFingerprintEntry>,
     ) -> Self {
         cdm_entries.sort();
@@ -86,6 +101,7 @@ impl ProbeFingerprint {
             browser_version,
             executable_len,
             executable_modified,
+            executable_sha512: executable_sha512.into(),
             cdm_entries,
             host_os: std::env::consts::OS.into(),
             host_arch: std::env::consts::ARCH.into(),
@@ -102,9 +118,27 @@ impl ProbeFingerprint {
         browser_version: Option<String>,
         cdm_entries: Vec<CdmFingerprintEntry>,
     ) -> Result<Self> {
+        if browser_version
+            .as_deref()
+            .is_none_or(|version| version.trim().is_empty())
+            || cdm_entries.is_empty()
+            || cdm_entries.iter().any(|entry| !entry.is_complete())
+        {
+            return Err(Error::state_corrupted(
+                "exact probe fingerprints require browser and byte-exact CDM identities",
+            ));
+        }
         let canonical = canonicalize_path(executable)?;
-        let metadata = fs::symlink_metadata(&canonical).map_err(Error::from)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(&canonical).map_err(Error::from)?;
+        let metadata = file.metadata().map_err(Error::from)?;
+        if !metadata.is_file() {
             return Err(Error::unknown_bundle_structure(format!(
                 "{} must be a regular executable file",
                 canonical.display()
@@ -118,11 +152,13 @@ impl ProbeFingerprint {
                 Error::other("executable mtime predates the Unix epoch").with_source(error)
             })?
             .as_secs();
+        let executable_sha512 = sha512_reader(&mut file)?;
         Ok(Self::new(
             canonical.to_string_lossy().into_owned(),
             browser_version,
             metadata.len(),
             modified,
+            executable_sha512,
             cdm_entries,
         ))
     }
@@ -141,6 +177,22 @@ impl ProbeFingerprint {
         self.cdm_entries
             .iter()
             .find_map(|entry| entry.library_sha512.as_deref())
+    }
+    fn validate(&self) -> Result<()> {
+        if !Path::new(&self.canonical_executable).is_absolute()
+            || self.executable_sha512.is_empty()
+            || self
+                .browser_version
+                .as_deref()
+                .is_none_or(|version| version.trim().is_empty())
+            || self.cdm_entries.is_empty()
+            || self.cdm_entries.iter().any(|entry| !entry.is_complete())
+        {
+            return Err(Error::state_corrupted(
+                "capability cache fingerprint is not byte-exact",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -203,6 +255,7 @@ impl StoredProbeReport {
                 "capability cache browser name must contain 1..=128 bytes",
             ));
         }
+        self.fingerprint.validate()?;
         self.raw.validate_schema()
     }
 }
@@ -264,18 +317,33 @@ pub fn load_report(root: &Path, expected: &ProbeFingerprint) -> Result<CacheLook
             path.display()
         )));
     }
+    let mut file = open_report(&path)?;
+    let metadata = file.metadata().map_err(Error::from)?;
+    if !metadata.is_file() {
+        return Err(Error::state_corrupted(format!(
+            "{} must be a regular cache file",
+            path.display()
+        )));
+    }
     if metadata.len() > MAX_REPORT_BYTES {
         return Err(Error::state_corrupted(format!(
             "{} exceeds the capability cache size limit",
             path.display()
         )));
     }
-
-    let mut file = open_report(&path)?;
     let length = usize::try_from(metadata.len())
         .map_err(|_| Error::state_corrupted("capability cache size is not representable"))?;
     let mut bytes = Vec::with_capacity(length);
-    file.read_to_end(&mut bytes).map_err(Error::from)?;
+    (&mut file)
+        .take(MAX_REPORT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(Error::from)?;
+    if bytes.len() as u64 > MAX_REPORT_BYTES {
+        return Err(Error::state_corrupted(format!(
+            "{} grew beyond the capability cache size limit while it was read",
+            path.display()
+        )));
+    }
     let report: StoredProbeReport = serde_json::from_slice(&bytes).map_err(|error| {
         Error::state_corrupted(format!("malformed capability cache {}", path.display()))
             .with_source(error)
@@ -403,10 +471,7 @@ fn atomic_write_report(path: &Path, bytes: &[u8]) -> Result<()> {
     file.sync_all().map_err(Error::from)?;
     drop(file);
 
-    atomic_rename(&temp, path)?;
-    if fs::symlink_metadata(&temp).is_ok() {
-        fs::remove_file(&temp).map_err(Error::from)?;
-    }
+    fs::rename(&temp, path).map_err(Error::from)?;
     fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(Error::from)?;
@@ -428,6 +493,7 @@ mod tests {
     };
     use crate::eme::probe::{assess, CapabilityStatus, EmeProbeResult, PROBE_SCHEMA_VERSION};
     use crate::widevine::ownership::OwnershipAssessment;
+    use crate::widevine::sha512_hex;
 
     fn cdm_entry(path: &str, digest: &str) -> CdmFingerprintEntry {
         CdmFingerprintEntry::new(path, Some("4.10.0.0".into()), Some(digest.into()))
@@ -445,6 +511,7 @@ mod tests {
             Some(browser_version.into()),
             len,
             modified,
+            "browser-digest",
             vec![cdm_entry(
                 "/opt/test-browser/WidevineCdm/libwidevinecdm.so",
                 digest,
@@ -559,6 +626,25 @@ mod tests {
         assert!(matches!(mtime_changed, CacheLookup::Stale(_)));
         assert!(matches!(length_changed, CacheLookup::Stale(_)));
     }
+    #[test]
+    fn executable_digest_change_invalidates_cached_evidence() {
+        let tmp = TempDir::new().expect("tempdir");
+        let old = fingerprint(
+            "/opt/test-browser/chromium",
+            "150.0",
+            100,
+            1_700_000_000,
+            "abc",
+        );
+        let mut changed = old.clone();
+        changed.executable_sha512 = "different-browser-digest".into();
+        save_report(tmp.path(), &stored(old)).expect("save");
+
+        assert!(matches!(
+            load_report(tmp.path(), &changed).expect("digest"),
+            CacheLookup::Stale(_)
+        ));
+    }
 
     #[test]
     fn executable_path_change_uses_distinct_cache_key() {
@@ -585,6 +671,7 @@ mod tests {
             Some("150.0".into()),
             100,
             1,
+            "browser-digest",
             vec![cdm_entry("/opt/old/libwidevinecdm.so", "old-digest")],
         );
         save_report(tmp.path(), &stored(old)).expect("save");
@@ -594,6 +681,7 @@ mod tests {
             Some("150.0".into()),
             100,
             1,
+            "browser-digest",
             vec![cdm_entry("/opt/new/libwidevinecdm.so", "old-digest")],
         );
         let digest_changed = ProbeFingerprint::new(
@@ -601,6 +689,7 @@ mod tests {
             Some("150.0".into()),
             100,
             1,
+            "browser-digest",
             vec![cdm_entry("/opt/old/libwidevinecdm.so", "new-digest")],
         );
 
@@ -621,6 +710,7 @@ mod tests {
             None,
             1,
             1,
+            "browser-digest",
             vec![
                 cdm_entry("/z/lib.so", "z"),
                 cdm_entry("/a/lib.so", "a"),
@@ -636,6 +726,46 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["/a/lib.so", "/z/lib.so"]
         );
+    }
+    #[test]
+    fn undigested_cdm_identity_prevents_cache_fingerprint() {
+        let tmp = TempDir::new().expect("tempdir");
+        let executable = tmp.path().join("chromium");
+        fs::write(&executable, b"browser").expect("write executable");
+        let entry = CdmFingerprintEntry::new("/opt/cdm/lib.so", None, None);
+
+        let error = ProbeFingerprint::from_executable(&executable, None, vec![entry])
+            .expect_err("undigested CDM must disable caching");
+
+        assert_eq!(error.category, crate::ErrorCategory::StateCorrupted);
+    }
+
+    #[test]
+    fn incomplete_browser_or_cdm_identity_prevents_cache_fingerprint() {
+        let tmp = TempDir::new().expect("tempdir");
+        let executable = tmp.path().join("chromium");
+        fs::write(&executable, b"browser").expect("write executable");
+
+        let no_browser_version = ProbeFingerprint::from_executable(
+            &executable,
+            None,
+            vec![cdm_entry("/opt/cdm/lib.so", "digest")],
+        );
+        let no_cdm =
+            ProbeFingerprint::from_executable(&executable, Some("150.0".into()), Vec::new());
+        let no_cdm_version = ProbeFingerprint::from_executable(
+            &executable,
+            Some("150.0".into()),
+            vec![CdmFingerprintEntry::new(
+                "/opt/cdm/lib.so",
+                None,
+                Some("digest".into()),
+            )],
+        );
+
+        assert!(no_browser_version.is_err());
+        assert!(no_cdm.is_err());
+        assert!(no_cdm_version.is_err());
     }
 
     #[test]
@@ -665,6 +795,7 @@ mod tests {
             exe.canonicalize().expect("canon").to_string_lossy()
         );
         assert!(fingerprint.executable_modified > 0);
+        assert_eq!(fingerprint.executable_sha512, sha512_hex(b"browser-bytes"));
         assert_eq!(fingerprint.cdm_entries.len(), 1);
     }
 

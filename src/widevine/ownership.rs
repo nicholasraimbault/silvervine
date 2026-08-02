@@ -15,13 +15,12 @@ use sha2::{Digest, Sha512};
 
 use crate::browsers::{Browser, BrowserKind};
 use crate::error::{Error, Result};
-use crate::platform::atomic_rename;
-use crate::widevine::download::{hex_lower, sha512_file_hex};
+use crate::widevine::download::{hex_lower, sha512_reader};
 use crate::widevine::{current_platform_key, CachedCdm};
 
 /// File stored beside an installed CDM to establish Silvervine provenance.
 pub const MANAGED_MARKER_FILENAME: &str = ".silvervine-managed.json";
-const MARKER_SCHEMA_VERSION: u8 = 2;
+const MARKER_SCHEMA_VERSION: u8 = 3;
 const MAX_VERSION_BYTES: usize = 64;
 const MAX_MARKER_BYTES: u64 = 16 * 1024;
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
@@ -41,6 +40,8 @@ pub struct ManagedMarker {
     pub platform: String,
     /// SHA-512 digest of the installed Widevine library.
     pub library_sha512: String,
+    /// SHA-512 digest of the installed root `manifest.json`.
+    pub manifest_sha512: String,
 }
 
 /// Installed CDM whose marker, manifest, platform, and library digest agree.
@@ -64,11 +65,13 @@ impl ValidatedInstalledCdm {
     }
     /// Whether this verified install is the same CDM release selected by a
     /// cached candidate. The library digest may differ after a trusted
-    /// platform transformation such as macOS code signing.
+    /// platform transformation such as macOS code signing, but the root
+    /// manifest digest must still match the parent-selected payload.
     #[must_use]
     pub fn matches_candidate(&self, candidate: &ManagedMarker) -> bool {
         self.marker.cdm_version == candidate.cdm_version
             && self.marker.platform == candidate.platform
+            && self.marker.manifest_sha512 == candidate.manifest_sha512
     }
 }
 
@@ -131,15 +134,27 @@ struct PayloadIdentity {
     version: String,
     platform: String,
     library_sha512: String,
+    manifest_sha512: String,
 }
 
 /// Construct the marker that must be committed with `cached`.
 ///
 /// # Errors
 ///
-/// Returns [`ErrorCategory::InvalidMarker`](crate::ErrorCategory::InvalidMarker)
-/// when the cached payload is not a safe, internally consistent CDM layout.
+/// Returns `InvalidMarker` when the cached payload is not a safe, internally
+/// consistent CDM layout, or when the cache handle was not authenticated from
+/// a live vendor CRX (or parent-selected marker). Returns `HashMismatch` when
+/// current library or root-manifest bytes no longer match the authenticated
+/// digests carried by the cache handle.
 pub fn marker_for_cached(cached: &CachedCdm) -> Result<ManagedMarker> {
+    let expected_library = cached.verified_library_sha512().ok_or_else(|| {
+        Error::invalid_marker("cached CDM library was not authenticated from a live vendor payload")
+    })?;
+    let expected_manifest = cached.verified_manifest_sha512().ok_or_else(|| {
+        Error::invalid_marker(
+            "cached CDM manifest was not authenticated from a live vendor payload",
+        )
+    })?;
     let marker = marker_for_payload(cached.cdm_dir())?;
     if marker.cdm_version != cached.version() {
         return Err(Error::invalid_marker(format!(
@@ -147,6 +162,19 @@ pub fn marker_for_cached(cached: &CachedCdm) -> Result<ManagedMarker> {
             cached.version(),
             marker.cdm_version
         )));
+    }
+    if !marker.library_sha512.eq_ignore_ascii_case(expected_library) {
+        return Err(Error::hash_mismatch(
+            "cached CDM library changed after integrity verification",
+        ));
+    }
+    if !marker
+        .manifest_sha512
+        .eq_ignore_ascii_case(expected_manifest)
+    {
+        return Err(Error::hash_mismatch(
+            "cached CDM manifest changed after integrity verification",
+        ));
     }
     Ok(marker)
 }
@@ -160,6 +188,7 @@ pub(crate) fn marker_for_payload(target: &Path) -> Result<ManagedMarker> {
         cdm_version: identity.version,
         platform: identity.platform,
         library_sha512: identity.library_sha512,
+        manifest_sha512: identity.manifest_sha512,
     })
 }
 /// Rebuild a parent-selected marker after a trusted platform finalizer changes
@@ -168,14 +197,18 @@ pub(crate) fn marker_for_payload(target: &Path) -> Result<ManagedMarker> {
 /// # Errors
 ///
 /// Returns `InvalidMarker` if the finalized payload changed the selected CDM
-/// version or platform, or if either payload or marker is malformed.
+/// version, platform, or root-manifest digest, or if either payload or marker
+/// is malformed.
 pub(crate) fn marker_for_finalized_payload(
     target: &Path,
     parent: &ManagedMarker,
 ) -> Result<ManagedMarker> {
     validate_marker_header(parent)?;
     let identity = inspect_payload(target)?;
-    if identity.version != parent.cdm_version || identity.platform != parent.platform {
+    if identity.version != parent.cdm_version
+        || identity.platform != parent.platform
+        || identity.manifest_sha512 != parent.manifest_sha512
+    {
         return Err(Error::invalid_marker(
             "platform finalization changed the parent-selected CDM identity",
         ));
@@ -207,11 +240,19 @@ pub fn write_marker(target: &Path, marker: &ManagedMarker) -> Result<()> {
 /// for malformed, symlinked, stale, or mismatched marker state.
 pub fn validate_installed_marker(target: &Path) -> Result<ManagedMarker> {
     let path = marker_path(target);
-    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|error| {
+            Error::invalid_marker(format!("could not safely open {}: {error}", path.display()))
+                .with_source(error)
+        })?;
+    let metadata = file.metadata().map_err(|error| {
         Error::invalid_marker(format!("could not inspect {}: {error}", path.display()))
             .with_source(error)
     })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    if !metadata.is_file() {
         return Err(Error::invalid_marker(format!(
             "{} must be a regular file",
             path.display()
@@ -224,15 +265,21 @@ pub fn validate_installed_marker(target: &Path) -> Result<ManagedMarker> {
         )));
     }
 
-    let mut file = OpenOptions::new().read(true).open(&path).map_err(|error| {
-        Error::invalid_marker("could not open ownership marker").with_source(error)
-    })?;
     let capacity = usize::try_from(metadata.len())
         .map_err(|_| Error::invalid_marker("ownership marker size is not representable"))?;
     let mut bytes = Vec::with_capacity(capacity);
-    file.read_to_end(&mut bytes).map_err(|error| {
-        Error::invalid_marker("could not read ownership marker").with_source(error)
-    })?;
+    (&mut file)
+        .take(MAX_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            Error::invalid_marker("could not read ownership marker").with_source(error)
+        })?;
+    if bytes.len() as u64 > MAX_MARKER_BYTES {
+        return Err(Error::invalid_marker(format!(
+            "{} grew beyond the marker size limit while it was read",
+            path.display()
+        )));
+    }
     let marker: ManagedMarker = serde_json::from_slice(&bytes).map_err(|error| {
         Error::invalid_marker("ownership marker is not valid JSON").with_source(error)
     })?;
@@ -273,13 +320,46 @@ pub fn classify(
     candidate: &CachedCdm,
     candidate_marker: &ManagedMarker,
 ) -> Result<OwnershipAssessment> {
+    let baseline = classify_without_candidate(browser, target)?;
+    if baseline.kind != OwnershipKind::External {
+        return Ok(baseline);
+    }
+
+    let Ok(installed) = inspect_payload(target) else {
+        return Ok(baseline);
+    };
+    let exact_candidate = candidate.version() == candidate_marker.cdm_version
+        && installed.version == candidate_marker.cdm_version
+        && installed.platform == candidate_marker.platform
+        && installed.library_sha512 == candidate_marker.library_sha512
+        && installed.manifest_sha512 == candidate_marker.manifest_sha512;
+    if exact_candidate {
+        return Ok(assessment(
+            OwnershipKind::LegacyManaged,
+            "The unmarked CDM is eligible for one-time Silvervine adoption.",
+            None,
+            baseline.details,
+        ));
+    }
+    Ok(baseline)
+}
+
+/// Conservatively classify an installed CDM when no verified cache candidate
+/// is available. Unmarked targets remain external because exact payload
+/// equality cannot be proven.
+///
+/// # Errors
+///
+/// Returns an I/O error only when the target itself cannot be inspected.
+/// Unsafe marker or payload state is represented in the returned assessment.
+pub fn classify_without_candidate(browser: &Browser, target: &Path) -> Result<OwnershipAssessment> {
     let target_metadata = match fs::symlink_metadata(target) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(assessment(
                 OwnershipKind::Missing,
                 "No Widevine CDM is installed at the patch target.",
-                None,
+                Some("Run `silvervine setup` or `silvervine patch`.".into()),
                 BTreeMap::new(),
             ));
         }
@@ -291,26 +371,26 @@ pub fn classify(
         ));
     }
 
-    let marker = marker_path(target);
-    match fs::symlink_metadata(&marker) {
+    match fs::symlink_metadata(marker_path(target)) {
         Ok(_) => {
-            return match validate_installed_marker(target) {
+            return Ok(match validate_installed_marker(target) {
                 Ok(installed) => {
                     let mut details = identity_details(&PayloadIdentity {
                         version: installed.cdm_version,
                         platform: installed.platform,
                         library_sha512: installed.library_sha512,
+                        manifest_sha512: installed.manifest_sha512,
                     });
                     details.insert("silvervine_version".into(), installed.silvervine_version);
-                    Ok(assessment(
+                    assessment(
                         OwnershipKind::Managed,
                         "The installed CDM has valid Silvervine provenance.",
                         None,
                         details,
-                    ))
+                    )
                 }
-                Err(error) => Ok(invalid_assessment(&error.message)),
-            };
+                Err(error) => invalid_assessment(&error.message),
+            });
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
@@ -336,20 +416,6 @@ pub fn classify(
         "browser_kind".into(),
         browser_kind_name(browser.kind).into(),
     );
-
-    let exact_candidate = candidate.version() == candidate_marker.cdm_version
-        && installed.version == candidate_marker.cdm_version
-        && installed.platform == candidate_marker.platform
-        && installed.library_sha512 == candidate_marker.library_sha512;
-    if exact_candidate {
-        return Ok(assessment(
-            OwnershipKind::LegacyManaged,
-            "The unmarked CDM is eligible for one-time Silvervine adoption.",
-            None,
-            details,
-        ));
-    }
-
     Ok(assessment(
         OwnershipKind::External,
         "The unmarked CDM may be managed by the browser, platform, or user.",
@@ -426,6 +492,12 @@ pub fn stage_verified_payload(
             "mutable CDM manifest no longer matches the parent-selected version",
         ));
     }
+    let manifest_digest = sha512_hex_of(&manifest_bytes);
+    if !manifest_digest.eq_ignore_ascii_case(&marker.manifest_sha512) {
+        return Err(Error::invalid_marker(
+            "mutable CDM manifest no longer matches the parent-selected digest",
+        ));
+    }
 
     let platform_root = open_relative_directory(&source_root, "_platform_specific")?;
     let platform = open_relative_directory(&platform_root, expected_platform_dir())?;
@@ -464,16 +536,12 @@ pub fn stage_verified_payload(
         .map_err(Error::from)?;
 
     write_new_file(&staged.path().join("manifest.json"), &manifest_bytes, 0o644)?;
-    let digest = copy_library(
+    copy_library(
         library,
         &staged_platform.join(expected_library_name()),
         MAX_LIBRARY_BYTES,
+        &marker.library_sha512,
     )?;
-    if digest != marker.library_sha512 {
-        return Err(Error::invalid_marker(
-            "mutable CDM library no longer matches the parent-selected digest",
-        ));
-    }
 
     let identity = inspect_payload(staged.path())?;
     validate_marker_fields(marker, &identity)?;
@@ -488,7 +556,7 @@ fn open_directory_tree(path: &Path) -> Result<fs::File> {
             "privileged CDM source must be an absolute path",
         ));
     }
-    let mut directory = open_directory(CStr::from_bytes_with_nul(b"/\0").expect("root path"))?;
+    let mut directory = open_directory(c"/")?;
     for component in path.components() {
         match component {
             Component::RootDir => {}
@@ -590,7 +658,12 @@ fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     file.flush().map_err(Error::from)
 }
 
-fn copy_library(mut source: fs::File, destination: &Path, limit: u64) -> Result<String> {
+fn copy_library(
+    mut source: fs::File,
+    destination: &Path,
+    limit: u64,
+    expected_digest: &str,
+) -> Result<()> {
     let mut target = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -599,14 +672,17 @@ fn copy_library(mut source: fs::File, destination: &Path, limit: u64) -> Result<
         .map_err(Error::from)?;
     let mut hasher = Sha512::new();
     let mut copied = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let count = source.read(&mut buffer).map_err(Error::from)?;
         if count == 0 {
             break;
         }
         copied = copied
-            .checked_add(u64::try_from(count).unwrap_or(u64::MAX))
+            .checked_add(
+                u64::try_from(count)
+                    .map_err(|_| Error::invalid_marker("CDM library size overflow"))?,
+            )
             .ok_or_else(|| Error::invalid_marker("CDM library size overflow"))?;
         if copied > limit {
             return Err(Error::invalid_marker(
@@ -617,7 +693,13 @@ fn copy_library(mut source: fs::File, destination: &Path, limit: u64) -> Result<
         target.write_all(&buffer[..count]).map_err(Error::from)?;
     }
     target.flush().map_err(Error::from)?;
-    Ok(hex_lower(&hasher.finalize()))
+    let digest = hex_lower(&hasher.finalize());
+    if !digest.eq_ignore_ascii_case(expected_digest) {
+        return Err(Error::invalid_marker(
+            "mutable CDM library no longer matches the parent-selected digest",
+        ));
+    }
+    Ok(())
 }
 
 static MARKER_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -662,10 +744,7 @@ fn atomic_write_marker(path: &Path, bytes: &[u8]) -> Result<()> {
     file.sync_all().map_err(Error::from)?;
     drop(file);
 
-    atomic_rename(&temp, path)?;
-    if fs::symlink_metadata(&temp).is_ok() {
-        fs::remove_file(&temp).map_err(Error::from)?;
-    }
+    fs::rename(&temp, path).map_err(Error::from)?;
     fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(Error::from)?;
@@ -711,6 +790,7 @@ fn identity_details(identity: &PayloadIdentity) -> BTreeMap<String, String> {
         ("cdm_version".into(), identity.version.clone()),
         ("platform".into(), identity.platform.clone()),
         ("library_sha512".into(), identity.library_sha512.clone()),
+        ("manifest_sha512".into(), identity.manifest_sha512.clone()),
     ])
 }
 
@@ -736,7 +816,20 @@ fn validate_marker_header(marker: &ManagedMarker) -> Result<()> {
             "ownership marker has an invalid Silvervine version",
         ));
     }
+    if !is_sha512_hex(&marker.library_sha512) || !is_sha512_hex(&marker.manifest_sha512) {
+        return Err(Error::invalid_marker(
+            "ownership marker has an invalid payload digest",
+        ));
+    }
     Ok(())
+}
+
+fn is_sha512_hex(value: &str) -> bool {
+    value.len() == 128 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn sha512_hex_of(bytes: &[u8]) -> String {
+    hex_lower(&Sha512::digest(bytes))
 }
 
 fn validate_marker_fields(marker: &ManagedMarker, identity: &PayloadIdentity) -> Result<()> {
@@ -744,6 +837,7 @@ fn validate_marker_fields(marker: &ManagedMarker, identity: &PayloadIdentity) ->
     if marker.cdm_version != identity.version
         || marker.platform != identity.platform
         || marker.library_sha512 != identity.library_sha512
+        || marker.manifest_sha512 != identity.manifest_sha512
     {
         return Err(Error::invalid_marker(
             "ownership marker no longer matches the installed CDM",
@@ -755,14 +849,12 @@ fn validate_marker_fields(marker: &ManagedMarker, identity: &PayloadIdentity) ->
 fn inspect_payload(root: &Path) -> Result<PayloadIdentity> {
     require_regular_directory(root, "CDM root")?;
     let manifest_path = root.join("manifest.json");
-    require_regular_file(&manifest_path, "CDM manifest")?;
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(&manifest_path).map_err(|error| {
-            Error::invalid_marker("could not read CDM manifest").with_source(error)
-        })?)
-        .map_err(|error| {
-            Error::invalid_marker("CDM manifest is not valid JSON").with_source(error)
-        })?;
+    let manifest_bytes =
+        read_bounded_regular_file(&manifest_path, "CDM manifest", MAX_MANIFEST_BYTES as u64)?;
+    let manifest_sha512 = sha512_hex_of(&manifest_bytes);
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).map_err(|error| {
+        Error::invalid_marker("CDM manifest is not valid JSON").with_source(error)
+    })?;
     let version = manifest
         .get("version")
         .and_then(serde_json::Value::as_str)
@@ -800,7 +892,7 @@ fn inspect_payload(root: &Path) -> Result<PayloadIdentity> {
         )));
     }
     let (platform_dir, library) = libraries.pop().expect("one library");
-    require_regular_file(&library, "Widevine library")?;
+    let library_file = open_bounded_regular_file(&library, "Widevine library", MAX_LIBRARY_BYTES)?;
     let platform = current_platform_key()?.as_str().to_owned();
     if platform_dir != expected_platform_dir() {
         return Err(Error::invalid_marker(format!(
@@ -808,13 +900,15 @@ fn inspect_payload(root: &Path) -> Result<PayloadIdentity> {
             expected_platform_dir()
         )));
     }
-    let library_sha512 = sha512_file_hex(&library).map_err(|error| {
-        Error::invalid_marker("could not hash Widevine library").with_source(error)
-    })?;
+    let library_sha512 =
+        sha512_reader(library_file.take(MAX_LIBRARY_BYTES + 1)).map_err(|error| {
+            Error::invalid_marker("could not hash Widevine library").with_source(error)
+        })?;
     Ok(PayloadIdentity {
         version,
         platform,
         library_sha512,
+        manifest_sha512,
     })
 }
 
@@ -840,6 +934,49 @@ fn require_regular_file(path: &Path, label: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn open_bounded_regular_file(path: &Path, label: &str, limit: u64) -> Result<fs::File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            Error::invalid_marker(format!("could not safely open {label}")).with_source(error)
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        Error::invalid_marker(format!("could not inspect opened {label}")).with_source(error)
+    })?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(Error::invalid_marker(format!(
+            "{label} must be a non-empty regular file"
+        )));
+    }
+    if metadata.len() > limit {
+        return Err(Error::invalid_marker(format!(
+            "{label} exceeds the {limit}-byte safety limit"
+        )));
+    }
+    Ok(file)
+}
+
+fn read_bounded_regular_file(path: &Path, label: &str, limit: u64) -> Result<Vec<u8>> {
+    let mut file = open_bounded_regular_file(path, label, limit)?;
+    let capacity = usize::try_from(file.metadata().map_err(Error::from)?.len())
+        .map_err(|_| Error::invalid_marker(format!("{label} size is not representable")))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    (&mut file)
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            Error::invalid_marker(format!("could not read {label}")).with_source(error)
+        })?;
+    if bytes.len() as u64 > limit {
+        return Err(Error::invalid_marker(format!(
+            "{label} grew beyond the {limit}-byte safety limit while it was read"
+        )));
+    }
+    Ok(bytes)
 }
 
 fn expected_platform_dir() -> &'static str {
@@ -881,8 +1018,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        classify, marker_for_cached, stage_verified_payload, validate_installed_cdm,
-        validate_installed_marker, write_marker, OwnershipKind, MANAGED_MARKER_FILENAME,
+        classify, marker_for_cached, marker_for_finalized_payload, stage_verified_payload,
+        validate_installed_cdm, validate_installed_marker, write_marker, OwnershipKind,
+        MANAGED_MARKER_FILENAME,
     };
     use crate::browsers::{Browser, BrowserKind};
     use crate::widevine::CachedCdm;
@@ -921,7 +1059,13 @@ mod tests {
     fn cached(root: &Path, version: &str, library: &[u8]) -> CachedCdm {
         let cdm = root.join("cache").join(version);
         write_payload(&cdm, version, library);
-        CachedCdm::new(version.to_owned(), cdm)
+        let manifest_body = format!(r#"{{"name":"WidevineCdm","version":"{version}"}}"#);
+        CachedCdm::from_verified_payload(
+            version.to_owned(),
+            cdm,
+            crate::widevine::sha512_hex(library),
+            crate::widevine::sha512_hex(manifest_body.as_bytes()),
+        )
     }
 
     fn browser(root: &Path, kind: BrowserKind) -> Browser {
@@ -949,6 +1093,51 @@ mod tests {
 
         assert_eq!(assessment.kind, OwnershipKind::Missing);
     }
+
+    #[test]
+    fn cached_marker_rejects_library_changed_after_cache_verification() {
+        let tmp = TempDir::new().expect("tempdir");
+        let candidate = cached(tmp.path(), "4.10.1", b"candidate");
+        let library = candidate
+            .cdm_dir()
+            .join("_platform_specific")
+            .join(platform_dir())
+            .join(library_name());
+        fs::write(library, b"tampered!").expect("tamper");
+
+        let error = marker_for_cached(&candidate)
+            .expect_err("post-verification cache changes must not be authorized");
+
+        assert_eq!(error.category, crate::ErrorCategory::HashMismatch);
+    }
+
+    #[test]
+    fn cached_marker_rejects_metadata_only_unverified_handle() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cdm_dir = tmp.path().join("cache/1.0.0");
+        write_payload(&cdm_dir, "1.0.0", b"library");
+        let unverified = CachedCdm::new("1.0.0".into(), cdm_dir);
+
+        let error = marker_for_cached(&unverified)
+            .expect_err("unverified cache handles cannot authorize patch markers");
+        assert_eq!(error.category, crate::ErrorCategory::InvalidMarker);
+    }
+
+    #[test]
+    fn cached_marker_rejects_manifest_changed_after_cache_verification() {
+        let tmp = TempDir::new().expect("tempdir");
+        let candidate = cached(tmp.path(), "4.10.1", b"candidate");
+        fs::write(
+            candidate.cdm_dir().join("manifest.json"),
+            br#"{"name":"WidevineCdm","version":"4.10.1","extra":"tampered"}"#,
+        )
+        .expect("tamper manifest");
+
+        let error = marker_for_cached(&candidate)
+            .expect_err("post-verification manifest changes must not be authorized");
+        assert_eq!(error.category, crate::ErrorCategory::HashMismatch);
+    }
+
     #[test]
     fn privileged_stage_copies_only_parent_verified_payload_files() {
         let tmp = TempDir::new().expect("tempdir");
@@ -961,11 +1150,50 @@ mod tests {
         let staged = stage_verified_payload(candidate.cdm_dir(), &trusted, &marker).expect("stage");
 
         assert!(!staged.path().join("untrusted-extra").exists());
-        let staged_cdm = CachedCdm::new(marker.cdm_version.clone(), staged.path().to_owned());
+        let staged_cdm = CachedCdm::from_verified_payload(
+            marker.cdm_version.clone(),
+            staged.path().to_owned(),
+            marker.library_sha512.clone(),
+            marker.manifest_sha512.clone(),
+        );
         assert_eq!(
             marker_for_cached(&staged_cdm).expect("staged marker"),
             marker
         );
+    }
+
+    #[test]
+    fn privileged_stage_rejects_parent_manifest_digest_substitution() {
+        let tmp = TempDir::new().expect("tempdir");
+        let candidate = cached(tmp.path(), "4.10.1", b"candidate");
+        let mut marker = marker_for_cached(&candidate).expect("marker");
+        marker.manifest_sha512 = crate::widevine::sha512_hex(br#"{"version":"substituted"}"#);
+        let trusted = tmp.path().join("trusted");
+        fs::create_dir(&trusted).unwrap();
+
+        let error = stage_verified_payload(candidate.cdm_dir(), &trusted, &marker)
+            .expect_err("parent-selected manifest digest must bind staged bytes");
+        assert_eq!(error.category, crate::ErrorCategory::InvalidMarker);
+    }
+
+    #[test]
+    fn privileged_stage_rejects_oversized_manifest() {
+        let tmp = TempDir::new().expect("tempdir");
+        let candidate = cached(tmp.path(), "4.10.1", b"candidate");
+        let marker = marker_for_cached(&candidate).expect("marker");
+        fs::write(
+            candidate.cdm_dir().join("manifest.json"),
+            vec![b'x'; super::MAX_MANIFEST_BYTES + 1],
+        )
+        .expect("oversized manifest");
+        let trusted = tmp.path().join("trusted");
+        fs::create_dir(&trusted).unwrap();
+
+        let error = stage_verified_payload(candidate.cdm_dir(), &trusted, &marker)
+            .expect_err("oversized payload must not cross the privilege boundary");
+
+        assert_eq!(error.category, crate::ErrorCategory::InvalidMarker);
+        assert!(error.message.contains("size limit"));
     }
 
     #[cfg(unix)]
@@ -1012,8 +1240,8 @@ mod tests {
         let candidate_marker = marker_for_cached(&candidate).expect("candidate marker");
         let target = tmp.path().join("installed");
         write_payload(&target, "4.10.1", b"signed candidate");
-        let installed_source = CachedCdm::new("4.10.1".into(), target.clone());
-        let installed_marker = marker_for_cached(&installed_source).expect("installed marker");
+        let installed_marker =
+            marker_for_finalized_payload(&target, &candidate_marker).expect("finalized marker");
         write_marker(&target, &installed_marker).expect("write marker");
 
         let installed = validate_installed_cdm(&target).expect("validated install");

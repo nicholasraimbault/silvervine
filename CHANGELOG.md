@@ -10,10 +10,12 @@ Future entries are generated from
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-08-01
+
 ### Added
 
 - Added `doctor --media-stack [--browser]` passive browser/CDM provenance,
-  binary architecture, codec, VA-API/Vulkan, and macOS graphics diagnostics
+  binary architecture, codec, VA-API, and macOS VideoToolbox diagnostics
   with stable JSON evidence sources and failure domains. The passive path
   performs no migration, log initialization, network access, or browser launch.
 - Added an explicit `test --browser <name>` normal-profile EME probe for
@@ -45,10 +47,11 @@ Future entries are generated from
 - Published Linux CDM directories and macOS application bundles through
   staged transactions, with verification before publication and rollback on
   failed live verification.
-- Corrected the non-native filesystem-exchange fallback so successful swaps
-  retain both entries and failed swaps preserve recoverable originals.
-- Added versioned cache-integrity metadata, one-time migration for valid
-  existing caches, and validation before activation or rollback.
+- Removed crash-vulnerable non-native filesystem-exchange fallbacks; filesystems
+  without native atomic exchange now fail closed before either path moves.
+- Added versioned cache-integrity metadata for corruption detection; reuse now
+  requires current library and root-manifest digests to match the exact payload
+  extracted from a manifest-authenticated CRX.
 
 ### Security
 
@@ -60,6 +63,15 @@ Future entries are generated from
   size/count/output, and a fixed timeout. Probe data never leaves the device.
 - Privileged patch children now inherit the parent's exact CDM replacement
   consent, and invalid ownership markers cannot bypass provenance checks.
+- Elevated patching now passes only a bounded, parent-authenticated payload,
+  rejects writable or symlinked install ancestry, and revalidates Linux
+  install/parent device and inode identities around publication.
+- Manifest retrieval now fails closed when both fixed Mozilla HTTPS origins
+  fail; mutable on-disk manifest snapshots are write-only and cannot authorize
+  executable content.
+- CRX downloads now enforce strict SHA-512 syntax and a 256 MiB bound, reject
+  symlink cache entries, and extract from the exact verified buffer rather than
+  reopening a mutable pathname.
 
 ## [2.0.1] - 2026-07-31
 
@@ -304,7 +316,8 @@ rc.1 has a hard deadlock on the patch path.
   scripts. Both bugs are obsoleted by the rewrite, but the reports
   were on the money.
 
-[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.0-rc.2...v2.0.0
 [2.0.0-rc.2]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.0-rc.1...v2.0.0-rc.2

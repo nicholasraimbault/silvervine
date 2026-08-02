@@ -69,7 +69,7 @@ impl PlatformPatcher for LinuxPatcher {
         parent_marker: &ManagedMarker,
     ) -> Result<ManagedWrite> {
         write_managed_cdm_into(target, cdm_source, parent_marker)?;
-        Ok(ManagedWrite::MarkerCommitted(parent_marker.clone()))
+        Ok(ManagedWrite::MarkerCommitted)
     }
 
     fn verify_post_patch(&self, target: &Path) -> Result<()> {
@@ -114,7 +114,11 @@ fn write_cdm_into(target: &Path, cdm_source: &Path) -> Result<()> {
         )));
     }
 
-    replace_cdm_transactionally(target, |staged| copy_recursive(cdm_source, staged))
+    replace_cdm_transactionally(
+        target,
+        |staged| copy_recursive(cdm_source, staged),
+        verify_cdm_at,
+    )
 }
 fn write_managed_cdm_into(
     target: &Path,
@@ -133,29 +137,103 @@ fn write_managed_cdm_into(
             target.display()
         )));
     }
-    replace_cdm_transactionally(target, |staged| {
-        copy_recursive(cdm_source, staged)?;
-        let copied = ownership::marker_for_finalized_payload(staged, parent_marker)?;
-        if &copied != parent_marker {
-            return Err(Error::invalid_marker(
-                "Linux CDM copy changed the parent-selected payload",
-            ));
-        }
-        ownership::write_marker(staged, parent_marker)?;
-        let installed = ownership::validate_installed_cdm(staged)?;
-        if installed.marker() != parent_marker {
-            return Err(Error::invalid_marker(
-                "Linux staging committed an unexpected ownership marker",
+    replace_cdm_transactionally(
+        target,
+        |staged| {
+            copy_recursive(cdm_source, staged)?;
+            let copied = ownership::marker_for_finalized_payload(staged, parent_marker)?;
+            if &copied != parent_marker {
+                return Err(Error::invalid_marker(
+                    "Linux CDM copy changed the parent-selected payload",
+                ));
+            }
+            ownership::write_marker(staged, parent_marker)?;
+            let installed = ownership::validate_installed_cdm(staged)?;
+            if installed.marker() != parent_marker {
+                return Err(Error::invalid_marker(
+                    "Linux staging committed an unexpected ownership marker",
+                ));
+            }
+            Ok(())
+        },
+        |live_root| {
+            verify_cdm_at(live_root)?;
+            let installed = ownership::validate_installed_cdm(&live_root.join(CDM_SUBDIR))?;
+            if installed.marker() != parent_marker {
+                return Err(Error::invalid_marker(
+                    "Linux live publication committed an unexpected ownership marker",
+                ));
+            }
+            Ok(())
+        },
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstallPathIdentity {
+    install_device: u64,
+    install_inode: u64,
+    parent_device: u64,
+    parent_inode: u64,
+}
+
+impl InstallPathIdentity {
+    fn capture(install: &Path, parent: &Path) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let install_metadata = fs::symlink_metadata(install).map_err(Error::from)?;
+        let parent_metadata = fs::symlink_metadata(parent).map_err(Error::from)?;
+        Ok(Self {
+            install_device: install_metadata.dev(),
+            install_inode: install_metadata.ino(),
+            parent_device: parent_metadata.dev(),
+            parent_inode: parent_metadata.ino(),
+        })
+    }
+
+    fn revalidate(self, install: &Path, parent: &Path) -> Result<()> {
+        let current = Self::capture(install, parent)?;
+        if current != self {
+            return Err(Error::permission_denied(
+                "privileged browser install or parent identity changed before publication",
             ));
         }
         Ok(())
-    })
+    }
 }
 
-fn replace_cdm_transactionally<F>(target: &Path, populate: F) -> Result<()>
+fn capture_privileged_install_identity(target: &Path) -> Result<Option<InstallPathIdentity>> {
+    if !crate::platform::is_running_as_root() {
+        return Ok(None);
+    }
+    let parent = target.parent().ok_or_else(|| {
+        Error::unknown_bundle_structure("browser install has no parent for secure publication")
+    })?;
+    super::validate_privileged_snapshot_parent(target, parent)?;
+    InstallPathIdentity::capture(target, parent).map(Some)
+}
+
+fn revalidate_privileged_install_identity(
+    target: &Path,
+    expected: Option<InstallPathIdentity>,
+) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let parent = target.parent().ok_or_else(|| {
+        Error::unknown_bundle_structure("browser install has no parent for secure publication")
+    })?;
+    super::validate_privileged_snapshot_parent(target, parent)?;
+    expected.revalidate(target, parent)
+}
+
+fn replace_cdm_transactionally<F, V>(target: &Path, populate: F, validate_live: V) -> Result<()>
 where
     F: FnOnce(&Path) -> Result<()>,
+    V: FnOnce(&Path) -> Result<()>,
 {
+    let privileged_identity = capture_privileged_install_identity(target)?;
+    revalidate_privileged_install_identity(target, privileged_identity)?;
     let staging = tempfile::Builder::new()
         .prefix(".silvervine-widevine-")
         .tempdir_in(target)
@@ -171,20 +249,31 @@ where
     set_permissions(&staged, DIR_MODE)?;
     populate(&staged)?;
     verify_cdm_at(staging.path())?;
-
+    revalidate_privileged_install_identity(target, privileged_identity)?;
     let destination = target.join(CDM_SUBDIR);
     let replaced_existing = destination.exists();
     crate::platform::atomic_rename(&staged, &destination)?;
-    if let Err(verify_error) = verify_cdm_at(target) {
+    let live_validation = revalidate_privileged_install_identity(target, privileged_identity)
+        .and_then(|()| validate_live(target));
+    if let Err(verify_error) = live_validation {
         let rollback = if replaced_existing {
             crate::platform::atomic_rename(&staged, &destination)
         } else {
             fs::remove_dir_all(&destination).map_err(Error::from)
         };
         if let Err(rollback_error) = rollback {
+            let recovery = if replaced_existing {
+                Some(staging.keep())
+            } else {
+                None
+            };
             let category = verify_error.category;
+            let recovery = recovery.map_or_else(
+                || "no retired payload was available".to_owned(),
+                |path| format!("the retired payload was preserved at {}", path.display()),
+            );
             let message = format!(
-                "{}; rollback also failed: {rollback_error}",
+                "{}; rollback also failed and {recovery}",
                 verify_error.message
             );
             return Err(Error::new(category, message).with_source(rollback_error));
@@ -465,14 +554,34 @@ mod tests {
         fs::create_dir_all(&live).unwrap();
         fs::write(live.join("manifest.json"), b"old").unwrap();
 
-        let result = replace_cdm_transactionally(&install, |staged| {
-            fs::write(staged.join("partial"), b"incomplete").unwrap();
-            Err(Error::other("injected staging failure"))
-        });
+        let result = replace_cdm_transactionally(
+            &install,
+            |staged| {
+                fs::write(staged.join("partial"), b"incomplete").unwrap();
+                Err(Error::other("injected staging failure"))
+            },
+            |_| Ok(()),
+        );
 
         assert!(result.is_err());
         assert_eq!(fs::read(live.join("manifest.json")).unwrap(), b"old");
         assert!(!live.join("partial").exists());
+    }
+
+    #[test]
+    fn install_identity_rejects_a_replaced_directory() {
+        let tmp = TempDir::new().unwrap();
+        let install = make_install(tmp.path());
+        let identity =
+            InstallPathIdentity::capture(&install, tmp.path()).expect("capture identity");
+        let retired = tmp.path().join("retired");
+        fs::rename(&install, &retired).expect("retire install");
+        fs::create_dir(&install).expect("replacement install");
+
+        let error = identity
+            .revalidate(&install, tmp.path())
+            .expect_err("replacement must not retain the authorized identity");
+        assert_eq!(error.category, crate::ErrorCategory::PermissionDenied);
     }
 
     #[test]

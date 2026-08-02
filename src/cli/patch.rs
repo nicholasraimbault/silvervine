@@ -268,9 +268,11 @@ pub fn run_privileged(args: &PrivilegedArgs) -> Result<()> {
         &args.managed_marker,
     )?;
     let browser = privileged_browser(args);
-    let cdm = CachedCdm::new(
+    let cdm = CachedCdm::from_verified_payload(
         args.managed_marker.cdm_version.clone(),
         staged.path().to_owned(),
+        args.managed_marker.library_sha512.clone(),
+        args.managed_marker.manifest_sha512.clone(),
     );
     let patcher = patch::host_patcher_for_layout(
         args.framework_name.as_deref(),
@@ -301,8 +303,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
     fn test_managed_marker() -> crate::widevine::ownership::ManagedMarker {
+        let manifest = br#"{"version":"1.0"}"#;
         crate::widevine::ownership::ManagedMarker {
-            schema_version: 2,
+            schema_version: 3,
             silvervine_version: env!("CARGO_PKG_VERSION").into(),
             cdm_version: "1.0".into(),
             platform: crate::widevine::current_platform_key()
@@ -310,6 +313,7 @@ mod tests {
                 .as_str()
                 .into(),
             library_sha512: "0".repeat(128),
+            manifest_sha512: crate::widevine::sha512_hex(manifest),
         }
     }
 
@@ -394,12 +398,14 @@ mod tests {
         let platform = dir.join("_platform_specific").join(test_platform_dir());
         fs::create_dir_all(&platform).unwrap();
         fs::write(platform.join(test_library_name()), b"fake").unwrap();
-        fs::write(
-            dir.join("manifest.json"),
-            format!(r#"{{"version":"{version}"}}"#),
+        let manifest_body = format!(r#"{{"version":"{version}"}}"#);
+        fs::write(dir.join("manifest.json"), &manifest_body).unwrap();
+        CachedCdm::from_verified_payload(
+            version.to_string(),
+            dir,
+            crate::widevine::sha512_hex(b"fake"),
+            crate::widevine::sha512_hex(manifest_body.as_bytes()),
         )
-        .unwrap();
-        CachedCdm::new(version.to_string(), dir)
     }
 
     fn test_platform_dir() -> &'static str {

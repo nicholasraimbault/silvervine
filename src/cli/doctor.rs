@@ -277,8 +277,11 @@ fn collect_media(detected: &[&crate::browsers::Browser]) -> MediaDiagnostics {
         .copied()
         .map(|browser| {
             let passive = collect_browser(browser);
-            let (cached_probe, cache_check) =
-                cached_probe(browser.name(), passive.fingerprint.as_ref());
+            let (cached_probe, cache_check) = cached_probe(
+                browser.name(),
+                passive.fingerprint.as_ref(),
+                &passive.ownership,
+            );
             BrowserMediaDiagnostics {
                 passive,
                 cached_probe,
@@ -295,6 +298,7 @@ fn collect_media(detected: &[&crate::browsers::Browser]) -> MediaDiagnostics {
 fn cached_probe(
     browser: &str,
     fingerprint: Option<&ProbeFingerprint>,
+    ownership: &crate::widevine::ownership::OwnershipAssessment,
 ) -> (Option<StoredProbeReport>, DiagnosticCheck) {
     let Some(fingerprint) = fingerprint else {
         return (
@@ -307,7 +311,7 @@ fn cached_probe(
         );
     };
     match load_default(fingerprint) {
-        Ok(CacheLookup::Hit(report)) => cache_hit(report),
+        Ok(CacheLookup::Hit(report)) => cache_hit(report, ownership),
         Ok(CacheLookup::Stale(report)) => (
             None,
             unavailable_cache_check(
@@ -359,12 +363,16 @@ fn cached_probe(
     }
 }
 
-fn cache_hit(report: StoredProbeReport) -> (Option<StoredProbeReport>, DiagnosticCheck) {
+fn cache_hit(
+    mut report: StoredProbeReport,
+    ownership: &crate::widevine::ownership::OwnershipAssessment,
+) -> (Option<StoredProbeReport>, DiagnosticCheck) {
+    report.assessment = crate::eme::probe::assess(&report.raw, ownership);
     let check = DiagnosticCheck {
         id: "eme.cached_probe".into(),
         status: report.assessment.status,
         source: EvidenceSource::LiveBrowser,
-        failure_domain: FailureDomain::BrowserMediaStack,
+        failure_domain: report.assessment.domain,
         summary: format!(
             "Exact-fingerprint live EME evidence was probed at Unix {}.",
             report.probed_at
@@ -926,5 +934,60 @@ mod tests {
         assert!(text.contains("HostProbe/BrowserMediaStack"));
         assert!(text.contains("did not launch a browser"));
         assert!(text.contains("not certified L1"));
+    }
+    #[test]
+    fn cache_hit_reassesses_raw_probe_with_current_ownership() {
+        let raw = crate::eme::probe::RawProbeResult {
+            schema_version: crate::eme::probe::PROBE_SCHEMA_VERSION,
+            user_agent: "Chromium/150".into(),
+            eme_api: false,
+            media_capabilities_api: false,
+            baseline: crate::eme::probe::CapabilityStatus::Unavailable,
+            baseline_error: None,
+            robustness: Vec::new(),
+            encryption_schemes: Vec::new(),
+            hdcp: Vec::new(),
+            codecs: Vec::new(),
+        };
+        let stale_ownership = crate::widevine::ownership::OwnershipAssessment::default();
+        let stale_assessment = crate::eme::probe::assess(&raw, &stale_ownership);
+        assert_eq!(
+            stale_assessment.domain,
+            crate::diagnostics::FailureDomain::Silvervine
+        );
+        let report = StoredProbeReport {
+            schema_version: crate::diagnostics::store::STORE_SCHEMA_VERSION,
+            probed_at: 123,
+            browser_name: "Chromium".into(),
+            fingerprint: ProbeFingerprint::new(
+                "/opt/chromium",
+                Some("150".into()),
+                1,
+                1,
+                "browser-digest",
+                Vec::new(),
+            ),
+            raw: raw.clone(),
+            assessment: stale_assessment,
+        };
+        let current_ownership = crate::widevine::ownership::OwnershipAssessment {
+            kind: crate::widevine::ownership::OwnershipKind::Managed,
+            summary: "Verified current Silvervine CDM.".into(),
+            action: None,
+            details: std::collections::BTreeMap::new(),
+        };
+
+        let (updated, check) = cache_hit(report, &current_ownership);
+        let updated = updated.expect("cached report");
+
+        assert_eq!(
+            updated.assessment,
+            crate::eme::probe::assess(&raw, &current_ownership)
+        );
+        assert_eq!(
+            updated.assessment.domain,
+            crate::diagnostics::FailureDomain::BrowserMediaStack
+        );
+        assert_eq!(check.failure_domain, updated.assessment.domain);
     }
 }

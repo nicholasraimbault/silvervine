@@ -203,7 +203,27 @@ fn rollback_json_stdout_is_exactly_one_document() {
     let library_dir = previous.join("_platform_specific").join(platform_dir);
     std::fs::create_dir_all(&library_dir).unwrap();
     std::fs::write(previous.join("manifest.json"), br#"{"version":"1.0"}"#).unwrap();
-    std::fs::write(library_dir.join(library), b"fixture").unwrap();
+    let library_bytes = b"fixture";
+    std::fs::write(library_dir.join(library), library_bytes).unwrap();
+    #[cfg(target_os = "linux")]
+    let platform = "linux-x86_64";
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let platform = "darwin-aarch64";
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    let platform = "darwin-x86_64";
+    let integrity = serde_json::json!({
+        "schema_version": 2,
+        "version": "1.0",
+        "platform": platform,
+        "library_size": library_bytes.len(),
+        "library_sha512": silvervine::widevine::sha512_hex(library_bytes),
+        "manifest_sha512": silvervine::widevine::sha512_hex(br#"{"version":"1.0"}"#),
+    });
+    std::fs::write(
+        previous.join(".silvervine-integrity.json"),
+        serde_json::to_vec(&integrity).unwrap(),
+    )
+    .unwrap();
     std::fs::create_dir_all(cache.join("2.0")).unwrap();
     symlink("2.0", cache.join("current")).unwrap();
     symlink("1.0", cache.join("previous")).unwrap();

@@ -4,6 +4,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use tempfile::TempDir;
+fn managed_marker(version: &str, library: &[u8]) -> String {
+    let manifest_body = format!(r#"{{"version":"{version}"}}"#);
+    serde_json::to_string(&silvervine::widevine::ownership::ManagedMarker {
+        schema_version: 3,
+        silvervine_version: env!("CARGO_PKG_VERSION").into(),
+        cdm_version: version.into(),
+        platform: "Linux_x86_64-gcc3".into(),
+        library_sha512: silvervine::widevine::download::sha512_hex(library),
+        manifest_sha512: silvervine::widevine::download::sha512_hex(manifest_body.as_bytes()),
+    })
+    .expect("marker")
+}
 
 #[test]
 fn privileged_operation_patches_exact_target_without_child_cache_log_or_hooks() {
@@ -21,6 +33,7 @@ fn privileged_operation_patches_exact_target_without_child_cache_log_or_hooks() 
     std::fs::create_dir_all(&platform).unwrap();
     std::fs::write(platform.join("libwidevinecdm.so"), b"verified-cdm").unwrap();
     std::fs::write(cdm.join("manifest.json"), br#"{"version":"9.8.7.6"}"#).unwrap();
+    let marker = managed_marker("9.8.7.6", b"verified-cdm");
 
     let hook_marker = child_root.join("hook-ran");
     let hook = child_root.join("config/silvervine/hooks/post-patch");
@@ -46,8 +59,8 @@ fn privileged_operation_patches_exact_target_without_child_cache_log_or_hooks() 
             parent_root.to_str().unwrap(),
             "--cdm-dir",
             cdm.to_str().unwrap(),
-            "--cdm-version",
-            "9.8.7.6",
+            "--managed-marker",
+            marker.as_str(),
             "--browser-name",
             "ParentOnlyCustom",
             "--force",
@@ -66,6 +79,10 @@ fn privileged_operation_patches_exact_target_without_child_cache_log_or_hooks() 
             .unwrap(),
         b"verified-cdm"
     );
+    let installed_marker =
+        silvervine::widevine::ownership::validate_installed_marker(&install.join("WidevineCdm"))
+            .expect("installed marker");
+    assert_eq!(installed_marker.cdm_version, "9.8.7.6");
     assert!(!decoy.join("WidevineCdm").exists());
     assert!(
         !child_root.join("cache").exists(),
@@ -92,6 +109,7 @@ fn privileged_operation_ignores_preplaced_snapshot_symlink() {
     std::fs::create_dir_all(&platform).unwrap();
     std::fs::write(platform.join("libwidevinecdm.so"), b"verified-cdm").unwrap();
     std::fs::write(cdm.join("manifest.json"), br#"{"version":"1"}"#).unwrap();
+    let marker = managed_marker("1", b"verified-cdm");
 
     let malicious_root = parent.join(".silvervine-backups");
     std::os::unix::fs::symlink(&victim, &malicious_root).unwrap();
@@ -104,8 +122,8 @@ fn privileged_operation_ignores_preplaced_snapshot_symlink() {
             parent.to_str().unwrap(),
             "--cdm-dir",
             cdm.to_str().unwrap(),
-            "--cdm-version",
-            "1",
+            "--managed-marker",
+            marker.as_str(),
             "--browser-name",
             "Evil",
             "--force",
@@ -131,6 +149,7 @@ fn privileged_operation_rejects_missing_exact_target() {
     let tmp = TempDir::new().unwrap();
     let cdm = tmp.path().join("cdm");
     std::fs::create_dir_all(&cdm).unwrap();
+    let marker = managed_marker("1", b"");
     let output = Command::new(env!("CARGO_BIN_EXE_silvervine"))
         .args([
             "__privileged-patch",
@@ -140,8 +159,8 @@ fn privileged_operation_rejects_missing_exact_target() {
             tmp.path().to_str().unwrap(),
             "--cdm-dir",
             cdm.to_str().unwrap(),
-            "--cdm-version",
-            "1",
+            "--managed-marker",
+            marker.as_str(),
             "--browser-name",
             "Missing",
         ])

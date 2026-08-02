@@ -81,7 +81,7 @@ Tests set these via the `ScopedEnv` RAII guard pattern — see existing tests in
 
 4. **Synthesize fixtures** when possible. Sample CRX3 files are constructed in-test via the `zip` crate's `ZipWriter`. Fake `/Applications` trees are constructed in `TempDir`. Tests should not depend on real-world artifacts being present.
 
-5. **Network tests are gated `#[ignore]`.** `cargo test` doesn't run them; `cargo test -- --ignored` does. Use `#[ignore = "<reason>"]` to make the gate self-documenting. Network tests verify the real Mozilla manifest URL fallback chain works against the live URL.
+5. **Network tests are gated `#[ignore]`.** `cargo test` doesn't run them; `cargo test -- --ignored` does. Use `#[ignore = "<reason>"]` to make the gate self-documenting. Network tests verify that both fixed Mozilla manifest HTTPS origins work live; mutable on-disk snapshots are never fallback trust roots.
 
 ## Conventional commits
 

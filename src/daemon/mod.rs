@@ -631,10 +631,13 @@ fn drive_patch_flow_with_cdm(
             .collect();
     };
 
-    // Retain the selected CDM so repair does not fetch a manifest when the
-    // verified current cache is already usable.
-    let cached_cdm =
-        fresh_cdm.or_else(|| crate::widevine::cache::validated_current().ok().flatten());
+    // Metadata-only current cache is never patch-authoritative. A live
+    // vendor ensure supplies verified digests when a patch is required.
+    // Already-managed installs still short-circuit via classify_without_candidate
+    // without network.
+    let cached_cdm = fresh_cdm.filter(|cdm| {
+        cdm.verified_library_sha512().is_some() && cdm.verified_manifest_sha512().is_some()
+    });
     let mut results: Vec<(String, bool)> = Vec::new();
     let mut needs: Vec<&Browser> = Vec::new();
     for browser in candidates {
@@ -724,8 +727,29 @@ pub fn select_patch_action(
     cdm_target: &std::path::Path,
 ) -> PatchSelection {
     let Some(candidate) = candidate else {
-        // Without a verified candidate the patch flow must resolve one first.
-        return PatchSelection::Patch;
+        let assessment = match ownership::classify_without_candidate(browser, cdm_target) {
+            Ok(assessment) => assessment,
+            Err(error) => OwnershipAssessment {
+                kind: OwnershipKind::InvalidMarker,
+                summary: "The CDM target could not be classified safely.".into(),
+                action: Some("Inspect the browser CDM path before retrying.".into()),
+                details: std::collections::BTreeMap::from([
+                    ("error_category".into(), error.category.as_str().into()),
+                    ("error".into(), error.message),
+                ]),
+            },
+        };
+        return match assessment.kind {
+            OwnershipKind::External | OwnershipKind::InvalidMarker => {
+                preserved_selection(&assessment)
+            }
+            // Valid managed installs are a no-op without network when the
+            // daemon has no live vendor-authenticated candidate.
+            OwnershipKind::Managed if !force => PatchSelection::SkipCurrent,
+            OwnershipKind::Missing | OwnershipKind::Managed | OwnershipKind::LegacyManaged => {
+                PatchSelection::Patch
+            }
+        };
     };
     let Ok(marker) = ownership::marker_for_cached(candidate) else {
         return PatchSelection::Patch;
@@ -1415,7 +1439,13 @@ mod tests {
     fn make_candidate(root: &Path, version: &str, library: &[u8]) -> CachedCdm {
         let dir = root.join("cache").join(version);
         write_payload(&dir, version, library);
-        CachedCdm::new(version.to_string(), dir)
+        let manifest_body = format!(r#"{{"version":"{version}"}}"#);
+        CachedCdm::from_verified_payload(
+            version.to_string(),
+            dir,
+            crate::widevine::sha512_hex(library),
+            crate::widevine::sha512_hex(manifest_body.as_bytes()),
+        )
     }
 
     fn install_target(browser: &Browser) -> PathBuf {
@@ -1511,7 +1541,7 @@ mod tests {
         write_payload(&install_target(&b), "4.10.2934.0", b"payload");
         std::fs::write(
             install_target(&b).join(ownership::MANAGED_MARKER_FILENAME),
-            br#"{"schema_version":2,"silvervine_version":"2.0.1","cdm_version":"4.10.2934.0","platform":"bogus","library_sha512":"deadbeef"}"#,
+            br#"{"schema_version":3,"silvervine_version":"2.0.1","cdm_version":"4.10.2934.0","platform":"bogus","library_sha512":"deadbeef","manifest_sha512":"cafebabe"}"#,
         )
         .unwrap();
         match select_patch_action(&b, Some(&candidate), false, &install_target(&b)) {
@@ -1575,11 +1605,29 @@ mod tests {
     }
 
     #[test]
-    fn needs_patch_when_cache_unknown() {
+    fn managed_install_without_verified_candidate_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let b = fake_browser("Helium", tmp.path().join("h"));
+        let candidate = make_candidate(tmp.path(), "4.10.2934.0", b"managed");
+        write_managed_install(&b, &candidate);
+        assert_eq!(
+            select_patch_action(&b, None, false, &install_target(&b)),
+            PatchSelection::SkipCurrent
+        );
+        assert!(!needs_patch(&b, None, false, &install_target(&b)));
+        // force still rechecks managed installs when a candidate is absent.
+        assert_eq!(
+            select_patch_action(&b, None, true, &install_target(&b)),
+            PatchSelection::Patch
+        );
+    }
+
+    #[test]
+    fn cache_unknown_preserves_unmarked_install() {
         let tmp = TempDir::new().unwrap();
         let b = fake_browser("Helium", tmp.path().join("h"));
         write_payload(&install_target(&b), "4.10.2891.0", b"old");
-        assert!(needs_patch(&b, None, false, &install_target(&b)));
+        assert!(!needs_patch(&b, None, false, &install_target(&b)));
     }
 
     #[test]

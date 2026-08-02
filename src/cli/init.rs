@@ -514,7 +514,13 @@ mod tests {
     fn make_cdm(root: &Path, version: &str) -> CachedCdm {
         let dir = root.join(version);
         write_test_cdm(&dir, version, b"fake");
-        CachedCdm::new(version.to_string(), dir)
+        let manifest_body = format!(r#"{{"version":"{version}"}}"#);
+        CachedCdm::from_verified_payload(
+            version.to_string(),
+            dir,
+            crate::widevine::sha512_hex(b"fake"),
+            crate::widevine::sha512_hex(manifest_body.as_bytes()),
+        )
     }
 
     fn write_test_cdm(root: &Path, version: &str, library: &[u8]) {

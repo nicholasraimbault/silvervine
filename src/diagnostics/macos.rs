@@ -198,7 +198,7 @@ fn videotoolbox_codec_check(id: &str, fourcc: &str, label: &str) -> DiagnosticCh
     match query_videotoolbox_support(fourcc) {
         VideoToolboxQuery::Supported(supported) => DiagnosticCheck {
             id: format!("host.videotoolbox.{id}"),
-            status: DiagnosticStatus::Pass,
+            status: videotoolbox_status(supported),
             source: EvidenceSource::HostProbe,
             failure_domain: FailureDomain::BrowserMediaStack,
             summary: if supported {
@@ -226,6 +226,14 @@ fn videotoolbox_codec_check(id: &str, fourcc: &str, label: &str) -> DiagnosticCh
                 ("reason".into(), reason),
             ]),
         },
+    }
+}
+
+const fn videotoolbox_status(supported: bool) -> DiagnosticStatus {
+    if supported {
+        DiagnosticStatus::Pass
+    } else {
+        DiagnosticStatus::Warn
     }
 }
 
@@ -421,6 +429,12 @@ mod tests {
         assert_eq!(fourcc_label("hvc1"), "HEVC");
         assert_eq!(fourcc_label("vp09"), "VP9");
         assert_eq!(fourcc_label("av01"), "AV1");
+    }
+
+    #[test]
+    fn absent_videotoolbox_hardware_support_is_not_a_pass() {
+        assert_eq!(videotoolbox_status(false), DiagnosticStatus::Warn);
+        assert_eq!(videotoolbox_status(true), DiagnosticStatus::Pass);
     }
 
     #[test]

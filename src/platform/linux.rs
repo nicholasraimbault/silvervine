@@ -17,9 +17,8 @@
 //! `renameat2(RENAME_EXCHANGE)` works on every modern Linux filesystem
 //! (ext4 ≥ 3.15, btrfs, xfs, f2fs). We call `libc::renameat2` directly
 //! because nix's safe wrapper is gated on `target_env = "gnu"` and does
-//! not exist on musl (a target we ship via cargo-dist). On `EINVAL`
-//! (filesystem doesn't support exchange) we fall back to the two-step
-//! rename documented in the trait doc.
+//! not exist on musl (a target we ship via cargo-dist). Filesystems that
+//! return `EINVAL` for native exchange fail closed before either path moves.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -91,6 +90,9 @@ pub(super) fn run_as_root(command: &[&str]) -> Result<Output> {
         "neither pkexec nor sudo is on $PATH; cannot elevate privileges",
     ))
 }
+pub(super) fn run_pinned_as_root(command: &[&str], _expected_sha512: &str) -> Result<Output> {
+    run_as_root(command)
+}
 
 /// Path-resolve `binary` against `$PATH`. Returns `None` if not found.
 ///
@@ -118,8 +120,9 @@ fn spawn_with_elevator(elevator: &str, command: &[&str]) -> Result<Output> {
         .map_err(|e| Error::other(format!("failed to spawn {elevator}")).with_source(e))
 }
 
-/// Atomic exchange via `renameat2(RENAME_EXCHANGE)`, with a two-step
-/// fallback for filesystems that don't support it.
+/// Atomic exchange via `renameat2(RENAME_EXCHANGE)`.
+///
+/// Unsupported filesystems fail closed without moving either path.
 pub(super) fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
     if !dst.exists() {
         // No exchange needed if the destination doesn't yet exist —
@@ -133,11 +136,7 @@ pub(super) fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
         })?;
         return Ok(());
     }
-    match exchange_renameat2(src, dst) {
-        Ok(()) => Ok(()),
-        Err(e) if e.is_invalid_argument() => super::fallback_exchange(src, dst),
-        Err(e) => Err(e.into_error(src, dst)),
-    }
+    exchange_renameat2(src, dst).map_err(|error| error.into_error(src, dst))
 }
 
 /// Wrapper return type for `renameat2`-style exchanges.
@@ -149,10 +148,6 @@ enum ExchangeError {
 }
 
 impl ExchangeError {
-    fn is_invalid_argument(&self) -> bool {
-        matches!(self, Self::InvalidArgument)
-    }
-
     fn into_error(self, src: &Path, dst: &Path) -> Error {
         let io_err = match self {
             Self::InvalidArgument => std::io::Error::from(std::io::ErrorKind::InvalidInput),
@@ -306,40 +301,9 @@ mod tests {
         let _ = which("sudo");
     }
 
-    /// Fallback two-step rename works when invoked directly. Integration
-    /// of "kernel rejected the syscall, fall back" requires a non-ext4
-    /// filesystem we can't synthesize cheaply; we exercise the helper
-    /// directly to keep the path covered.
-    #[test]
-    fn fallback_two_step_rename_swaps_into_place() {
-        let tmp = TempDir::new().expect("tempdir");
-        let src = tmp.path().join("src");
-        let dst = tmp.path().join("dst");
-        fs::write(&src, b"new").unwrap();
-        fs::write(&dst, b"old").unwrap();
-        super::super::fallback_exchange(&src, &dst).expect("fallback ok");
-        assert_eq!(fs::read(&src).unwrap(), b"old");
-        assert_eq!(fs::read(&dst).unwrap(), b"new");
-    }
-
-    #[test]
-    fn fallback_two_step_rename_recovers_when_step_2_fails() {
-        let tmp = TempDir::new().expect("tempdir");
-        let src = tmp.path().join("nonexistent");
-        let dst = tmp.path().join("dst");
-        fs::write(&dst, b"old").unwrap();
-        // Step 1 succeeds (rename dst -> backup), step 2 fails because
-        // src doesn't exist; the function must restore dst from backup.
-        let r = super::super::fallback_exchange(&src, &dst);
-        assert!(r.is_err());
-        assert!(dst.exists(), "dst must be restored on failure");
-    }
-
-    /// Direct test of the renameat2 wrapper: should succeed on tmpfs.
-    /// Most CI runners use tmpfs for `/tmp`, which supports
-    /// `RENAME_EXCHANGE` since kernel 3.15. If a CI agent ever runs on
-    /// an exotic FS that returns `EINVAL`, the wrapper still works
-    /// because the public `atomic_rename` falls back.
+    /// Direct test of the renameat2 wrapper. Most CI `/tmp` filesystems
+    /// support `RENAME_EXCHANGE`; unsupported filesystems return an error
+    /// without invoking a non-atomic fallback.
     #[test]
     fn exchange_renameat2_swaps_on_tmpfs() {
         let tmp = TempDir::new().expect("tempdir");
@@ -396,7 +360,7 @@ mod tests {
     #[test]
     fn exchange_error_into_error_carries_path_context() {
         let e = ExchangeError::InvalidArgument;
-        assert!(e.is_invalid_argument());
+        assert!(matches!(&e, ExchangeError::InvalidArgument));
         let err = e.into_error(std::path::Path::new("/x"), std::path::Path::new("/y"));
         assert!(err.message.contains("atomic_rename"));
         assert!(err.message.contains("/x"));

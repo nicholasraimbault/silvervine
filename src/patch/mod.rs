@@ -273,8 +273,9 @@ impl PatchReport {
 pub enum ManagedWrite {
     /// Only payload bytes were written; core must validate and commit a marker.
     PayloadOnly,
-    /// Payload and marker were validated and atomically published together.
-    MarkerCommitted(ManagedMarker),
+    /// Payload and marker were atomically published and validated at the live
+    /// path before the retired payload was discarded.
+    MarkerCommitted,
 }
 enum PatchAttempt {
     Success,
@@ -323,8 +324,12 @@ pub trait PlatformPatcher {
     /// inside the platform transaction.
     ///
     /// The default writes only the payload; core then validates and commits the
-    /// marker. Transactional implementations override this to seal the marker
-    /// before atomic publication.
+    /// marker. A transactional implementation returning `MarkerCommitted` must
+    /// validate the live payload and marker before discarding rollback state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the categorized platform write error when placement fails.
     fn write_managed_cdm(
         &self,
         target: &Path,
@@ -346,6 +351,11 @@ pub trait PlatformPatcher {
     }
 
     /// Validate a payload-only write and produce the marker core will commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorCategory::InvalidMarker`] when the written payload
+    /// no longer matches the parent-authorized identity, or an inspection error.
     fn prepare_managed_payload(
         &self,
         _target: &Path,
@@ -363,9 +373,9 @@ pub trait PlatformPatcher {
 
     /// Verify the CDM and ownership marker at their live post-patch location.
     ///
-    /// This runs after marker commit. Transactional implementations perform a
-    /// post-publish check only; they must not mutate the marked payload or its
-    /// enclosing signature seal.
+    /// Core calls this after a payload-only marker commit. Transactional
+    /// implementations returning `MarkerCommitted` call it, or an equivalent
+    /// platform-specific validator, while rollback state is still retained.
     ///
     /// # Errors
     ///
@@ -646,16 +656,36 @@ fn run_patch(
             &marker,
         );
     }
+    let direct_root_stage = if running_as_root && !options.as_root {
+        let trusted_parent = select_privileged_snapshot_parent(browser.install_path())?;
+        validate_privileged_snapshot_parent(browser.install_path(), &trusted_parent)?;
+        Some(ownership::stage_verified_payload(
+            cdm.cdm_dir(),
+            &trusted_parent,
+            &marker,
+        )?)
+    } else {
+        None
+    };
+    let direct_root_cdm = direct_root_stage.as_ref().map(|staged| {
+        CachedCdm::from_verified_payload(
+            cdm.version().to_owned(),
+            staged.path().to_owned(),
+            marker.library_sha512.clone(),
+            marker.manifest_sha512.clone(),
+        )
+    });
+    let write_cdm = direct_root_cdm.as_ref().unwrap_or(cdm);
 
     if patcher.writes_transactionally() {
-        match perform_patch(browser, cdm, patcher, &cdm_target, &marker) {
+        match perform_patch(browser, write_cdm, patcher, &cdm_target, &marker) {
             PatchAttempt::Success => {}
             PatchAttempt::FailedBeforeModification(error)
             | PatchAttempt::ModifiedOriginal(error) => return Err(error),
         }
     } else {
         let snapshot = take_snapshot(browser, options, version_before.as_deref())?;
-        match perform_patch(browser, cdm, patcher, &cdm_target, &marker) {
+        match perform_patch(browser, write_cdm, patcher, &cdm_target, &marker) {
             PatchAttempt::Success => {}
             PatchAttempt::FailedBeforeModification(patch_err) => {
                 let _ = snapshot.commit();
@@ -688,17 +718,14 @@ fn enforce_ownership(assessment: &OwnershipAssessment, options: &PatchOptions) -
         None => assessment.summary.clone(),
     };
     match assessment.kind {
-        OwnershipKind::InvalidMarker if !options.replace_external_cdm => {
-            Err(Error::invalid_marker(message))
-        }
+        OwnershipKind::InvalidMarker => Err(Error::invalid_marker(message)),
         OwnershipKind::External if !options.replace_external_cdm => {
             Err(Error::external_cdm(message))
         }
         OwnershipKind::Missing
         | OwnershipKind::Managed
         | OwnershipKind::LegacyManaged
-        | OwnershipKind::External
-        | OwnershipKind::InvalidMarker => Ok(()),
+        | OwnershipKind::External => Ok(()),
     }
 }
 
@@ -773,60 +800,80 @@ fn select_privileged_snapshot_parent(install_path: &Path) -> Result<PathBuf> {
         ))
         .with_source(error)
     })?;
-    let install_device = std::fs::metadata(&canonical_install)
-        .map_err(Error::from)?
-        .dev();
-    let candidate = canonical_install.parent().ok_or_else(|| {
-        Error::unknown_bundle_structure("browser install has no parent for a secure snapshot")
+    if canonical_install != install_path {
+        return Err(Error::unknown_bundle_structure(
+            "privileged browser install path must be exact and canonical",
+        ));
+    }
+    let install_metadata = std::fs::symlink_metadata(&canonical_install).map_err(Error::from)?;
+    let parent = canonical_install.parent().ok_or_else(|| {
+        Error::unknown_bundle_structure("browser install has no parent for secure publication")
     })?;
+    let parent_metadata = std::fs::symlink_metadata(parent).map_err(Error::from)?;
+    if install_metadata.dev() != parent_metadata.dev() {
+        return Err(Error::permission_denied(
+            "privileged browser install and its direct parent must share a filesystem",
+        ));
+    }
 
-    #[cfg(test)]
-    {
-        let _ = install_device;
-        Ok(candidate.to_path_buf())
-    }
     #[cfg(not(test))]
-    {
-        let mut candidate = candidate;
-        if platform::is_running_as_root() {
-            return Ok(candidate.to_path_buf());
-        }
-        loop {
-            let metadata = std::fs::metadata(candidate).map_err(Error::from)?;
-            if metadata.dev() != install_device {
-                return Err(Error::permission_denied(
-                    "no non-writable same-filesystem ancestor is available for a secure privileged snapshot",
-                ));
-            }
-            if !target_writable(candidate) {
-                return Ok(candidate.to_path_buf());
-            }
-            candidate = candidate.parent().ok_or_else(|| {
-                Error::permission_denied(
-                    "no trusted same-filesystem directory is available for a privileged snapshot",
-                )
-            })?;
-        }
-    }
+    validate_privileged_path_ancestry(&canonical_install, 0)?;
+
+    Ok(parent.to_path_buf())
 }
 
-/// Validate the exact snapshot parent handed to the privileged child.
+fn validate_privileged_path_ancestry(path: &Path, expected_uid: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    for ancestor in path.ancestors() {
+        let metadata = std::fs::symlink_metadata(ancestor).map_err(Error::from)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(Error::unknown_bundle_structure(format!(
+                "privileged browser path component must be a non-symlink directory: {}",
+                ancestor.display()
+            )));
+        }
+        if metadata.uid() != expected_uid || metadata.mode() & 0o022 != 0 {
+            return Err(Error::permission_denied(format!(
+                "privileged browser path component must be owned by uid {expected_uid} and not group/world-writable: {}",
+                ancestor.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the exact install directory and direct parent handed to the
+/// privileged child.
 ///
 /// # Errors
-/// Rejects symlinked/non-canonical directories and cross-filesystem parents.
+///
+/// Rejects non-canonical, symlinked, writable, differently-owned,
+/// non-direct, cross-filesystem, or root-untrusted ancestor paths.
 pub fn validate_privileged_snapshot_parent(install_path: &Path, parent: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    let install_metadata = std::fs::symlink_metadata(install_path).map_err(Error::from)?;
-    if install_metadata.file_type().is_symlink() {
+    let canonical_install = std::fs::canonicalize(install_path).map_err(Error::from)?;
+    if canonical_install != install_path {
         return Err(Error::unknown_bundle_structure(
-            "privileged browser install path must not be a symlink",
+            "privileged browser install path must be exact and canonical",
+        ));
+    }
+    let install_metadata = std::fs::symlink_metadata(install_path).map_err(Error::from)?;
+    if !install_metadata.is_dir() || install_metadata.file_type().is_symlink() {
+        return Err(Error::unknown_bundle_structure(
+            "privileged browser install path must be a non-symlink directory",
         ));
     }
     let canonical_parent = std::fs::canonicalize(parent).map_err(Error::from)?;
     if canonical_parent != parent {
         return Err(Error::unknown_bundle_structure(
             "privileged snapshot parent must be an exact canonical directory",
+        ));
+    }
+    if install_path.parent() != Some(parent) {
+        return Err(Error::permission_denied(
+            "privileged snapshot parent must be the install path's direct parent",
         ));
     }
     let parent_metadata = std::fs::symlink_metadata(parent).map_err(Error::from)?;
@@ -837,9 +884,15 @@ pub fn validate_privileged_snapshot_parent(install_path: &Path, parent: &Path) -
     }
     // SAFETY: `geteuid` has no preconditions and does not modify process state.
     let effective_uid = unsafe { libc::geteuid() };
-    if parent_metadata.uid() != effective_uid || parent_metadata.mode() & 0o022 != 0 {
+    if effective_uid == 0 {
+        validate_privileged_path_ancestry(&canonical_install, effective_uid)?;
+    } else if install_metadata.uid() != effective_uid
+        || parent_metadata.uid() != effective_uid
+        || install_metadata.mode() & 0o022 != 0
+        || parent_metadata.mode() & 0o022 != 0
+    {
         return Err(Error::permission_denied(
-            "privileged snapshot parent must be owned by the elevated user and not group/world-writable",
+            "privileged install and direct parent must be elevated-user-owned and not group/world-writable",
         ));
     }
     if install_metadata.dev() != parent_metadata.dev() {
@@ -850,34 +903,103 @@ pub fn validate_privileged_snapshot_parent(install_path: &Path, parent: &Path) -
     Ok(())
 }
 
-/// Re-invoke the current Silvervine binary with elevated privileges and let the
-/// privileged child do the actual filesystem work. The parent process
-/// (this one) only validates that the child exited cleanly; the child
-/// writes the snapshot, the CDM, and the verify in one go.
+/// Resolve and hash the exact executable image authorized for elevation.
 ///
-/// On `SILVERVINE_TEST_ESCALATE_NOOP=1`, [`platform::run_as_root`] returns a
-/// canned successful [`Output`](std::process::Output) without actually
-/// spawning anything — the test branch surfaces a synthetic
-/// [`PatchOutcome`] with the version-before captured pre-escalation. Tests
-/// exercise the branch without invoking real elevation.
+/// Linux uses the kernel-owned `/proc/<pid>/exe` link, which remains bound to
+/// the running inode. macOS hashes the current absolute executable path before
+/// the authorization prompt; the elevated shell later opens that path once,
+/// verifies the digest through its descriptor, and executes the same descriptor.
+///
+/// # Errors
+///
+/// Returns [`crate::ErrorCategory::PermissionDenied`] when the running image
+/// cannot be resolved to a regular file, or a categorized I/O error when it
+/// cannot be hashed.
+fn trusted_elevation_executable() -> Result<(PathBuf, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        let executable = PathBuf::from(format!("/proc/{}/exe", std::process::id()));
+        let metadata = std::fs::metadata(&executable).map_err(|error| {
+            Error::permission_denied(
+                "cannot pin the running Silvervine image through /proc for elevation",
+            )
+            .with_source(error)
+        })?;
+        if !metadata.is_file() {
+            return Err(Error::permission_denied(
+                "the /proc elevation executable does not resolve to a regular file",
+            ));
+        }
+        let digest = crate::widevine::download::sha512_file_hex(&executable)?;
+        Ok((executable, digest))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let executable = std::env::current_exe().map_err(|error| {
+            Error::permission_denied("could not resolve the Silvervine executable")
+                .with_source(error)
+        })?;
+        if !executable.is_absolute() {
+            return Err(Error::permission_denied(
+                "the Silvervine executable path is not absolute",
+            ));
+        }
+        let metadata = std::fs::symlink_metadata(&executable).map_err(|error| {
+            Error::permission_denied("could not inspect the Silvervine executable")
+                .with_source(error)
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(Error::permission_denied(
+                "the Silvervine executable is not a regular non-symlink file",
+            ));
+        }
+        let digest = crate::widevine::download::sha512_file_hex(&executable)?;
+        Ok((executable, digest))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    Err(Error::unsupported_platform(
+        "privileged patching requires Linux or macOS",
+    ))
+}
+
+/// Copy the parent-authenticated payload into an exclusive, bounded staging
+/// tree, then re-invoke the pinned Silvervine image with elevated privileges.
+/// The child receives only that staged manifest and host library, never the
+/// mutable cache root.
+///
+/// On `SILVERVINE_TEST_ESCALATE_NOOP=1`, [`platform::run_pinned_as_root`]
+/// returns a canned successful [`Output`](std::process::Output). Only test builds skip
+/// post-child filesystem validation for that synthetic result.
 fn run_patch_via_escalation(
     browser: &Browser,
     cdm: &CachedCdm,
-    _patcher: &dyn PlatformPatcher,
+    patcher: &dyn PlatformPatcher,
     options: &PatchOptions,
     started: Instant,
     version_before: Option<String>,
     marker: &ManagedMarker,
 ) -> Result<PatchOutcome> {
-    let exe = std::env::current_exe()
-        .map_err(|e| Error::other("could not resolve current executable").with_source(e))?;
-    let exe_str = exe
+    let staging_parent = tempfile::Builder::new()
+        .prefix(".silvervine-elevation-")
+        .tempdir()
+        .map_err(Error::from)?;
+    let staged = ownership::stage_verified_payload(cdm.cdm_dir(), staging_parent.path(), marker)?;
+    let staged_cdm = CachedCdm::from_verified_payload(
+        cdm.version().to_owned(),
+        staged.path().to_owned(),
+        marker.library_sha512.clone(),
+        marker.manifest_sha512.clone(),
+    );
+    let (executable, executable_sha512) = trusted_elevation_executable()?;
+    let executable = executable
         .to_str()
-        .ok_or_else(|| Error::other("current executable path is not valid UTF-8"))?;
+        .ok_or_else(|| Error::other("trusted executable path is not valid UTF-8"))?;
 
-    let argv = privileged_patch_argv(exe_str, browser, cdm, marker, options)?;
+    let argv = privileged_patch_argv(executable, browser, &staged_cdm, marker, options)?;
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let output = platform::run_as_root(&argv_refs)?;
+    let output = platform::run_pinned_as_root(&argv_refs, &executable_sha512)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -889,11 +1011,32 @@ fn run_patch_via_escalation(
         )));
     }
 
-    // The child wrote the CDM as root; we trust its exit-zero status.
-    // For V2 the patch doesn't change the browser version, so
-    // `version_after` is just `version_before`. Phase 3+ that needs an
-    // accurate post-version can read from disk here (no privilege needed
-    // to read; only to write).
+    #[cfg(test)]
+    let synthetic_noop =
+        std::env::var_os("SILVERVINE_TEST_ESCALATE_NOOP").as_deref() == Some("1".as_ref());
+    #[cfg(not(test))]
+    let synthetic_noop = false;
+
+    if !synthetic_noop {
+        let target = patcher.cdm_target(browser.install_path())?;
+        let installed = ownership::validate_installed_cdm(&target).map_err(|error| {
+            Error::invalid_marker(format!(
+                "elevated patch exited successfully but installed CDM validation failed: {error}"
+            ))
+        })?;
+        #[cfg(target_os = "linux")]
+        let expected_payload = installed.marker() == marker;
+        #[cfg(target_os = "macos")]
+        let expected_payload = installed.matches_candidate(marker);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let expected_payload = false;
+        if !expected_payload {
+            return Err(Error::invalid_marker(
+                "elevated patch installed a different CDM identity than the parent authorized",
+            ));
+        }
+    }
+
     Ok(PatchOutcome {
         browser_name: browser.name().to_string(),
         version_before: version_before.clone(),
@@ -981,7 +1124,7 @@ fn perform_patch(
             Err(error) => return PatchAttempt::ModifiedOriginal(error),
         };
 
-    let finalized_marker = match managed_write {
+    match managed_write {
         ManagedWrite::PayloadOnly => {
             let finalized =
                 match patcher.prepare_managed_payload(browser.install_path(), cdm_target, marker) {
@@ -991,35 +1134,19 @@ fn perform_patch(
             if let Err(error) = ownership::write_marker(cdm_target, &finalized) {
                 return PatchAttempt::ModifiedOriginal(error);
             }
-            finalized
-        }
-        ManagedWrite::MarkerCommitted(committed) => {
-            let expected = match ownership::marker_for_finalized_payload(cdm_target, marker) {
-                Ok(marker) => marker,
-                Err(error) => return PatchAttempt::ModifiedOriginal(error),
-            };
-            if committed != expected {
-                return PatchAttempt::ModifiedOriginal(Error::invalid_marker(
-                    "transactional patch committed an unexpected CDM identity",
-                ));
+            if let Err(error) = patcher.verify_post_patch(browser.install_path()) {
+                return PatchAttempt::ModifiedOriginal(error);
             }
-            committed
+            match ownership::validate_installed_cdm(cdm_target) {
+                Ok(installed) if installed.marker() == &finalized => PatchAttempt::Success,
+                Ok(_) => PatchAttempt::ModifiedOriginal(Error::invalid_marker(
+                    "finalized CDM marker changed after platform verification",
+                )),
+                Err(error) => PatchAttempt::ModifiedOriginal(error),
+            }
         }
-    };
-
-    if let Err(error) = patcher.verify_post_patch(browser.install_path()) {
-        return PatchAttempt::ModifiedOriginal(error);
+        ManagedWrite::MarkerCommitted => PatchAttempt::Success,
     }
-    match ownership::validate_installed_cdm(cdm_target) {
-        Ok(installed) if installed.marker() == &finalized_marker => {}
-        Ok(_) => {
-            return PatchAttempt::ModifiedOriginal(Error::invalid_marker(
-                "finalized CDM marker changed after platform verification",
-            ));
-        }
-        Err(error) => return PatchAttempt::ModifiedOriginal(error),
-    }
-    PatchAttempt::Success
 }
 
 #[cfg(test)]
@@ -1039,12 +1166,14 @@ mod tests {
         let cdm = dir.join("_platform_specific").join(test_platform_dir());
         fs::create_dir_all(&cdm).expect("mkdir cdm");
         fs::write(cdm.join(test_library_name()), b"fake-so").expect("write library");
-        fs::write(
-            dir.join("manifest.json"),
-            format!(r#"{{"version":"{version}"}}"#),
+        let manifest_body = format!(r#"{{"version":"{version}"}}"#);
+        fs::write(dir.join("manifest.json"), &manifest_body).expect("write manifest");
+        CachedCdm::from_verified_payload(
+            version.to_string(),
+            dir,
+            crate::widevine::sha512_hex(b"fake-so"),
+            crate::widevine::sha512_hex(manifest_body.as_bytes()),
         )
-        .expect("write manifest");
-        CachedCdm::new(version.to_string(), dir)
     }
 
     fn write_installed_cdm(install: &Path, version: &str, library: &[u8]) {
@@ -1354,28 +1483,28 @@ mod tests {
     }
 
     #[test]
-    fn explicit_targeted_replacement_repairs_an_invalid_marker() {
+    fn explicit_targeted_replacement_preserves_an_invalid_marker() {
         let tmp = TempDir::new().expect("tempdir");
         let install = tmp.path().join("install");
         fs::create_dir_all(&install).expect("install");
         write_installed_cdm(&install, "4.10.0.0", b"candidate");
-        fs::write(
-            install
-                .join("WidevineCdm")
-                .join(crate::widevine::ownership::MANAGED_MARKER_FILENAME),
-            b"not json",
-        )
-        .expect("bad marker");
+        let marker_path = install
+            .join("WidevineCdm")
+            .join(crate::widevine::ownership::MANAGED_MARKER_FILENAME);
+        fs::write(&marker_path, b"not json").expect("bad marker");
         let browser = make_browser(install.clone());
         let cdm = make_cached_cdm(&tmp.path().join("cache"), "4.10.0.0");
         let patcher = MockPatcher::default();
 
-        patch_browser(&browser, &cdm, &patcher, &ownership_options(&tmp, true))
-            .expect("explicit replacement repairs invalid provenance");
+        let error = patch_browser(&browser, &cdm, &patcher, &ownership_options(&tmp, true))
+            .expect_err("replacement consent must not bypass invalid provenance");
 
-        crate::widevine::ownership::validate_installed_marker(&install.join("WidevineCdm"))
-            .expect("replacement marker");
-        assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(error.category, crate::ErrorCategory::InvalidMarker);
+        assert_eq!(
+            fs::read(marker_path).expect("preserved marker"),
+            b"not json"
+        );
+        assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1813,6 +1942,36 @@ mod tests {
 
         let error = validate_privileged_snapshot_parent(&install, tmp.path())
             .expect_err("writable parent must not be trusted across elevation");
+
+        assert_eq!(error.category, crate::ErrorCategory::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn privileged_snapshot_parent_must_be_install_direct_parent() {
+        let tmp = TempDir::new().expect("tempdir");
+        let direct_parent = tmp.path().join("browser-root");
+        let install = direct_parent.join("install");
+        fs::create_dir_all(&install).expect("install");
+
+        let error = validate_privileged_snapshot_parent(&install, tmp.path())
+            .expect_err("an ancestor leaves intermediate components swappable");
+
+        assert_eq!(error.category, crate::ErrorCategory::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn privileged_snapshot_parent_rejects_writable_install_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let install = tmp.path().join("install");
+        fs::create_dir(&install).expect("install");
+        fs::set_permissions(&install, fs::Permissions::from_mode(0o777)).expect("chmod install");
+
+        let error = validate_privileged_snapshot_parent(&install, tmp.path())
+            .expect_err("a writable install can be swapped below its trusted parent");
 
         assert_eq!(error.category, crate::ErrorCategory::PermissionDenied);
     }

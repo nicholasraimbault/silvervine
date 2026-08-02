@@ -88,8 +88,8 @@
     if (encryptionScheme) capability.encryptionScheme = encryptionScheme;
     return {
       initDataTypes: ["cenc"],
-      distinctiveIdentifier: "optional",
-      persistentState: "optional",
+      distinctiveIdentifier: "not-allowed",
+      persistentState: "not-allowed",
       sessionTypes: ["temporary"],
       [`${mediaKind}Capabilities`]: [capability],
     };
@@ -199,8 +199,8 @@
         keySystemConfiguration: {
           keySystem: KEY_SYSTEM,
           initDataType: "cenc",
-          distinctiveIdentifier: "optional",
-          persistentState: "optional",
+          distinctiveIdentifier: "not-allowed",
+          persistentState: "not-allowed",
           sessionTypes: ["temporary"],
           video: { contentType, robustness: "" },
         },
