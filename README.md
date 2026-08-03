@@ -16,7 +16,7 @@ The installer places `silvervine` in `$CARGO_HOME/bin` (usually `~/.cargo/bin`).
 
 Setup detects browsers, downloads Widevine through Mozilla's distribution manifest, verifies its SHA-512 digest, attempts to patch each browser, and registers a user-session daemon. Run `silvervine status` afterward to verify the result.
 
-System-owned browsers may require administrator approval for patching. The registered daemon remains in your user session.
+On Linux, system-owned browsers may require administrator approval for patching. The registered daemon remains in your user session.
 
 Release archives and checksums are available from [GitHub Releases](https://github.com/nicholasraimbault/silvervine/releases).
 
@@ -34,7 +34,6 @@ Custom installations can be added to the configuration file:
 name = "My Browser"
 install_path = "/home/me/my-browser" # Linux
 # bundle_path = "/Users/me/Applications/My Browser.app" # macOS
-# framework_name = "My Browser Framework"               # optional
 ```
 
 Chrome, Edge, Brave, and Firefox already manage Widevine and do not need Silvervine.
@@ -43,7 +42,7 @@ Chrome, Edge, Brave, and Firefox already manage Widevine and do not need Silverv
 
 Silvervine provides software-only Widevine L3. Playback quality is controlled by each streaming service and may be lower than in an officially supported browser. Silvervine does not provide hardware-backed L1 DRM or guarantee HD, 4K, or HDR playback.
 
-Silvervine refuses to patch a running browser unless forced. It creates an exclusive rollback snapshot before each change, verifies the result, and restores the snapshot on failure. The user-session daemon watches for browser updates and re-patches as needed.
+Silvervine refuses to patch a running browser unless forced. It stages and verifies a complete CDM tree before atomically publishing it. On macOS, Silvervine installs the component in the browser's per-user profile and leaves the vendor application bundle and its code signature unchanged. The user-session daemon watches for browser updates and CDM changes.
 
 ## Commands
 

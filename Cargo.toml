@@ -1,6 +1,6 @@
 [package]
 name = "silvervine"
-version = "2.1.1"
+version = "2.1.2"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Nicholas Raimbault <nraimbault16@gmail.com>"]
@@ -114,6 +114,8 @@ tempfile = "3"
 # `block2` is required because NSNotificationCenter takes a block-typed
 # handler argument; the framework crates do not enable it transitively.
 [target.'cfg(target_os = "macos")'.dependencies]
+# Parse both XML and binary browser Info.plist metadata.
+plist = "1"
 objc2 = "0.6"
 # Foundation feature-gates each generated class. The wake observer needs
 # NSString/NSNotification plus NSOperationQueue's block-taking API.
@@ -142,6 +144,7 @@ tray-icon = { version = "0.24", default-features = false }
 zbus = { version = "5" }
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 [dev-dependencies]
+plist = "1"
 
 [profile.release]
 opt-level = 3

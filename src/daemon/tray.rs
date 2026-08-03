@@ -127,7 +127,7 @@ pub enum TrayCommand {
     /// cache from upstream and then re-patches every detected browser
     /// so the on-disk CDM matches what's cached. That two-step combo
     /// is what users expect from a button named "Update Widevine" —
-    /// a refresh alone would leave the browser bundle stale.
+    /// a refresh alone would leave the active browser CDM stale.
     UpdateWidevine,
     /// User toggled "Launch at Login" — the boolean is the desired state.
     ToggleLaunchAtLogin(bool),
@@ -847,7 +847,6 @@ mod tests {
             name: name.into(),
             install_path: PathBuf::from(format!("/opt/{name}-bin")),
             kind: BrowserKind::Detected,
-            framework_name: None,
         }
     }
 

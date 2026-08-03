@@ -124,19 +124,14 @@ fn spawn_with_elevator(elevator: &str, command: &[&str]) -> Result<Output> {
 ///
 /// Unsupported filesystems fail closed without moving either path.
 pub(super) fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
-    if !dst.exists() {
-        // No exchange needed if the destination doesn't yet exist —
-        // a plain rename is already atomic.
-        std::fs::rename(src, dst).map_err(|e| {
-            Error::from(e).with_context(format!(
-                "rename({} -> {}) failed",
-                src.display(),
-                dst.display()
-            ))
-        })?;
-        return Ok(());
+    match renameat2_with_flags(src, dst, RENAME_EXCHANGE) {
+        Ok(()) => Ok(()),
+        Err(ExchangeError::Other(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            renameat2_with_flags(src, dst, RENAME_NOREPLACE)
+                .map_err(|error| error.into_error(src, dst))
+        }
+        Err(error) => Err(error.into_error(src, dst)),
     }
-    exchange_renameat2(src, dst).map_err(|error| error.into_error(src, dst))
 }
 
 /// Wrapper return type for `renameat2`-style exchanges.
@@ -161,13 +156,17 @@ impl ExchangeError {
     }
 }
 
-/// Invoke `renameat2(AT_FDCWD, src, AT_FDCWD, dst, RENAME_EXCHANGE)`.
+/// Invoke `renameat2(AT_FDCWD, src, AT_FDCWD, dst, flags)`.
 ///
 /// We use libc directly via a single FFI call rather than pulling in
 /// the full `nix` crate just for this one syscall. The wrapper is
 /// straightforward — we hand both paths in as null-terminated `CString`s
 /// and check the return code.
-fn exchange_renameat2(src: &Path, dst: &Path) -> std::result::Result<(), ExchangeError> {
+fn renameat2_with_flags(
+    src: &Path,
+    dst: &Path,
+    flags: libc::c_uint,
+) -> std::result::Result<(), ExchangeError> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -178,10 +177,9 @@ fn exchange_renameat2(src: &Path, dst: &Path) -> std::result::Result<(), Exchang
 
     // SAFETY: `renameat2` is a stable Linux syscall (since 3.15). We pass
     // null-terminated C strings constructed from valid UTF-8/OsStr bytes,
-    // and `AT_FDCWD` is the well-known constant for "use the current
-    // working directory as the dirfd." `RENAME_EXCHANGE = 2` per
-    // <linux/fs.h>. The flags fit in `c_uint`. No memory is shared with
-    // the syscall after it returns.
+    // `AT_FDCWD` selects the current working directory, and `flags` is one
+    // of the kernel constants declared below. No memory is shared with the
+    // syscall after it returns.
     //
     // We invoke via `libc::syscall(SYS_renameat2, …)` rather than a
     // direct `libc::renameat2` binding because the latter isn't exposed
@@ -196,7 +194,7 @@ fn exchange_renameat2(src: &Path, dst: &Path) -> std::result::Result<(), Exchang
             src_c.as_ptr(),
             libc::AT_FDCWD,
             dst_c.as_ptr(),
-            RENAME_EXCHANGE,
+            flags,
         )
     };
     if rc == 0 {
@@ -210,8 +208,9 @@ fn exchange_renameat2(src: &Path, dst: &Path) -> std::result::Result<(), Exchang
     }
 }
 
-/// `RENAME_EXCHANGE` from `<linux/fs.h>`. `libc` does not expose this constant
-/// consistently across every Linux target we support.
+/// `renameat2` flags from `<linux/fs.h>`. `libc` does not expose these
+/// constants consistently across every Linux target we support.
+const RENAME_NOREPLACE: libc::c_uint = 1;
 const RENAME_EXCHANGE: libc::c_uint = 2;
 
 fn io_invalid(e: std::ffi::NulError) -> std::io::Error {
@@ -272,9 +271,8 @@ mod tests {
         assert_eq!(b_after, b"AAA");
     }
 
-    /// When the destination doesn't exist, `atomic_rename` falls through
-    /// to a plain `rename` and the destination ends up holding the source
-    /// content.
+    /// When the destination doesn't exist, `atomic_rename` uses an exclusive
+    /// no-replace move so a concurrent destination cannot be overwritten.
     #[test]
     fn atomic_rename_handles_missing_destination() {
         let tmp = TempDir::new().expect("tempdir");
@@ -284,6 +282,25 @@ mod tests {
         atomic_rename(&a, &b).expect("rename ok");
         assert!(!a.exists());
         assert_eq!(fs::read(&b).unwrap(), b"AAA");
+    }
+
+    #[test]
+    fn rename_noreplace_preserves_existing_destination() {
+        let tmp = TempDir::new().expect("tempdir");
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        fs::write(&source, b"source").expect("source");
+        fs::write(&destination, b"destination").expect("destination");
+
+        assert!(matches!(
+            renameat2_with_flags(&source, &destination, RENAME_NOREPLACE),
+            Err(ExchangeError::Other(_))
+        ));
+        assert_eq!(fs::read(source).expect("preserved source"), b"source");
+        assert_eq!(
+            fs::read(destination).expect("preserved destination"),
+            b"destination"
+        );
     }
 
     /// `run_as_root` rejects an empty command without elevating.
@@ -311,7 +328,7 @@ mod tests {
         let b = tmp.path().join("bb");
         fs::write(&a, b"X").unwrap();
         fs::write(&b, b"Y").unwrap();
-        match exchange_renameat2(&a, &b) {
+        match renameat2_with_flags(&a, &b, RENAME_EXCHANGE) {
             Ok(()) => {
                 assert_eq!(fs::read(&a).unwrap(), b"Y");
                 assert_eq!(fs::read(&b).unwrap(), b"X");
@@ -343,7 +360,7 @@ mod tests {
         assert!(r.is_err(), "spawn must fail for missing binary");
     }
 
-    /// `exchange_renameat2` returns `Other` with the underlying io error
+    /// `renameat2_with_flags` returns `Other` with the underlying I/O error
     /// when src doesn't exist (`ENOENT`).
     #[test]
     fn exchange_renameat2_errors_on_missing_src() {
@@ -351,7 +368,7 @@ mod tests {
         let nonexistent = tmp.path().join("nope");
         let dst = tmp.path().join("dst");
         fs::write(&dst, b"x").unwrap();
-        let r = exchange_renameat2(&nonexistent, &dst);
+        let r = renameat2_with_flags(&nonexistent, &dst, RENAME_EXCHANGE);
         // ENOENT is `Other`, not `InvalidArgument`.
         assert!(matches!(r, Err(ExchangeError::Other(_))));
     }

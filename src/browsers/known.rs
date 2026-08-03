@@ -21,9 +21,6 @@ use super::{Browser, BrowserKind, FilesystemRoots, Os};
 pub struct KnownBrowser {
     /// Display name (also used as the macOS bundle name).
     pub name: &'static str,
-    /// macOS framework directory name. Always present so the patch flow
-    /// (Phase 2) knows which framework folder to write into.
-    pub macos_framework: &'static str,
     /// Linux install paths to probe, in priority order.
     pub linux_paths: &'static [&'static str],
 }
@@ -36,7 +33,6 @@ pub struct KnownBrowser {
 pub const KNOWN: &[KnownBrowser] = &[
     KnownBrowser {
         name: "Helium",
-        macos_framework: "Helium Framework",
         // `/opt/helium` is the official .deb path used on Debian/Ubuntu/Pop!_OS
         // (apt repo pkg.helium.computer); `/opt/helium-browser-bin` is the AUR
         // path on Arch.
@@ -44,17 +40,14 @@ pub const KNOWN: &[KnownBrowser] = &[
     },
     KnownBrowser {
         name: "Thorium",
-        macos_framework: "Thorium Framework",
         linux_paths: &["/opt/chromium.org/thorium", "/opt/thorium-browser"],
     },
     KnownBrowser {
         name: "ungoogled-chromium",
-        macos_framework: "Chromium Framework",
         linux_paths: &["/usr/lib/chromium", "/usr/lib64/chromium"],
     },
     KnownBrowser {
         name: "Chromium",
-        macos_framework: "Chromium Framework",
         linux_paths: &["/usr/lib/chromium-browser"],
     },
 ];
@@ -81,7 +74,6 @@ pub fn known_for_os(os: Os, roots: &FilesystemRoots) -> Vec<Browser> {
                         name: kb.name.to_string(),
                         install_path: p,
                         kind: BrowserKind::Known,
-                        framework_name: None,
                     });
                 }
             }
@@ -91,7 +83,6 @@ pub fn known_for_os(os: Os, roots: &FilesystemRoots) -> Vec<Browser> {
                         name: kb.name.to_string(),
                         install_path: p,
                         kind: BrowserKind::Known,
-                        framework_name: Some(kb.macos_framework.to_string()),
                     });
                 }
             }
@@ -217,11 +208,7 @@ mod tests {
         let names: Vec<&str> = found.iter().map(|b| b.name.as_str()).collect();
         assert!(names.contains(&"Thorium"));
         let entry = found.iter().find(|b| b.name == "Thorium").expect("thorium");
-        assert_eq!(
-            entry.framework_name.as_deref(),
-            Some("Thorium Framework"),
-            "macOS known browsers carry their framework name"
-        );
+        assert!(entry.install_path.ends_with("Thorium.app"));
     }
 
     #[test]

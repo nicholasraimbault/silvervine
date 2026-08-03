@@ -1,12 +1,12 @@
-//! Atomic patch protocol — write the Widevine CDM into a browser bundle.
+//! Atomic patch protocol — publish a verified Widevine CDM for a browser.
 //!
 //! This module is the **core engine** half of patching. It owns:
 //!
 //! * The public [`patch_browser`] entry point that the CLI / daemon call.
-//! * The lockfile, snapshot/restore, browser-running detection, and post-patch
-//!   verification (all platform-agnostic).
-//! * The [`PlatformPatcher`] trait that decouples the platform-specific
-//!   bundle write from the orchestration above.
+//! * The lockfile, optional snapshot/restore, browser-running detection, and
+//!   post-patch verification (all platform-agnostic).
+//! * The [`PlatformPatcher`] trait that decouples platform-specific CDM
+//!   publication from the orchestration above.
 //!
 //! Platform-specific implementations of [`PlatformPatcher`] live in the
 //! Platform team's `src/patch/linux.rs` and `src/patch/macos.rs` modules.
@@ -33,10 +33,10 @@
 //!
 //! ## Why a trait?
 //!
-//! Linux assembles and verifies a temporary `WidevineCdm` tree before
-//! exchanging it with the live directory. macOS clones the application bundle,
-//! updates and signs the clone, then exchanges whole bundles. A shared trait
-//! keeps orchestration testable while each platform owns its publish semantics.
+//! Linux and macOS each assemble and verify a temporary `WidevineCdm` tree,
+//! then atomically exchange it with the platform's active target. Linux targets
+//! the browser installation; macOS targets Chromium's per-user component
+//! directory. The shared trait keeps orchestration testable.
 //!
 //! ## What this module does NOT do
 //!
@@ -44,6 +44,9 @@
 //! * No CDM download — that's [`crate::widevine::download`].
 //! * No tray notifications — daemon team owns those.
 
+use std::fs;
+use std::io::ErrorKind;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -96,50 +99,6 @@ pub fn host_patcher() -> Result<Box<dyn PlatformPatcher>> {
     #[cfg(target_os = "macos")]
     {
         Ok(Box::new(MacosPatcher::new()))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        Err(Error::unsupported_platform(
-            "patching is only implemented for Linux and macOS",
-        ))
-    }
-}
-
-/// Build the host patcher while preserving exact parent-selected macOS
-/// framework and version components for the privileged child. Linux ignores
-/// both values.
-///
-/// # Errors
-///
-/// Returns `UnknownBundleStructure` for missing/unsafe macOS components and
-/// `UnsupportedPlatform` outside Linux and macOS.
-pub fn host_patcher_for_layout(
-    framework_name: Option<&str>,
-    framework_version: Option<&str>,
-) -> Result<Box<dyn PlatformPatcher>> {
-    #[cfg(target_os = "linux")]
-    {
-        let _ = (framework_name, framework_version);
-        Ok(Box::new(LinuxPatcher::new()))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let framework_name = framework_name.ok_or_else(|| {
-            Error::unknown_bundle_structure(
-                "privileged macOS patch requires an exact parent-selected framework",
-            )
-        })?;
-        let framework_version = framework_version.ok_or_else(|| {
-            Error::unknown_bundle_structure(
-                "privileged macOS patch requires an exact parent-selected framework version",
-            )
-        })?;
-        macos::validate_layout_component("framework", framework_name)?;
-        macos::validate_layout_component("framework version", framework_version)?;
-        Ok(Box::new(MacosPatcher::for_layout(
-            framework_name,
-            framework_version,
-        )))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -277,6 +236,94 @@ pub enum ManagedWrite {
     /// path before the retired payload was discarded.
     MarkerCommitted,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TargetIdentity {
+    device: u64,
+    inode: u64,
+}
+
+/// Opaque identity of the candidate target authorized under the patch lock.
+///
+/// Existing targets retain an open directory handle for the authorization
+/// lifetime. Keeping the original inode alive prevents remove-and-recreate
+/// races from passing validation through immediate inode-number reuse.
+#[derive(Debug)]
+pub struct TargetAuthorization {
+    identity: Option<TargetIdentity>,
+    _handle: Option<fs::File>,
+}
+
+impl TargetAuthorization {
+    pub(crate) fn capture(target: &Path) -> Result<Self> {
+        let handle = match open_target_handle(target) {
+            Ok(handle) => Some(handle),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(Error::from(error)),
+        };
+        let identity = handle
+            .as_ref()
+            .map(fs::File::metadata)
+            .transpose()?
+            .map(|metadata| TargetIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            });
+        Ok(Self {
+            identity,
+            _handle: handle,
+        })
+    }
+
+    pub(crate) fn validate(&self, target: &Path) -> Result<()> {
+        let current = Self::capture(target)?;
+        if self.identity != current.identity {
+            return Err(Error::state_corrupted(
+                "CDM target changed after ownership authorization",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn open_target_handle(target: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    options.open(target)
+}
+
+/// Remove transaction state only while it still has the authorized identity.
+///
+/// # Errors
+///
+/// Preserves the entire staging directory and returns `StateCorrupted` when
+/// another process replaced the path that cleanup would recursively remove.
+pub(crate) fn close_authorized_staging(
+    staging: tempfile::TempDir,
+    staged: &Path,
+    authorization: &TargetAuthorization,
+    publication_root: &Path,
+) -> Result<()> {
+    if let Err(error) = authorization.validate(staged) {
+        let recovery = staging.keep();
+        return Err(Error::state_corrupted(format!(
+            "{}; transaction state was preserved at {}",
+            error.message,
+            recovery.display()
+        ))
+        .with_source(error));
+    }
+    if let Err(error) = staging.close() {
+        tracing::warn!(
+            path = %publication_root.display(),
+            error = %error,
+            "could not remove retired CDM transaction state"
+        );
+    }
+    Ok(())
+}
 enum PatchAttempt {
     Success,
     FailedBeforeModification(Error),
@@ -295,12 +342,11 @@ enum PatchAttempt {
 /// `false`, mutates the live bundle, and is wrapped in the core
 /// [`BackupHandle`] snapshot/restore path.
 pub trait PlatformPatcher {
-    /// Place the CDM files into `target` (the browser's install path).
+    /// Place the CDM files for `target` (the browser's install identity).
     ///
-    /// On Linux this is the install root (e.g. `/opt/helium-browser-bin`)
-    /// and the implementation writes under `<target>/WidevineCdm/`. On
-    /// macOS this is the `.app` bundle and the implementation writes under
-    /// `<target>/Contents/Frameworks/<framework>/Versions/<n>/Libraries/WidevineCdm/`.
+    /// Linux publishes under `<target>/WidevineCdm/`. macOS derives the
+    /// browser's user-profile component root from the application bundle and
+    /// publishes a versioned `WidevineCdm/<version>/` directory there.
     ///
     /// `cdm_source` points at a directory laid out by [`crate::widevine::extract`]:
     ///
@@ -315,29 +361,66 @@ pub trait PlatformPatcher {
     /// # Errors
     ///
     /// Surface anything that prevented CDM placement as a categorized
-    /// [`Error`]. Transactional implementations must leave the live bundle
+    /// [`Error`]. Transactional implementations must leave the live target
     /// unchanged or valid; core attempts snapshot restoration for legacy
     /// implementations that modified it.
     fn write_cdm(&self, target: &Path, cdm_source: &Path) -> Result<()>;
 
-    /// Place a parent-verified CDM and report whether its marker was committed
-    /// inside the platform transaction.
+    /// Place a parent-verified CDM at the exact target authorized by core and
+    /// report whether its marker was committed inside the platform transaction.
     ///
-    /// The default writes only the payload; core then validates and commits the
-    /// marker. A transactional implementation returning `MarkerCommitted` must
-    /// validate the live payload and marker before discarding rollback state.
+    /// The default rejects a target that no longer matches platform
+    /// resolution, writes only the payload, and lets core validate and commit
+    /// the marker. A transactional implementation returning `MarkerCommitted`
+    /// must validate the live payload, marker, and active target before
+    /// discarding rollback state.
     ///
     /// # Errors
     ///
-    /// Returns the categorized platform write error when placement fails.
+    /// Returns the categorized platform write error when placement fails or
+    /// when `cdm_target` no longer matches the candidate target selected under
+    /// the patch lock.
     fn write_managed_cdm(
         &self,
         target: &Path,
+        cdm_target: &Path,
         cdm_source: &Path,
-        _parent_marker: &ManagedMarker,
+        parent_marker: &ManagedMarker,
     ) -> Result<ManagedWrite> {
+        let expected = self.cdm_target_for_candidate(target, &parent_marker.cdm_version)?;
+        if expected != cdm_target {
+            return Err(Error::state_corrupted(
+                "platform CDM target changed after ownership authorization",
+            ));
+        }
         self.write_cdm(target, cdm_source)?;
         Ok(ManagedWrite::PayloadOnly)
+    }
+
+    /// Publish through a transaction bound to the exact target authorized by
+    /// core. Transactional implementations must validate `authorization`
+    /// against both the live target before publication and the displaced
+    /// target before discarding rollback state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a categorized error when the authorized target changed or
+    /// platform publication failed.
+    fn write_authorized_managed_cdm(
+        &self,
+        target: &Path,
+        cdm_target: &Path,
+        cdm_source: &Path,
+        parent_marker: &ManagedMarker,
+        authorization: &TargetAuthorization,
+    ) -> Result<ManagedWrite> {
+        if self.writes_transactionally() {
+            return Err(Error::state_corrupted(
+                "transactional patcher must implement authorized publication",
+            ));
+        }
+        authorization.validate(cdm_target)?;
+        self.write_managed_cdm(target, cdm_target, cdm_source, parent_marker)
     }
 
     /// Resolve the exact CDM directory owned by this platform layout.
@@ -348,6 +431,19 @@ pub trait PlatformPatcher {
     /// target cannot be resolved safely.
     fn cdm_target(&self, target: &Path) -> Result<PathBuf> {
         Ok(target.join("WidevineCdm"))
+    }
+    /// Resolve the exact CDM directory for a candidate version.
+    ///
+    /// Platforms with a versioned component layout override this so ownership
+    /// checks and publication address the same version directory. Flat layouts
+    /// use [`Self::cdm_target`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a categorized layout error when the candidate target cannot be
+    /// resolved safely.
+    fn cdm_target_for_candidate(&self, target: &Path, _version: &str) -> Result<PathBuf> {
+        self.cdm_target(target)
     }
 
     /// Validate a payload-only write and produce the marker core will commit.
@@ -398,11 +494,22 @@ pub trait PlatformPatcher {
     /// entries.
     ///
     /// The core probes this path before deciding whether privilege escalation
-    /// is required. Linux stages inside the install root and uses the default;
-    /// macOS overrides this with the application bundle's parent directory.
-    #[must_use]
-    fn write_access_root<'a>(&self, target: &'a Path) -> &'a Path {
-        target
+    /// is required. An owned path allows user-profile patchers to return a
+    /// location outside the browser installation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a categorized path-resolution error.
+    fn write_access_root(&self, target: &Path) -> Result<PathBuf> {
+        Ok(target.to_path_buf())
+    }
+
+    /// Whether a failed write-access probe may invoke the privileged child.
+    ///
+    /// User-profile patchers return `false`: escalating would select root's
+    /// profile and create incorrectly-owned state instead of fixing access.
+    fn supports_elevation(&self) -> bool {
+        true
     }
 
     /// Whether [`PlatformPatcher::write_cdm`] stages, verifies, and atomically
@@ -596,6 +703,32 @@ pub fn decide_escalate(as_root: bool, running_as_root: bool, write_root_writable
     !as_root && !running_as_root && !write_root_writable
 }
 
+fn authorize_candidate_target(
+    browser: &Browser,
+    cdm: &CachedCdm,
+    patcher: &dyn PlatformPatcher,
+    options: &PatchOptions,
+    marker: &ManagedMarker,
+) -> Result<(PathBuf, TargetAuthorization)> {
+    let active_target = patcher.cdm_target(browser.install_path())?;
+    let active_authorization = TargetAuthorization::capture(&active_target)?;
+    let active_ownership = ownership::classify(browser, &active_target, cdm, marker)?;
+    enforce_ownership(&active_ownership, options)?;
+    active_authorization.validate(&active_target)?;
+
+    let candidate_target =
+        patcher.cdm_target_for_candidate(browser.install_path(), cdm.version())?;
+    if candidate_target == active_target {
+        return Ok((candidate_target, active_authorization));
+    }
+
+    let candidate_authorization = TargetAuthorization::capture(&candidate_target)?;
+    let candidate_ownership = ownership::classify(browser, &candidate_target, cdm, marker)?;
+    enforce_ownership(&candidate_ownership, options)?;
+    candidate_authorization.validate(&candidate_target)?;
+    Ok((candidate_target, candidate_authorization))
+}
+
 /// Inner patch flow, run while the lockfile is held.
 fn run_patch(
     browser: &Browser,
@@ -607,9 +740,8 @@ fn run_patch(
     let started = Instant::now();
 
     let marker = ownership::marker_for_cached(cdm)?;
-    let cdm_target = patcher.cdm_target(browser.install_path())?;
-    let ownership = ownership::classify(browser, &cdm_target, cdm, &marker)?;
-    enforce_ownership(&ownership, options)?;
+    let (candidate_target, target_authorization) =
+        authorize_candidate_target(browser, cdm, patcher, options, &marker)?;
 
     // The locked parent performs process inspection once. The elevated child
     // remains filesystem-only and never probes another account's session.
@@ -641,11 +773,18 @@ fn run_patch(
     }
 
     // Escalate only when the patcher's actual publication root is not writable.
+    let write_access_root = patcher.write_access_root(browser.install_path())?;
     if decide_escalate(
         options.as_root,
         running_as_root,
-        target_writable(patcher.write_access_root(browser.install_path())),
+        target_writable(&write_access_root),
     ) {
+        if !patcher.supports_elevation() {
+            return Err(Error::permission_denied(format!(
+                "CDM publication directory is not writable: {}",
+                write_access_root.display()
+            )));
+        }
         return run_patch_via_escalation(
             browser,
             cdm,
@@ -656,17 +795,9 @@ fn run_patch(
             &marker,
         );
     }
-    let direct_root_stage = if running_as_root && !options.as_root {
-        let trusted_parent = select_privileged_snapshot_parent(browser.install_path())?;
-        validate_privileged_snapshot_parent(browser.install_path(), &trusted_parent)?;
-        Some(ownership::stage_verified_payload(
-            cdm.cdm_dir(),
-            &trusted_parent,
-            &marker,
-        )?)
-    } else {
-        None
-    };
+    let direct_root_stage = (running_as_root && !options.as_root)
+        .then(|| stage_direct_root_payload(browser, cdm, &marker))
+        .transpose()?;
     let direct_root_cdm = direct_root_stage.as_ref().map(|staged| {
         CachedCdm::from_verified_payload(
             cdm.version().to_owned(),
@@ -677,39 +808,54 @@ fn run_patch(
     });
     let write_cdm = direct_root_cdm.as_ref().unwrap_or(cdm);
 
-    if patcher.writes_transactionally() {
-        match perform_patch(browser, write_cdm, patcher, &cdm_target, &marker) {
-            PatchAttempt::Success => {}
-            PatchAttempt::FailedBeforeModification(error)
-            | PatchAttempt::ModifiedOriginal(error) => return Err(error),
+    let snapshot = (!patcher.writes_transactionally())
+        .then(|| take_snapshot(browser, options, version_before.as_deref()))
+        .transpose()?;
+    match perform_patch(
+        browser,
+        write_cdm,
+        patcher,
+        &candidate_target,
+        &marker,
+        &target_authorization,
+    ) {
+        PatchAttempt::Success => {
+            snapshot.map(BackupHandle::commit).transpose()?;
         }
-    } else {
-        let snapshot = take_snapshot(browser, options, version_before.as_deref())?;
-        match perform_patch(browser, write_cdm, patcher, &cdm_target, &marker) {
-            PatchAttempt::Success => {}
-            PatchAttempt::FailedBeforeModification(patch_err) => {
+        PatchAttempt::FailedBeforeModification(error) => {
+            if let Some(snapshot) = snapshot {
                 let _ = snapshot.commit();
-                return Err(patch_err);
             }
-            PatchAttempt::ModifiedOriginal(patch_err) => {
-                if let Err(restore_err) = snapshot.restore() {
-                    return Err(restore_err.with_source(patch_err));
-                }
-                return Err(patch_err);
-            }
+            return Err(error);
         }
-        snapshot.commit()?;
+        PatchAttempt::ModifiedOriginal(error) => {
+            if let Some(snapshot) = snapshot {
+                if let Err(restore_error) = snapshot.restore() {
+                    return Err(restore_error.with_source(error));
+                }
+            }
+            return Err(error);
+        }
     }
 
-    let version_after = version_before.clone();
     Ok(PatchOutcome {
         browser_name: browser.name().to_string(),
+        version_after: version_before.clone(),
         version_before,
-        version_after,
         cdm_version: cdm.version().to_string(),
         duration: started.elapsed(),
         dry_run: false,
     })
+}
+
+fn stage_direct_root_payload(
+    browser: &Browser,
+    cdm: &CachedCdm,
+    marker: &ManagedMarker,
+) -> Result<ownership::StagedPayload> {
+    let trusted_parent = select_privileged_snapshot_parent(browser.install_path())?;
+    validate_privileged_snapshot_parent(browser.install_path(), &trusted_parent)?;
+    ownership::stage_verified_payload(cdm.cdm_dir(), &trusted_parent, marker)
 }
 
 fn enforce_ownership(assessment: &OwnershipAssessment, options: &PatchOptions) -> Result<()> {
@@ -1018,7 +1164,7 @@ fn run_patch_via_escalation(
     let synthetic_noop = false;
 
     if !synthetic_noop {
-        let target = patcher.cdm_target(browser.install_path())?;
+        let target = patcher.cdm_target_for_candidate(browser.install_path(), cdm.version())?;
         let installed = ownership::validate_installed_cdm(&target).map_err(|error| {
             Error::invalid_marker(format!(
                 "elevated patch exited successfully but installed CDM validation failed: {error}"
@@ -1083,22 +1229,6 @@ fn privileged_patch_argv(
         "--browser-kind".into(),
         browser.kind.as_str().into(),
     ];
-    #[cfg(target_os = "macos")]
-    {
-        let (framework, version) = macos::resolve_privileged_layout(
-            browser.install_path(),
-            browser.framework_name.as_deref(),
-        )?;
-        argv.push("--framework-name".into());
-        argv.push(framework);
-        argv.push("--framework-version".into());
-        argv.push(version);
-    }
-    #[cfg(not(target_os = "macos"))]
-    if let Some(framework) = &browser.framework_name {
-        argv.push("--framework-name".into());
-        argv.push(framework.clone());
-    }
     if options.force_while_running {
         argv.push("--force".into());
     }
@@ -1114,15 +1244,21 @@ fn perform_patch(
     patcher: &dyn PlatformPatcher,
     cdm_target: &Path,
     marker: &ManagedMarker,
+    authorization: &TargetAuthorization,
 ) -> PatchAttempt {
-    let managed_write =
-        match patcher.write_managed_cdm(browser.install_path(), cdm.cdm_dir(), marker) {
-            Ok(outcome) => outcome,
-            Err(error) if patcher.writes_transactionally() => {
-                return PatchAttempt::FailedBeforeModification(error);
-            }
-            Err(error) => return PatchAttempt::ModifiedOriginal(error),
-        };
+    let managed_write = match patcher.write_authorized_managed_cdm(
+        browser.install_path(),
+        cdm_target,
+        cdm.cdm_dir(),
+        marker,
+        authorization,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) if patcher.writes_transactionally() => {
+            return PatchAttempt::FailedBeforeModification(error);
+        }
+        Err(error) => return PatchAttempt::ModifiedOriginal(error),
+    };
 
     match managed_write {
         ManagedWrite::PayloadOnly => {
@@ -1273,6 +1409,18 @@ mod tests {
             Ok(())
         }
 
+        fn write_authorized_managed_cdm(
+            &self,
+            target: &Path,
+            cdm_target: &Path,
+            cdm_source: &Path,
+            parent_marker: &ManagedMarker,
+            authorization: &TargetAuthorization,
+        ) -> Result<ManagedWrite> {
+            authorization.validate(cdm_target)?;
+            self.write_managed_cdm(target, cdm_target, cdm_source, parent_marker)
+        }
+
         fn verify_post_patch(&self, target: &Path) -> Result<()> {
             self.verify_calls.fetch_add(1, Ordering::SeqCst);
             self.verify_saw_marker.store(
@@ -1299,6 +1447,45 @@ mod tests {
         fn writes_transactionally(&self) -> bool {
             self.transactional
         }
+    }
+
+    struct IncompleteTransactionalPatcher;
+    impl PlatformPatcher for IncompleteTransactionalPatcher {
+        fn write_cdm(&self, target: &Path, _cdm_source: &Path) -> Result<()> {
+            fs::write(target.join("incomplete-write"), b"called").map_err(Error::from)
+        }
+
+        fn verify_post_patch(&self, _target: &Path) -> Result<()> {
+            Ok(())
+        }
+
+        fn read_browser_version(&self, _target: &Path) -> Option<String> {
+            None
+        }
+
+        fn writes_transactionally(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn transactional_patcher_must_override_authorized_publication() {
+        let tmp = TempDir::new().expect("tempdir");
+        let install = tmp.path().join("install");
+        fs::create_dir(&install).expect("install");
+        let cdm = make_cached_cdm(&tmp.path().join("cache"), "1.0");
+        let marker = ownership::marker_for_cached(&cdm).expect("marker");
+        let target = install.join("WidevineCdm");
+        let authorization = TargetAuthorization::capture(&target).expect("missing target");
+        let patcher = IncompleteTransactionalPatcher;
+
+        let error = patcher
+            .write_authorized_managed_cdm(&install, &target, cdm.cdm_dir(), &marker, &authorization)
+            .expect_err("transactional patchers must own authorized rollback");
+
+        assert_eq!(error.category, crate::ErrorCategory::StateCorrupted);
+        assert!(!install.join("incomplete-write").exists());
+        assert!(!target.exists());
     }
 
     struct MutatingUnknownBundleMock;
@@ -1397,7 +1584,6 @@ mod tests {
             name: "TestBrowser".into(),
             install_path,
             kind: BrowserKind::Detected,
-            framework_name: None,
         }
     }
 
@@ -1998,12 +2184,15 @@ mod tests {
         let cache = tmp.path().join("widevine");
         let cdm = make_cached_cdm(&cache, "1.0");
         let marker = ownership::marker_for_cached(&cdm).expect("marker");
+        let authorization =
+            TargetAuthorization::capture(&install.join("WidevineCdm")).expect("target identity");
         let outcome = perform_patch(
             &browser,
             &cdm,
             &UnknownBundleMock,
             &install.join("WidevineCdm"),
             &marker,
+            &authorization,
         );
         assert!(matches!(outcome, PatchAttempt::ModifiedOriginal(_)));
         assert!(!install.join("WidevineCdm").exists());
@@ -2025,7 +2214,15 @@ mod tests {
         let cache = tmp.path().join("widevine");
         let cdm = make_cached_cdm(&cache, "1.0");
         let marker = ownership::marker_for_cached(&cdm).expect("marker");
-        let outcome = perform_patch(&browser, &cdm, &PartialFailMock, &partial, &marker);
+        let authorization = TargetAuthorization::capture(&partial).expect("target identity");
+        let outcome = perform_patch(
+            &browser,
+            &cdm,
+            &PartialFailMock,
+            &partial,
+            &marker,
+            &authorization,
+        );
         assert!(matches!(outcome, PatchAttempt::ModifiedOriginal(_)));
     }
     /// When the install path is not writable AND `as_root` is `false`,
@@ -2043,11 +2240,6 @@ mod tests {
         let root = canonical_fixture_root(tmp.path());
         let install = root.join("install");
         fs::create_dir_all(&install).expect("mkdir install");
-        #[cfg(target_os = "macos")]
-        fs::create_dir_all(
-            install.join("Contents/Frameworks/Test Framework.framework/Versions/1.0/Libraries"),
-        )
-        .expect("create synthetic macOS framework layout");
         // Make install read-only so target_writable returns false.
         let perms = fs::Permissions::from_mode(0o555);
         fs::set_permissions(&install, perms).expect("chmod ro");
@@ -2106,16 +2298,10 @@ mod tests {
         let install = root.join("exact custom install");
         let cdm_root = root.join("exact cache");
         fs::create_dir_all(&install).unwrap();
-        #[cfg(target_os = "macos")]
-        fs::create_dir_all(
-            install.join("Contents/Frameworks/Exact Framework.framework/Versions/2.0/Libraries"),
-        )
-        .unwrap();
         let cdm = make_cached_cdm(&cdm_root, "9.8.7.6");
         let mut browser = make_browser(install.clone());
         browser.name = "Parent Custom".into();
         browser.kind = BrowserKind::Known;
-        browser.framework_name = Some("Exact Framework".into());
         let marker = ownership::marker_for_cached(&cdm).unwrap();
         let argv = privileged_patch_argv(
             "/bin/silvervine",
@@ -2149,44 +2335,8 @@ mod tests {
             .windows(2)
             .any(|v| v == ["--browser-name", "Parent Custom"]));
         assert!(argv.windows(2).any(|v| v == ["--browser-kind", "known"]));
-        assert!(argv
-            .windows(2)
-            .any(|v| v == ["--framework-name", "Exact Framework"]));
-        #[cfg(target_os = "macos")]
-        assert!(argv.windows(2).any(|v| v == ["--framework-version", "2.0"]));
         assert!(argv.contains(&"--force".to_string()));
         assert!(argv.contains(&"--replace-external-cdm".to_string()));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn privileged_handoff_resolves_missing_custom_framework_in_parent() {
-        let tmp = TempDir::new().unwrap();
-        let root = canonical_fixture_root(tmp.path());
-        let install = root.join("Custom.app");
-        fs::create_dir_all(
-            install.join("Contents/Frameworks/Selected Framework.framework/Versions/1.0/Libraries"),
-        )
-        .unwrap();
-        let cdm = make_cached_cdm(&root.join("cache"), "1.0");
-        let mut browser = make_browser(install);
-        browser.framework_name = None;
-
-        let marker = ownership::marker_for_cached(&cdm).unwrap();
-        let argv = privileged_patch_argv(
-            "/usr/local/bin/silvervine",
-            &browser,
-            &cdm,
-            &marker,
-            &PatchOptions::default(),
-        )
-        .unwrap();
-        assert!(argv
-            .windows(2)
-            .any(|args| args == ["--framework-name", "Selected Framework"]));
-        assert!(argv
-            .windows(2)
-            .any(|args| args == ["--framework-version", "1.0"]));
     }
 
     #[test]
@@ -2195,11 +2345,6 @@ mod tests {
         let root = canonical_fixture_root(tmp.path());
         let install = root.join("helium");
         fs::create_dir_all(&install).unwrap();
-        #[cfg(target_os = "macos")]
-        fs::create_dir_all(
-            install.join("Contents/Frameworks/Test Framework.framework/Versions/1.0/Libraries"),
-        )
-        .unwrap();
         let cdm = make_cached_cdm(&root.join("cache"), "1.2.3");
         let mut browser = make_browser(install);
         browser.kind = BrowserKind::Known;

@@ -17,15 +17,14 @@ pub fn collect_host_checks() -> Vec<DiagnosticCheck> {
     checks
 }
 
-/// Codesign verification for the browser bundle and Silvervine-managed code.
+/// Verify the vendor-signed browser bundle and, when managed, the signed
+/// Widevine library in the user profile.
 #[must_use]
-pub fn codesign_check(
-    bundle: &Path,
-    cdm_target: Option<&Path>,
-    cdm_library: Option<&Path>,
-    managed: bool,
-) -> DiagnosticCheck {
-    let paths = codesign_paths(bundle, cdm_target, cdm_library);
+pub fn codesign_check(bundle: &Path, cdm_library: Option<&Path>, managed: bool) -> DiagnosticCheck {
+    let paths = CodesignPaths {
+        bundle,
+        cdm_library,
+    };
     if let Some(check) = missing_managed_codesign_paths(paths, managed) {
         return check;
     }
@@ -48,18 +47,13 @@ pub fn codesign_check(
 #[derive(Clone, Copy)]
 struct CodesignPaths<'a> {
     bundle: &'a Path,
-    framework: Option<&'a Path>,
     cdm_library: Option<&'a Path>,
 }
 
 impl<'a> CodesignPaths<'a> {
-    fn scopes(self, managed: bool) -> [Option<(&'static str, &'a Path)>; 3] {
+    fn scopes(self, managed: bool) -> [Option<(&'static str, &'a Path)>; 2] {
         [
             Some(("bundle", self.bundle)),
-            managed
-                .then_some(self.framework)
-                .flatten()
-                .map(|path| ("framework", path)),
             managed
                 .then_some(self.cdm_library)
                 .flatten()
@@ -68,47 +62,24 @@ impl<'a> CodesignPaths<'a> {
     }
 }
 
-fn codesign_paths<'a>(
-    bundle: &'a Path,
-    cdm_target: Option<&'a Path>,
-    cdm_library: Option<&'a Path>,
-) -> CodesignPaths<'a> {
-    let framework = cdm_target.and_then(|target| {
-        target
-            .ancestors()
-            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("framework"))
-    });
-    CodesignPaths {
-        bundle,
-        framework,
-        cdm_library,
-    }
-}
-
 fn missing_managed_codesign_paths(
     paths: CodesignPaths<'_>,
     managed: bool,
 ) -> Option<DiagnosticCheck> {
-    if !managed {
+    if !managed || paths.cdm_library.is_some() {
         return None;
     }
-    let missing = match (paths.framework.is_none(), paths.cdm_library.is_none()) {
-        (false, false) => return None,
-        (true, false) => "framework",
-        (false, true) => "cdm_library",
-        (true, true) => "framework,cdm_library",
-    };
     Some(DiagnosticCheck {
         id: "browser.codesign".into(),
         status: DiagnosticStatus::Fail,
         source: EvidenceSource::HostProbe,
         failure_domain: FailureDomain::Silvervine,
-        summary: "Silvervine-managed code paths could not be resolved for codesign verification."
+        summary: "The Silvervine-managed Widevine library could not be resolved for codesign verification."
             .into(),
         action: Some("Run `silvervine repair` to restore the managed macOS CDM layout.".into()),
         details: BTreeMap::from([
             ("bundle_path".into(), paths.bundle.display().to_string()),
-            ("missing_managed_scopes".into(), missing.into()),
+            ("missing_managed_scopes".into(), "cdm_library".into()),
         ]),
     })
 }
@@ -129,20 +100,17 @@ fn classify_codesign_result(
         (
             DiagnosticStatus::Fail,
             FailureDomain::Silvervine,
-            "Codesign verification failed for Silvervine-managed code.",
-            Some(
-                "Re-run `silvervine patch` so managed macOS code is re-signed after CDM install."
-                    .into(),
-            ),
+            "Codesign verification failed for the Silvervine-managed Widevine library.",
+            Some("Re-run `silvervine patch` to reinstall the verified Widevine component.".into()),
         )
     } else if managed_incomplete {
         (
             DiagnosticStatus::Unavailable,
             FailureDomain::Silvervine,
             if managed_timed_out {
-                "Silvervine-managed codesign verification timed out."
+                "Silvervine-managed Widevine signature verification timed out."
             } else {
-                "Silvervine-managed codesign verification could not complete."
+                "Silvervine-managed Widevine signature verification could not complete."
             },
             None,
         )
@@ -168,7 +136,7 @@ fn classify_codesign_result(
         (
             DiagnosticStatus::Pass,
             FailureDomain::Silvervine,
-            "Codesign verification passed for the browser bundle and Silvervine-managed code.",
+            "Codesign verification passed for the vendor browser bundle and managed Widevine library.",
             None,
         )
     } else {
@@ -220,7 +188,7 @@ fn run_codesign_check(codesign: &Path, paths: CodesignPaths<'_>, managed: bool) 
                         format!("{scope}_evidence"),
                         stderr
                             .chars()
-                            .filter(|c| !c.is_control())
+                            .filter(|character| !character.is_control())
                             .take(500)
                             .collect(),
                     );
@@ -568,61 +536,39 @@ mod tests {
             ),
         );
         let bundle = Path::new("/Applications/Helium.app");
-        let paths = super::codesign_paths(bundle, None, None);
+        let paths = super::CodesignPaths {
+            bundle,
+            cdm_library: None,
+        };
 
         let check = super::run_codesign_check(&tool, paths, false);
 
         assert_eq!(check.status, DiagnosticStatus::Pass);
         let args = fs::read_to_string(args_path).expect("captured codesign args");
-        assert!(args.lines().any(|arg| arg == "--verify"));
-        assert!(args.lines().any(|arg| arg == "--strict"));
+        assert!(args.lines().any(|argument| argument == "--verify"));
+        assert!(args.lines().any(|argument| argument == "--strict"));
         assert!(
-            args.lines().all(|arg| arg != "--deep"),
+            args.lines().all(|argument| argument != "--deep"),
             "recursive verification scans unrelated nested browser code"
         );
     }
-    #[test]
-    fn codesign_paths_follow_managed_ownership_scope() {
-        let bundle = Path::new("/Applications/Helium.app");
-        let framework = bundle
-            .join("Contents/Frameworks")
-            .join("Helium Framework.framework");
-        let cdm_target = framework
-            .join("Versions/151.0.7922.71/Libraries")
-            .join("WidevineCdm");
-        let library = cdm_target
-            .join("_platform_specific/mac_arm64")
-            .join("libwidevinecdm.dylib");
 
-        let managed =
-            super::codesign_paths(bundle, Some(cdm_target.as_path()), Some(library.as_path()));
+    #[test]
+    fn codesign_scopes_vendor_bundle_and_profile_library() {
+        let bundle = Path::new("/Applications/Helium.app");
+        let library = Path::new(
+            "/Users/me/Library/Application Support/net.imput.helium/WidevineCdm/4.10.3050.0/_platform_specific/mac_arm64/libwidevinecdm.dylib",
+        );
+        let managed = super::CodesignPaths {
+            bundle,
+            cdm_library: Some(library),
+        };
+
         assert_eq!(
             managed.scopes(true),
-            [
-                Some(("bundle", bundle)),
-                Some(("framework", framework.as_path())),
-                Some(("cdm_library", library.as_path())),
-            ]
+            [Some(("bundle", bundle)), Some(("cdm_library", library)),]
         );
-
-        let nested_target = framework
-            .join("Versions/Current/Libraries/Components")
-            .join("WidevineCdm");
-        let nested = super::codesign_paths(
-            bundle,
-            Some(nested_target.as_path()),
-            Some(library.as_path()),
-        );
-        assert_eq!(
-            nested.framework,
-            Some(framework.as_path()),
-            "framework lookup must not depend on a fixed CDM layout depth"
-        );
-
-        assert_eq!(
-            managed.scopes(false),
-            [Some(("bundle", bundle)), None, None]
-        );
+        assert_eq!(managed.scopes(false), [Some(("bundle", bundle)), None]);
     }
 
     #[test]
@@ -630,11 +576,13 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let tool = write_fake_codesign(&tmp, "#!/bin/sh\nexit 1\n");
         let bundle = Path::new("/Applications/Helium.app");
-        let target = Path::new(
-            "/Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/1/Libraries/WidevineCdm",
+        let library = Path::new(
+            "/Users/me/Library/Application Support/net.imput.helium/WidevineCdm/4.10.3050.0/_platform_specific/mac_arm64/libwidevinecdm.dylib",
         );
-        let library = target.join("_platform_specific/mac_arm64/libwidevinecdm.dylib");
-        let paths = super::codesign_paths(bundle, Some(target), Some(&library));
+        let paths = super::CodesignPaths {
+            bundle,
+            cdm_library: Some(library),
+        };
 
         let check = super::run_codesign_check(&tool, paths, true);
 
@@ -647,11 +595,13 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let tool = write_fake_codesign(&tmp, "#!/bin/sh\nrm \"$0\"\nexit 1\n");
         let bundle = Path::new("/Applications/Helium.app");
-        let target = Path::new(
-            "/Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/1/Libraries/WidevineCdm",
+        let library = Path::new(
+            "/Users/me/Library/Application Support/net.imput.helium/WidevineCdm/4.10.3050.0/_platform_specific/mac_arm64/libwidevinecdm.dylib",
         );
-        let library = target.join("_platform_specific/mac_arm64/libwidevinecdm.dylib");
-        let paths = super::codesign_paths(bundle, Some(target), Some(&library));
+        let paths = super::CodesignPaths {
+            bundle,
+            cdm_library: Some(library),
+        };
 
         let check = super::run_codesign_check(&tool, paths, true);
 
@@ -659,19 +609,19 @@ mod tests {
         assert_eq!(check.failure_domain, FailureDomain::Silvervine);
         assert_eq!(
             check.summary,
-            "Silvervine-managed codesign verification could not complete."
+            "Silvervine-managed Widevine signature verification could not complete."
         );
     }
 
     #[test]
-    fn managed_missing_paths_never_report_codesign_pass() {
-        let check = super::codesign_check(Path::new("/Applications/Helium.app"), None, None, true);
+    fn managed_missing_library_never_reports_codesign_pass() {
+        let check = super::codesign_check(Path::new("/Applications/Helium.app"), None, true);
 
         assert_eq!(check.status, DiagnosticStatus::Fail);
         assert_eq!(check.failure_domain, FailureDomain::Silvervine);
         assert_eq!(
             check.details.get("missing_managed_scopes"),
-            Some(&"framework,cdm_library".to_owned())
+            Some(&"cdm_library".to_owned())
         );
     }
 
@@ -680,7 +630,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let tool = write_fake_codesign(&tmp, "#!/bin/sh\nexit 1\n");
         let bundle = Path::new("/Applications/Chrome.app");
-        let paths = super::codesign_paths(bundle, None, None);
+        let paths = super::CodesignPaths {
+            bundle,
+            cdm_library: None,
+        };
 
         let check = super::run_codesign_check(&tool, paths, false);
 

@@ -159,10 +159,6 @@ enum Command {
         #[arg(long)]
         install_path: PathBuf,
         #[arg(long)]
-        framework_name: Option<String>,
-        #[arg(long)]
-        framework_version: Option<String>,
-        #[arg(long)]
         backup_parent: PathBuf,
         #[arg(long)]
         cdm_dir: PathBuf,
@@ -202,8 +198,6 @@ fn main() -> ExitCode {
     // logs, fetch manifests, touch caches, or emit hooks.
     if let Some(Command::PrivilegedPatch {
         install_path,
-        framework_name,
-        framework_version,
         backup_parent,
         cdm_dir,
         managed_marker,
@@ -215,8 +209,6 @@ fn main() -> ExitCode {
     {
         let result = cli::patch::run_privileged(&cli::patch::PrivilegedArgs {
             install_path: install_path.clone(),
-            framework_name: framework_name.clone(),
-            framework_version: framework_version.clone(),
             backup_parent: backup_parent.clone(),
             cdm_dir: cdm_dir.clone(),
             managed_marker: managed_marker.as_ref().clone(),

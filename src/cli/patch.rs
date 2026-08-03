@@ -43,10 +43,6 @@ pub struct Args {
 pub struct PrivilegedArgs {
     /// Exact absolute browser install selected by the locked parent.
     pub install_path: PathBuf,
-    /// Exact framework selected by the parent on macOS.
-    pub framework_name: Option<String>,
-    /// Exact framework version selected by the parent on macOS.
-    pub framework_version: Option<String>,
     /// Trusted same-filesystem directory selected by the unprivileged parent
     /// for exclusive snapshot creation.
     pub backup_parent: PathBuf,
@@ -211,7 +207,6 @@ pub fn privileged_browser(args: &PrivilegedArgs) -> Browser {
         kind: args
             .browser_kind
             .unwrap_or(crate::browsers::BrowserKind::Detected),
-        framework_name: args.framework_name.clone(),
     }
 }
 
@@ -239,58 +234,44 @@ pub fn run_privileged(args: &PrivilegedArgs) -> Result<()> {
             args.install_path.display()
         )));
     }
-    // Do not inspect the user-writable source path with path-following APIs.
-    // `stage_verified_payload` resolves each component with openat+O_NOFOLLOW.
+    // A macOS component belongs to the login user's profile. Running this
+    // child as root would select root's profile and create incorrectly-owned
+    // state, so macOS never supports the privileged patch path.
     #[cfg(target_os = "macos")]
-    let pinned_layout = {
-        let framework = args.framework_name.as_deref().ok_or_else(|| {
-            Error::unknown_bundle_structure(
-                "privileged macOS patch requires an exact parent-selected framework",
-            )
-        })?;
-        let version = args.framework_version.as_deref().ok_or_else(|| {
-            Error::unknown_bundle_structure(
-                "privileged macOS patch requires an exact parent-selected framework version",
-            )
-        })?;
-        (framework, version)
-    };
-    patch::validate_privileged_snapshot_parent(&args.install_path, &args.backup_parent)?;
-    #[cfg(target_os = "macos")]
-    crate::patch::macos::validate_privileged_layout(
-        &args.install_path,
-        pinned_layout.0,
-        pinned_layout.1,
-    )?;
-    let staged = crate::widevine::ownership::stage_verified_payload(
-        &args.cdm_dir,
-        &args.backup_parent,
-        &args.managed_marker,
-    )?;
-    let browser = privileged_browser(args);
-    let cdm = CachedCdm::from_verified_payload(
-        args.managed_marker.cdm_version.clone(),
-        staged.path().to_owned(),
-        args.managed_marker.library_sha512.clone(),
-        args.managed_marker.manifest_sha512.clone(),
-    );
-    let patcher = patch::host_patcher_for_layout(
-        args.framework_name.as_deref(),
-        args.framework_version.as_deref(),
-    )?;
-    patch::patch_browser(
-        &browser,
-        &cdm,
-        patcher.as_ref(),
-        &PatchOptions {
-            force_while_running: args.force,
-            replace_external_cdm: args.replace_external_cdm,
-            backups_dir: Some(args.backup_parent.clone()),
-            as_root: true,
-            ..Default::default()
-        },
-    )?;
-    Ok(())
+    {
+        Err(Error::permission_denied(
+            "macOS Widevine installation does not support privileged execution",
+        ))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let staged = crate::widevine::ownership::stage_verified_payload(
+            &args.cdm_dir,
+            &args.backup_parent,
+            &args.managed_marker,
+        )?;
+        let browser = privileged_browser(args);
+        let cdm = CachedCdm::from_verified_payload(
+            args.managed_marker.cdm_version.clone(),
+            staged.path().to_owned(),
+            args.managed_marker.library_sha512.clone(),
+            args.managed_marker.manifest_sha512.clone(),
+        );
+        let patcher = patch::host_patcher()?;
+        patch::patch_browser(
+            &browser,
+            &cdm,
+            patcher.as_ref(),
+            &PatchOptions {
+                force_while_running: args.force,
+                replace_external_cdm: args.replace_external_cdm,
+                backups_dir: Some(args.backup_parent.clone()),
+                as_root: true,
+                ..Default::default()
+            },
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -389,7 +370,6 @@ mod tests {
             name: name.into(),
             install_path: install,
             kind: BrowserKind::Detected,
-            framework_name: None,
         }
     }
 
@@ -694,7 +674,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn privileged_child_rejects_missing_parent_selected_framework() {
+    fn privileged_child_is_disabled_for_profile_installation() {
         let tmp = tempfile::TempDir::new().unwrap();
         let install = tmp.path().join("Custom.app");
         let cdm = tmp.path().join("cdm");
@@ -702,8 +682,6 @@ mod tests {
         fs::create_dir_all(&cdm).unwrap();
         let error = run_privileged(&PrivilegedArgs {
             install_path: install,
-            framework_name: None,
-            framework_version: None,
             backup_parent: tmp.path().to_path_buf(),
             cdm_dir: cdm,
             managed_marker: test_managed_marker(),
@@ -713,7 +691,7 @@ mod tests {
             replace_external_cdm: false,
         })
         .unwrap_err();
-        assert!(error.to_string().contains("parent-selected framework"));
+        assert!(error.to_string().contains("privileged execution"));
     }
 
     #[test]
@@ -783,8 +761,6 @@ mod tests {
         fs::create_dir_all(&install).unwrap();
         let browser = privileged_browser(&PrivilegedArgs {
             install_path: install.clone(),
-            framework_name: None,
-            framework_version: None,
             backup_parent: tmp.path().to_path_buf(),
             cdm_dir: tmp.path().join("cdm"),
             managed_marker: test_managed_marker(),
@@ -805,8 +781,6 @@ mod tests {
         fs::create_dir_all(&install).unwrap();
         let browser = privileged_browser(&PrivilegedArgs {
             install_path: install,
-            framework_name: None,
-            framework_version: None,
             backup_parent: tmp.path().to_path_buf(),
             cdm_dir: tmp.path().join("cdm"),
             managed_marker: test_managed_marker(),

@@ -145,7 +145,7 @@ fn collect_browser_at(
 ) -> BrowserDiagnostics {
     let (browser_executable, executable_check) = collect_executable(browser, executable);
     let cdm = collect_cdm(browser, cdm_target, candidate);
-    let external = collect_external_cdms(browser, profile_roots);
+    let external = collect_external_cdms(browser, profile_roots, cdm.target.as_deref());
     let mut checks = Vec::with_capacity(3 + cdm.checks.len() + external.checks.len());
     checks.push(executable_check);
     checks.push(version_check(browser_version.as_deref()));
@@ -162,7 +162,6 @@ fn collect_browser_at(
     {
         checks.push(macos::codesign_check(
             browser.install_path(),
-            cdm.target.as_deref(),
             cdm.library.as_deref(),
             cdm.ownership.kind == OwnershipKind::Managed,
         ));
@@ -574,7 +573,11 @@ const MAX_LOCAL_STATE_PROFILE_ENTRIES: usize = 16;
 /// Local State / Preferences size cap for bounded metadata reads.
 const MAX_PROFILE_METADATA_BYTES: u64 = 1024 * 1024;
 
-fn collect_external_cdms(browser: &Browser, profile_roots: Option<&[PathBuf]>) -> ExternalEvidence {
+fn collect_external_cdms(
+    browser: &Browser,
+    profile_roots: Option<&[PathBuf]>,
+    primary_target: Option<&Path>,
+) -> ExternalEvidence {
     let (roots, mut profile_scope_complete) = match profile_roots {
         // Explicit roots (including empty) are a deliberate test/production seam:
         // completeness still depends on successful bounded inspection of each root.
@@ -598,6 +601,9 @@ fn collect_external_cdms(browser: &Browser, profile_roots: Option<&[PathBuf]>) -
                 merge_external_hints(&mut hints, &mut seen, root_hints);
             }
         }
+    }
+    if let Some(primary_target) = primary_target.and_then(|target| canonicalize_path(target).ok()) {
+        hints.retain(|hint| !hint_belongs_to_target(hint, &primary_target));
     }
 
     let checks = external_checks(&hints, profile_scope_complete);
@@ -971,15 +977,78 @@ fn collect_profile_dir_evidence(
         return false;
     }
 
-    let Some(hint) = inspect_external_hint(
+    let Some(root_hint) = inspect_external_hint(
         containment_root,
         &widevine,
         ExternalCdmOrigin::ProfileWidevineCdm,
     ) else {
         return false;
     };
-    push_unique_hint(hints, seen, hint);
-    true
+    if root_hint.version.is_some() || root_hint.library.is_some() || metadata.is_file() {
+        push_unique_hint(hints, seen, root_hint);
+        return true;
+    }
+
+    let Ok(entries) = fs::read_dir(&widevine) else {
+        return false;
+    };
+    let mut complete = true;
+    let mut inspected = 0_usize;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            complete = false;
+            continue;
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            complete = false;
+            continue;
+        };
+        if !is_dotted_numeric_version(&name) {
+            continue;
+        }
+        inspected += 1;
+        if inspected > MAX_PROFILES_PER_USER_DATA_ROOT {
+            complete = false;
+            break;
+        }
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            complete = false;
+            continue;
+        };
+        if file_type.is_symlink() || !file_type.is_dir() {
+            complete = false;
+            continue;
+        }
+        if let Some(hint) = inspect_external_hint(
+            containment_root,
+            &path,
+            ExternalCdmOrigin::ProfileWidevineCdm,
+        ) {
+            if hint.version.is_some() || hint.library.is_some() {
+                push_unique_hint(hints, seen, hint);
+            } else {
+                complete = false;
+            }
+        } else {
+            complete = false;
+        }
+    }
+    complete
+}
+
+fn is_dotted_numeric_version(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn hint_belongs_to_target(hint: &ExternalCdmHint, target: &Path) -> bool {
+    canonicalize_path(&hint.path).is_ok_and(|path| path == target)
+        || hint.library.as_ref().is_some_and(|library| {
+            canonicalize_path(library).is_ok_and(|path| path.starts_with(target))
+        })
 }
 
 fn push_unique_hint(
@@ -1366,19 +1435,14 @@ fn default_profile_roots(browser: &Browser) -> Option<Vec<PathBuf>> {
 
     #[cfg(target_os = "macos")]
     {
-        let suffixes = profile_support_suffixes(&name);
+        let suffixes = crate::patch::macos::profile_support_suffixes(&name);
         if suffixes.is_empty() {
             return None;
         }
         let support = dirs::home_dir()?
             .join("Library")
             .join("Application Support");
-        Some(
-            suffixes
-                .into_iter()
-                .map(|suffix| support.join(suffix))
-                .collect(),
-        )
+        Some(suffixes.iter().map(|suffix| support.join(suffix)).collect())
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1395,17 +1459,6 @@ fn profile_config_suffixes(name: &str) -> Vec<&'static str> {
         "thorium" => vec!["thorium", "Thorium"],
         "ungoogled-chromium" => vec!["ungoogled-chromium"],
         "chromium" => vec!["chromium"],
-        _ => Vec::new(),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn profile_support_suffixes(name: &str) -> Vec<&'static str> {
-    match name {
-        "helium" => vec!["Helium"],
-        "thorium" => vec!["Thorium"],
-        "ungoogled-chromium" => vec!["ungoogled-chromium"],
-        "chromium" => vec!["Chromium"],
         _ => Vec::new(),
     }
 }
@@ -1613,7 +1666,6 @@ mod tests {
             name: "Chromium".into(),
             install_path: install_path.to_path_buf(),
             kind,
-            framework_name: None,
         }
     }
 
@@ -1880,6 +1932,37 @@ mod tests {
             .cdm_entries
             .iter()
             .any(|entry| { entry.version.as_deref() == Some("4.10.9.9") }));
+    }
+    #[test]
+    fn managed_profile_component_is_not_duplicated_as_external_evidence() {
+        let tmp = TempDir::new().expect("tempdir");
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).expect("install");
+        let (seeded, _) = managed_cdm(&tmp.path().join("seed"));
+        let profile = tmp.path().join("profile");
+        let target = profile.join("WidevineCdm/4.10.0.0");
+        fs::create_dir_all(target.parent().expect("component parent")).expect("component parent");
+        fs::rename(seeded, &target).expect("move managed component");
+
+        let diagnostics = collect_browser_for_test(
+            &browser(&install, BrowserKind::Known),
+            Ok(std::env::current_exe().expect("exe")),
+            Some("150.0.1".into()),
+            Ok(target),
+            None,
+            &[profile],
+        );
+
+        assert_eq!(diagnostics.ownership.kind, OwnershipKind::Managed);
+        assert!(diagnostics.external_cdms.is_empty());
+        assert_eq!(
+            diagnostics
+                .fingerprint
+                .expect("fingerprint")
+                .cdm_entries
+                .len(),
+            1
+        );
     }
 
     #[test]

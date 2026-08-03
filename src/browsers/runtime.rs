@@ -75,9 +75,12 @@ pub fn passive_version(browser: &Browser) -> Option<String> {
     }
     #[cfg(target_os = "macos")]
     {
-        let plist =
-            std::fs::read_to_string(browser.install_path().join("Contents/Info.plist")).ok()?;
-        plist_string_value(&plist, "CFBundleShortVersionString")
+        crate::patch::macos::read_info_plist_string(
+            browser.install_path(),
+            "CFBundleShortVersionString",
+        )
+        .ok()
+        .flatten()
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -153,19 +156,6 @@ fn parse_dpkg_owner(output: &str) -> Option<String> {
     valid.then(|| package.to_owned())
 }
 
-#[cfg(target_os = "macos")]
-fn plist_string_value(plist: &str, key: &str) -> Option<String> {
-    let key = format!("<key>{key}</key>");
-    let remainder = plist.split_once(&key)?.1;
-    let value = remainder
-        .split_once("<string>")?
-        .1
-        .split_once("</string>")?
-        .0
-        .trim();
-    (!value.is_empty()).then(|| value.to_owned())
-}
-
 #[cfg(target_os = "linux")]
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -193,7 +183,6 @@ mod tests {
             name: name.to_owned(),
             install_path,
             kind: BrowserKind::Known,
-            framework_name: None,
         }
     }
 

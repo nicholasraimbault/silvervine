@@ -1079,7 +1079,6 @@ mod tests {
             name: "Test Browser".into(),
             install_path: root.join("browser"),
             kind,
-            framework_name: None,
         }
     }
 

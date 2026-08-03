@@ -18,8 +18,7 @@
 //!
 //! ## What does NOT live here
 //!
-//! * Bundle write semantics, `xattr -cr`, `codesign` — those are
-//!   patch-flow concerns and live in `crate::patch::macos`.
+//! * CDM publication semantics — those live in `crate::patch::{linux,macos}`.
 //! * Daemon registration (`LaunchAgent` / systemd-user) — Phase 3.
 //! * Sleep/wake hooks — Phase 3.
 //!

@@ -1,10 +1,10 @@
 //! `silvervine repair` — composition: uninstall (preserving config) + setup.
 //!
 //! Useful when state goes weird: the daemon won't start, the CDM cache
-//! is corrupt, or the patch state file says one thing while the
-//! browser bundle says another. Repair removes the daemon registration,
-//! the CDM cache, and the state file, then re-runs `setup` (without the
-//! EME health check) so the user ends with a known-clean install.
+//! is corrupt, or the patch state file disagrees with the active CDM target.
+//! Repair removes the daemon registration, the CDM cache, and the state file,
+//! then re-runs `setup` (without the EME health check) so the user ends with a
+//! known-clean install.
 
 use std::io::Write;
 

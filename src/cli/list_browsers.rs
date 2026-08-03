@@ -158,7 +158,6 @@ mod tests {
             name: name.into(),
             install_path: path,
             kind,
-            framework_name: None,
         }
     }
 

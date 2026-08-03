@@ -502,7 +502,6 @@ mod tests {
             name: name.into(),
             install_path: install,
             kind: BrowserKind::Detected,
-            framework_name: None,
         }
     }
 
@@ -515,7 +514,6 @@ mod tests {
             name: name.into(),
             install_path: app,
             kind: BrowserKind::Detected,
-            framework_name: None,
         }
     }
 
@@ -600,7 +598,6 @@ mod tests {
             name: "Helium".into(),
             install_path: install,
             kind: BrowserKind::Detected,
-            framework_name: None,
         }];
         let r = Plan::build(&detected, &Args::default());
         assert!(r.is_err());
@@ -845,7 +842,6 @@ mod tests {
             name: "Chromium".into(),
             install_path: PathBuf::from("/tmp/chromium"),
             kind: BrowserKind::Detected,
-            framework_name: None,
         };
         let fingerprint = ProbeFingerprint::new(
             "/opt/test/chromium",
@@ -1019,7 +1015,6 @@ mod tests {
             name: "Chromium".into(),
             install_path: PathBuf::from("/tmp/chromium"),
             kind: BrowserKind::Detected,
-            framework_name: None,
         };
         let pre = sample_passive(Some(sample_fingerprint("before-digest")));
         let post = sample_passive(Some(sample_fingerprint("after-digest")));
@@ -1108,7 +1103,6 @@ mod tests {
             name: "Chromium".into(),
             install_path: PathBuf::from("/tmp/chromium"),
             kind: BrowserKind::Detected,
-            framework_name: None,
         };
         let fingerprint = sample_fingerprint("stable-digest");
         let pre = sample_passive(Some(fingerprint.clone()));

@@ -793,7 +793,6 @@ mod tests {
             name: "TestyBrowser".into(),
             install_path: bundle.clone(),
             kind: BrowserKind::Detected,
-            framework_name: None,
         };
         match snapshot_for_browser(&browser, Some("v1.2.3")) {
             Ok(handle) => {

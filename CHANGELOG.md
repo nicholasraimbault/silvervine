@@ -10,14 +10,15 @@ Future entries are generated from
 
 ## [Unreleased]
 
+## [2.1.2] - 2026-08-03
+
 ### Changed
 
 - Stopped the daemon watcher from rescanning the process table every 500 ms
   while idle; it now blocks until a filesystem event or a scheduled
   debounce/deferred-poll deadline.
 - Replaced recursive macOS diagnostic codesign scans with strict checks of the
-  browser bundle plus the framework and CDM library only when Silvervine owns
-  them.
+  vendor browser bundle and Silvervine-managed user-profile CDM library.
 
 ### Fixed
 
@@ -26,6 +27,17 @@ Future entries are generated from
   that could patch the same browser twice.
 - Corrected macOS codesign diagnostics for missing or invalid Silvervine-managed
   paths and inconclusive host probes.
+- Installed macOS Widevine in each browser's per-user Chromium component
+  directory, preserving the vendor application signature and entitlements and
+  avoiding launch failures caused by ad-hoc bundle re-signing.
+- Protected both the active and candidate macOS component targets with
+  Silvervine ownership checks, bound publication and rollback cleanup to the
+  authorized profile path and filesystem object, and rolled back any candidate
+  the browser would not select as active.
+- Honored explicit Chromium profile-directory metadata and parsed both XML and
+  binary browser property lists for profile and version detection.
+- Resolved status and passive diagnostics through the platform's active CDM
+  target and deduplicated that managed target from external component evidence.
 
 ## [2.1.1] - 2026-08-02
 
@@ -370,7 +382,8 @@ rc.1 has a hard deadlock on the patch path.
   scripts. Both bugs are obsoleted by the rewrite, but the reports
   were on the money.
 
-[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.1...HEAD
+[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.2...HEAD
+[2.1.2]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.1...v2.1.2
 [2.1.1]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.0...v2.0.1

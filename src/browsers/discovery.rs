@@ -118,7 +118,6 @@ fn discover_linux(roots: &FilesystemRoots) -> Vec<Browser> {
                     name,
                     install_path: path,
                     kind: BrowserKind::Detected,
-                    framework_name: None,
                 });
             }
         }
@@ -192,7 +191,6 @@ fn discover_macos(roots: &FilesystemRoots) -> Vec<Browser> {
                 name: app_name,
                 install_path: path,
                 kind: BrowserKind::Detected,
-                framework_name: Some(framework_name),
             });
         }
     }
@@ -340,7 +338,6 @@ mod tests {
         assert_eq!(found[0].name, "helium-browser-bin");
         assert_eq!(found[0].install_path, helium);
         assert_eq!(found[0].kind, BrowserKind::Detected);
-        assert!(found[0].framework_name.is_none());
     }
 
     #[test]
@@ -487,10 +484,6 @@ mod tests {
         let found = discover_filesystem(Os::Macos, &roots);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name, "WeirdChromium");
-        assert_eq!(
-            found[0].framework_name.as_deref(),
-            Some("WeirdChromium Framework")
-        );
         assert_eq!(found[0].install_path, app);
         assert_eq!(found[0].kind, BrowserKind::Detected);
     }
@@ -562,13 +555,11 @@ mod tests {
             name: "Helium".into(),
             install_path: PathBuf::from("/opt/helium"),
             kind: BrowserKind::Detected,
-            framework_name: None,
         };
         let thorium = Browser {
             name: "Thorium".into(),
             install_path: PathBuf::from("/opt/thorium"),
             kind: BrowserKind::Detected,
-            framework_name: None,
         };
 
         assert!(snapshot.is_running(&helium));

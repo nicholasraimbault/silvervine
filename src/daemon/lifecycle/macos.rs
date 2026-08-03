@@ -93,12 +93,6 @@ fn log_path() -> Result<PathBuf> {
 /// Compose the plist body. Exposed at crate-private visibility so tests
 /// can assert against it.
 pub(super) fn plist_body(exec_path: &Path, log: &Path) -> String {
-    // We hand-write the XML; the `plist` crate would pull in ~50KB of
-    // serialization machinery for what is effectively a six-key dict.
-    // The format is fixed by Apple's DTD; no field needs escaping in the
-    // realistic install path (no XML metacharacters in our binary or log
-    // paths). If a user's $HOME contains `<` or `&` we'd produce
-    // malformed XML, but that's not a realistic scenario.
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
