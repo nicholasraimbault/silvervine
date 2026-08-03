@@ -1,6 +1,6 @@
 [package]
 name = "silvervine"
-version = "2.1.0"
+version = "2.1.1"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Nicholas Raimbault <nraimbault16@gmail.com>"]
@@ -38,8 +38,10 @@ dirs = "6"
 fs2 = "0.4"
 # Compact, non-poisoning mutexes for daemon state shared across watcher threads.
 parking_lot = "0.12"
-# SHA-512 verification for Widevine CRX3 downloads.
+# SHA-512 manifest digests and SHA-256 CRX component IDs.
 sha2 = "0.11"
+# Verify the pinned Widevine CRX3 developer signature.
+ring = "0.17"
 # CRX3 ZIP body extraction. Select only flate2-based deflate decoding;
 # zip's umbrella `deflate` feature also enables the unused Zopfli encoder.
 zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"] }

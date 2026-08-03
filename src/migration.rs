@@ -934,48 +934,35 @@ pub fn remove_legacy_with(
     remove_legacy_with_elevator(install, cdm_destination, &platform::run_as_root_script)
 }
 
-/// Same as [`remove_legacy_with`] but with the elevator function
-/// injected so tests can simulate user-cancelled sudo / pkexec dialogs.
-/// Pass 1's batched-script failure routes the corresponding paths to
-/// [`MigrationOutcome::skipped`] with the error reason — they are
-/// **not** falsely reported in [`MigrationOutcome::removed`].
-///
-/// # Errors
-///
-/// See [`remove_legacy`]. The elevator's error is not propagated as a
-/// hard error because Pass 2 (user-level ops) still has useful work to
-/// do; instead the elevated artifacts are reported as skipped.
-pub fn remove_legacy_with_elevator<E>(
-    install: LegacyInstall,
-    cdm_destination: &Path,
+fn record_elevated_cleanup_postconditions(paths: Vec<PathBuf>, outcome: &mut MigrationOutcome) {
+    for path in paths {
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                outcome.removed.push(path);
+            }
+            Ok(_) => outcome.skipped.push(SkipReason {
+                path,
+                reason: "elevated cleanup left artifact in place".into(),
+            }),
+            Err(error) => outcome.skipped.push(SkipReason {
+                path,
+                reason: format!("could not verify elevated cleanup postcondition: {error}"),
+            }),
+        }
+    }
+}
+
+fn remove_elevated_legacy<E>(
+    install: &LegacyInstall,
+    pkg_hint: &str,
+    outcome: &mut MigrationOutcome,
     elevator: &E,
-) -> Result<MigrationOutcome>
+) -> Result<()>
 where
     E: Fn(&str) -> Result<std::process::Output>,
 {
-    let mut outcome = MigrationOutcome::default();
-    let pkg_hint = legacy_package_uninstall_hint(install.package_manager, "neon-drm");
-
-    // Pass 1: batch every elevation-required operation into a single
-    // shell script, then run that script under one elevation prompt.
-    // Turns N sudo/pkexec prompts into exactly one regardless of how
-    // many legacy artifacts are present.
-    //
-    // Failure of any individual sub-command inside the script is
-    // tolerated (`|| true`) — best-effort cleanup that mirrors the
-    // previous per-call behavior. Surfaced errors come from the
-    // elevation itself, not the cleanup ops.
-    //
-    // Package-managed artifacts are *not* removed in this pass — we
-    // skip them with a pkg-manager-aware advisory so the user can
-    // uninstall cleanly via their distro's tooling.
-    //
-    // We collect the paths Pass 1 *would* remove into a pending vec
-    // and only promote them to `outcome.removed` after the elevator
-    // returns success. If the elevator fails (e.g. user dismisses the
-    // sudo prompt), the paths are routed to `outcome.skipped` with the
-    // error reason so the caller can surface accurate state instead of
-    // falsely claiming the artifacts were removed.
+    // Pass 1 batches every elevation-required operation into one script and
+    // only records removal after a successful exit and absent-path check.
     let mut root_script: Vec<String> = Vec::new();
     let mut pending_removed: Vec<PathBuf> = Vec::new();
     let mut needs_systemd_reload = false;
@@ -983,7 +970,7 @@ where
         if art.package_managed {
             outcome.skipped.push(SkipReason {
                 path: art.path.clone(),
-                reason: pkg_hint.clone(),
+                reason: pkg_hint.to_owned(),
             });
             continue;
         }
@@ -1021,7 +1008,24 @@ where
     if !root_script.is_empty() {
         let script = root_script.join("\n");
         match elevator(&script) {
-            Ok(_) => outcome.removed.extend(pending_removed),
+            Ok(output) if output.status.success() => {
+                record_elevated_cleanup_postconditions(pending_removed, outcome);
+            }
+            Ok(output) => {
+                let status = platform::format_exit_status(output.status);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let reason = if stderr.trim().is_empty() {
+                    format!("elevated cleanup failed: {status}")
+                } else {
+                    format!("elevated cleanup failed: {status}: {}", stderr.trim())
+                };
+                for path in pending_removed {
+                    outcome.skipped.push(SkipReason {
+                        path,
+                        reason: reason.clone(),
+                    });
+                }
+            }
             Err(e) => {
                 let reason = format!("elevated cleanup failed: {e}");
                 for path in pending_removed {
@@ -1033,6 +1037,37 @@ where
             }
         }
     }
+    Ok(())
+}
+
+/// Same as [`remove_legacy_with`] but with the elevator function
+/// injected so tests can simulate user-cancelled sudo / pkexec dialogs,
+/// nonzero elevator exits, and successful elevation that still leaves
+/// artifacts on disk.
+///
+/// Pass 1 only promotes a path to [`MigrationOutcome::removed`] when the
+/// elevator returns a successful exit **and** the path is gone afterward.
+/// Cancelled prompts, spawn failures, nonzero elevator status, and
+/// postcondition mismatches all route the corresponding paths to
+/// [`MigrationOutcome::skipped`] with an actionable reason — they are
+/// **not** falsely reported in [`MigrationOutcome::removed`].
+///
+/// # Errors
+///
+/// See [`remove_legacy`]. Elevator failures are not propagated as a hard
+/// error because Pass 2 (user-level ops) still has useful work to do;
+/// instead the elevated artifacts are reported as skipped.
+pub fn remove_legacy_with_elevator<E>(
+    install: LegacyInstall,
+    cdm_destination: &Path,
+    elevator: &E,
+) -> Result<MigrationOutcome>
+where
+    E: Fn(&str) -> Result<std::process::Output>,
+{
+    let mut outcome = MigrationOutcome::default();
+    let pkg_hint = legacy_package_uninstall_hint(install.package_manager, "neon-drm");
+    remove_elevated_legacy(&install, &pkg_hint, &mut outcome, elevator)?;
 
     // Pass 2: user-level operations (no elevation).
     for art in install.artifacts {
@@ -1195,7 +1230,61 @@ fn remove_path(path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{ExitStatus, Output};
     use tempfile::TempDir;
+
+    fn elevator_output(raw_status: i32, stderr: &str) -> Output {
+        Output {
+            status: ExitStatus::from_raw(raw_status),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// Elevator mock that reports success without touching the filesystem.
+    fn elevator_success_noop(_script: &str) -> Output {
+        elevator_output(0, "")
+    }
+
+    /// Elevator mock that reports a nonzero exit without deleting anything.
+    fn elevator_nonzero(_script: &str) -> Output {
+        elevator_output(256, "permission denied by policy")
+    }
+
+    /// Elevator mock that deletes every quoted path in the script, then
+    /// returns success — simulates a real elevated `rm` without shelling out.
+    fn elevator_success_deleting(script: &str) -> Output {
+        for segment in script.split('\'') {
+            // sh_quote wraps paths in single quotes; odd-indexed split
+            // pieces are the quoted contents (with `'\''` already expanded
+            // away for simple temp paths without embedded quotes).
+            let path = Path::new(segment);
+            if path.is_absolute() && path.exists() {
+                let _ = fs::remove_file(path);
+                let _ = fs::remove_dir_all(path);
+            }
+        }
+        elevator_output(0, "")
+    }
+
+    fn elevated_artifact_paths(install: &LegacyInstall) -> Vec<PathBuf> {
+        install
+            .artifacts
+            .iter()
+            .filter(|art| {
+                !art.package_managed
+                    && matches!(
+                        art.kind,
+                        LegacyKind::MacLaunchDaemon
+                            | LegacyKind::LinuxSystemdPath
+                            | LegacyKind::LinuxSystemdService
+                    )
+            })
+            .map(|art| art.path.clone())
+            .collect()
+    }
 
     fn data_paths(tmp: &Path) -> DataMigrationPaths {
         DataMigrationPaths {
@@ -1411,10 +1500,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let roots = synthesize_full_legacy(tmp.path());
         let install = detect_legacy_install_in(&roots);
+        let elevated = elevated_artifact_paths(&install);
         let cdm_dest = tmp.path().join("v2-cache").join("widevine").join("legacy");
         // Elevator always fails — simulates the user dismissing the
         // sudo / pkexec / osascript prompt.
-        let elevator = |_script: &str| -> Result<std::process::Output> {
+        let elevator = |_script: &str| -> Result<Output> {
             Err(crate::error::Error::permission_denied(
                 "user cancelled the prompt",
             ))
@@ -1422,39 +1512,203 @@ mod tests {
         let outcome =
             remove_legacy_with_elevator(install, &cdm_dest, &elevator).expect("returns Ok");
 
-        // The elevated-only artifacts must NOT appear in `removed`.
-        assert!(
-            !outcome
-                .removed
+        for path in &elevated {
+            assert!(
+                !outcome.removed.iter().any(|p| p == path),
+                "cancelled elevation must not report removed: {}",
+                path.display()
+            );
+            assert!(
+                path.exists(),
+                "cancelled elevation must leave artifact on disk: {}",
+                path.display()
+            );
+            let skipped = outcome
+                .skipped
                 .iter()
-                .any(|p| p.ends_with("Library/LaunchDaemons/com.neon.fix-drm.plist")),
-            "LaunchDaemon must not be reported as removed when elevator failed; \
-             removed={:?}",
-            outcome.removed
-        );
-        // They must appear in `skipped` with a reason that explains why.
-        let skipped_daemon = outcome.skipped.iter().find(|s| {
-            s.path
-                .ends_with("Library/LaunchDaemons/com.neon.fix-drm.plist")
-        });
-        assert!(
-            skipped_daemon.is_some(),
-            "LaunchDaemon must be in skipped; got skipped={:?}",
-            outcome.skipped
-        );
-        assert!(
-            skipped_daemon
-                .unwrap()
-                .reason
-                .contains("elevated cleanup failed"),
-            "skipped reason should mention the elevation failure; got {}",
-            skipped_daemon.unwrap().reason
-        );
+                .find(|s| &s.path == path)
+                .unwrap_or_else(|| panic!("expected skipped entry for {}", path.display()));
+            assert!(
+                skipped.reason.contains("elevated cleanup failed"),
+                "skipped reason should mention the elevation failure; got {}",
+                skipped.reason
+            );
+            assert!(
+                skipped.reason.contains("user cancelled the prompt"),
+                "skipped reason should carry the cancel detail; got {}",
+                skipped.reason
+            );
+        }
+
+        // User-level work must still proceed after elevation cancel.
+        let home = roots.home.as_ref().unwrap();
+        assert!(!home
+            .join("Library/LaunchAgents/com.neon.app.plist")
+            .exists());
+        assert!(!home.join(".config/autostart/neon.desktop").exists());
+        assert!(cdm_dest.exists());
     }
 
-    /// `remove_legacy_with` removes all user artifacts cleanly when
-    /// running with `SILVERVINE_TEST_ESCALATE_NOOP` set so root operations
-    /// don't actually shell out.
+    /// A spawned elevator that exits nonzero is not legacy removal.
+    #[test]
+    fn elevator_nonzero_exit_routes_paths_to_skipped_not_removed() {
+        let tmp = TempDir::new().unwrap();
+        let roots = synthesize_full_legacy(tmp.path());
+        let install = detect_legacy_install_in(&roots);
+        let elevated = elevated_artifact_paths(&install);
+        let cdm_dest = tmp.path().join("v2-cache").join("widevine").join("legacy");
+
+        let elevator = |script: &str| -> Result<Output> { Ok(elevator_nonzero(script)) };
+        let outcome =
+            remove_legacy_with_elevator(install, &cdm_dest, &elevator).expect("returns Ok");
+
+        for path in &elevated {
+            assert!(
+                !outcome.removed.iter().any(|p| p == path),
+                "nonzero elevator exit must not report removed: {}",
+                path.display()
+            );
+            assert!(path.exists(), "artifact must remain: {}", path.display());
+            let skipped = outcome
+                .skipped
+                .iter()
+                .find(|s| &s.path == path)
+                .unwrap_or_else(|| panic!("expected skipped entry for {}", path.display()));
+            assert!(
+                skipped.reason.contains("elevated cleanup failed"),
+                "got {}",
+                skipped.reason
+            );
+            assert!(
+                skipped.reason.contains("exit 1"),
+                "reason should include exit status; got {}",
+                skipped.reason
+            );
+            assert!(
+                skipped.reason.contains("permission denied by policy"),
+                "reason should include stderr; got {}",
+                skipped.reason
+            );
+        }
+
+        // Pass 2 still runs.
+        let home = roots.home.as_ref().unwrap();
+        assert!(!home.join(".config/autostart/neon.desktop").exists());
+        assert!(cdm_dest.exists());
+    }
+
+    /// Successful elevation status alone is insufficient: paths that remain
+    /// on disk after the elevator returns must not be reported as removed.
+    #[test]
+    fn elevator_success_without_postcondition_routes_to_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let roots = synthesize_full_legacy(tmp.path());
+        let install = detect_legacy_install_in(&roots);
+        let elevated = elevated_artifact_paths(&install);
+        let cdm_dest = tmp.path().join("v2-cache").join("widevine").join("legacy");
+
+        let elevator = |script: &str| -> Result<Output> { Ok(elevator_success_noop(script)) };
+        let outcome =
+            remove_legacy_with_elevator(install, &cdm_dest, &elevator).expect("returns Ok");
+
+        for path in &elevated {
+            assert!(
+                !outcome.removed.iter().any(|p| p == path),
+                "spawn success without removal must not report removed: {}",
+                path.display()
+            );
+            assert!(path.exists(), "artifact must remain: {}", path.display());
+            let skipped = outcome
+                .skipped
+                .iter()
+                .find(|s| &s.path == path)
+                .unwrap_or_else(|| panic!("expected skipped entry for {}", path.display()));
+            assert_eq!(
+                skipped.reason, "elevated cleanup left artifact in place",
+                "postcondition mismatch reason; got {}",
+                skipped.reason
+            );
+        }
+    }
+
+    #[test]
+    fn elevator_success_does_not_report_a_dangling_symlink_removed() {
+        let tmp = TempDir::new().unwrap();
+        let roots = synthesize_full_legacy(tmp.path());
+        let install = detect_legacy_install_in(&roots);
+        let path = elevated_artifact_paths(&install)
+            .into_iter()
+            .next()
+            .expect("elevated artifact");
+        fs::remove_file(&path).expect("replace artifact");
+        symlink("missing-target", &path).expect("create dangling symlink");
+        let cdm_dest = tmp.path().join("v2-cache").join("widevine").join("legacy");
+        let elevator = |script: &str| -> Result<Output> { Ok(elevator_success_noop(script)) };
+
+        let outcome =
+            remove_legacy_with_elevator(install, &cdm_dest, &elevator).expect("returns Ok");
+
+        assert!(!outcome.removed.contains(&path));
+        let skipped = outcome
+            .skipped
+            .iter()
+            .find(|entry| entry.path == path)
+            .expect("dangling symlink must remain skipped");
+        assert_eq!(skipped.reason, "elevated cleanup left artifact in place");
+        assert!(fs::symlink_metadata(&path).is_ok());
+    }
+
+    /// Success requires both a successful elevator exit and the expected
+    /// filesystem postcondition for each elevated artifact.
+    #[test]
+    fn elevator_success_with_postcondition_reports_removed() {
+        let tmp = TempDir::new().unwrap();
+        let roots = synthesize_full_legacy(tmp.path());
+        let install = detect_legacy_install_in(&roots);
+        let elevated = elevated_artifact_paths(&install);
+        let cdm_dest = tmp.path().join("v2-cache").join("widevine").join("legacy");
+
+        let elevator = |script: &str| -> Result<Output> { Ok(elevator_success_deleting(script)) };
+        let outcome =
+            remove_legacy_with_elevator(install, &cdm_dest, &elevator).expect("returns Ok");
+
+        for path in &elevated {
+            assert!(
+                outcome.removed.iter().any(|p| p == path),
+                "verified removal must report removed: {}; removed={:?}",
+                path.display(),
+                outcome.removed
+            );
+            assert!(
+                !path.exists(),
+                "verified removal must delete artifact: {}",
+                path.display()
+            );
+            assert!(
+                !outcome.skipped.iter().any(|s| &s.path == path),
+                "verified removal must not also skip: {}",
+                path.display()
+            );
+        }
+
+        // User-level migration still runs alongside verified elevated cleanup.
+        let home = roots.home.as_ref().unwrap();
+        assert!(!home
+            .join("Library/LaunchAgents/com.neon.app.plist")
+            .exists());
+        assert!(!home.join(".config/autostart/neon.desktop").exists());
+        assert!(cdm_dest.join("4.10.0.0/libwidevinecdm.so").exists());
+        assert!(!home.join(".local/share/WidevineCdm").exists());
+        assert!(outcome
+            .skipped
+            .iter()
+            .any(|s| s.path.ends_with("usr/lib/neon")));
+        assert!(!outcome.migrated.is_empty());
+    }
+
+    /// `remove_legacy_with` under NOOP elevation still performs user-level
+    /// cleanup. Elevated paths stay on disk and must not be claimed removed
+    /// merely because the elevator short-circuited with a successful status.
     #[test]
     fn remove_legacy_under_noop_short_circuit() {
         let _guard = crate::test_support::env_lock();
@@ -1464,6 +1718,7 @@ mod tests {
         // restore at end-of-test.
         unsafe { std::env::set_var("SILVERVINE_TEST_ESCALATE_NOOP", "1") };
         let install = detect_legacy_install_in(&roots);
+        let elevated = elevated_artifact_paths(&install);
         let cdm_dest = tmp.path().join("v2-cache").join("widevine").join("legacy");
         let outcome = remove_legacy_with(install, &cdm_dest).expect("ok");
 
@@ -1484,12 +1739,32 @@ mod tests {
             .skipped
             .iter()
             .any(|s| s.path.ends_with("usr/lib/neon")));
-        // System-side removed entries are recorded in `removed` even if
-        // we didn't actually shell out (NOOP mode).
-        assert!(outcome
-            .removed
-            .iter()
-            .any(|p| p.ends_with("Library/LaunchDaemons/com.neon.fix-drm.plist")));
+
+        // NOOP elevation returns success without deleting system artifacts.
+        // Those paths must be skipped for postcondition mismatch — never
+        // falsely listed under `removed`.
+        for path in &elevated {
+            assert!(
+                path.exists(),
+                "NOOP elevator must leave elevated artifact: {}",
+                path.display()
+            );
+            assert!(
+                !outcome.removed.iter().any(|p| p == path),
+                "NOOP elevator must not report removed: {}",
+                path.display()
+            );
+            let skipped = outcome
+                .skipped
+                .iter()
+                .find(|s| &s.path == path)
+                .unwrap_or_else(|| panic!("expected skipped entry for {}", path.display()));
+            assert_eq!(
+                skipped.reason, "elevated cleanup left artifact in place",
+                "got {}",
+                skipped.reason
+            );
+        }
         assert!(!outcome.migrated.is_empty());
 
         unsafe { std::env::remove_var("SILVERVINE_TEST_ESCALATE_NOOP") };

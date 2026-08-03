@@ -47,13 +47,23 @@
 //! 1. `https://hg.mozilla.org/...`
 //! 2. `https://raw.githubusercontent.com/...`
 //!
-//! Each origin attempt covers download **and** parse/schema validation.
-//! Transport failures, non-success HTTP status, and malformed/schema-invalid
-//! bodies all continue to the next fixed origin. A successful response may be
-//! written as a diagnostic snapshot, but mutable on-disk snapshots are never
-//! read back to authorize executable CDM content.
+//! Each default-origin attempt and redirect is restricted to the fixed
+//! Mozilla/GitHub host allowlist. Explicit custom sources require HTTPS with no
+//! local/private address literal and may redirect only on the same origin. Each
+//! attempt then performs a bounded body download and parse/schema validation.
+//! Transport failures, disallowed origins, non-success HTTP status, oversized
+//! bodies, and malformed or schema-invalid bodies continue to the next source.
+//! A successful response may be written as a diagnostic snapshot, but mutable
+//! on-disk snapshots are never read back to authorize executable CDM content.
+//!
+//! Trust boundary: Silvervine authenticates CDM *bytes* with the SHA-512
+//! digest carried by a freshly fetched manifest over HTTPS. It does **not**
+//! independently verify a Mozilla publisher signature over the manifest JSON
+//! itself; HTTPS transport integrity plus the fixed origin list are the
+//! manifest authenticity controls implemented here.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -70,6 +80,13 @@ pub const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// HTTP request timeout per origin.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Hard ceiling for a single Mozilla `widevinecdm.json` response body.
+///
+/// The live fixture is a few KiB. This bound keeps declared `Content-Length`
+/// and undeclared/chunked streams from allocating unbounded memory before
+/// parse.
+const MAX_MANIFEST_BODY_BYTES: u64 = 256 * 1024;
 
 /// Minimal schema for a CDM bundle's installed `manifest.json`.
 ///
@@ -339,11 +356,12 @@ pub fn fetch_manifest() -> Result<Manifest> {
 ///
 /// # Behavior
 ///
-/// 1. Try each URL in order (download + parse/schema validation as one attempt).
+/// 1. Try each URL in order (scheme check + download + parse/schema
+///    validation as one attempt).
 /// 2. On the first fully valid response, optionally snapshot its exact bytes
 ///    and return the parsed manifest.
-/// 3. Transport, HTTP status, and parse/schema failures all continue to the
-///    next URL.
+/// 3. Disallowed schemes, transport, HTTP status, oversized body, and
+///    parse/schema failures all continue to the next URL.
 /// 4. If every URL fails, return [`ErrorCategory::ManifestFetchFailed`] with
 ///    the last per-origin failure as `source`.
 ///
@@ -357,14 +375,9 @@ pub fn fetch_manifest_with(
     cache_path: Option<&Path>,
     _cache_ttl: Duration,
 ) -> Result<Manifest> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .build()
-        .map_err(|e| Error::network("failed to construct HTTP client").with_source(e))?;
-
     let mut last_failure: Option<Error> = None;
     for url in urls {
-        match try_fetch_one(&client, url) {
+        match try_fetch_one(url) {
             Ok((manifest, bytes)) => {
                 // Best-effort cache write — failures here shouldn't fail
                 // the whole fetch (we have a perfectly good response in hand).
@@ -391,14 +404,40 @@ pub fn fetch_manifest_with(
     Err(err)
 }
 
+/// Whether `url` is allowed before manifest network dispatch.
+///
+/// Official sources are pinned to Silvervine's fixed Mozilla/GitHub origins.
+/// Explicit custom sources require HTTPS with no local/private address literal
+/// and may redirect only within that exact origin. Unit tests permit loopback.
+fn is_allowed_manifest_source(url: &Url) -> bool {
+    super::is_official_manifest_url(url) || super::is_allowed_custom_manifest_url(url)
+}
+
+/// Reject disallowed schemes/hosts before any HTTP client dispatch.
+fn ensure_manifest_source_url(url: &Url) -> Result<()> {
+    if is_allowed_manifest_source(url) {
+        return Ok(());
+    }
+    Err(Error::network(format!(
+        "refusing manifest source {url}: expected an official origin or an explicit HTTPS source without a local/private address literal"
+    )))
+}
+
 /// Fetch one URL, parse/schema-validate the body, and return both the
 /// manifest and the exact response bytes on success.
 ///
-/// Failures cover transport errors, non-success HTTP status, body read
-/// errors, and JSON/schema validation. Callers treat every failure the same
-/// for fallback purposes.
-fn try_fetch_one(client: &reqwest::blocking::Client, url: &Url) -> Result<(Manifest, Vec<u8>)> {
-    let response = client
+/// Failures cover disallowed schemes, transport errors, non-success HTTP
+/// status, oversized bodies, body read errors, and JSON/schema validation.
+/// Callers treat every failure the same for fallback purposes.
+fn try_fetch_one(url: &Url) -> Result<(Manifest, Vec<u8>)> {
+    ensure_manifest_source_url(url)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .redirect(super::manifest_redirect_policy(url))
+        .build()
+        .map_err(|e| Error::network("failed to construct HTTP client").with_source(e))?;
+
+    let mut response = client
         .get(url.clone())
         .send()
         .map_err(|e| Error::network(format!("GET {url} failed")).with_source(e))?;
@@ -408,10 +447,33 @@ fn try_fetch_one(client: &reqwest::blocking::Client, url: &Url) -> Result<(Manif
             response.status()
         )));
     }
-    let bytes = response
-        .bytes()
-        .map_err(|e| Error::network(format!("read body from {url}")).with_source(e))?
-        .to_vec();
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > MAX_MANIFEST_BODY_BYTES)
+    {
+        return Err(Error::network(format!(
+            "GET {url} declared a body larger than the {MAX_MANIFEST_BODY_BYTES}-byte manifest limit"
+        )));
+    }
+
+    let capacity = response
+        .content_length()
+        .and_then(|len| usize::try_from(len).ok())
+        .unwrap_or(0)
+        .min(usize::try_from(MAX_MANIFEST_BODY_BYTES).unwrap_or(usize::MAX));
+    let mut bytes = Vec::with_capacity(capacity);
+    // Single bounded read: no `Response::bytes().to_vec()` double buffer.
+    response
+        .by_ref()
+        .take(MAX_MANIFEST_BODY_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::network(format!("read body from {url}")).with_source(e))?;
+    if bytes.len() as u64 > MAX_MANIFEST_BODY_BYTES {
+        return Err(Error::network(format!(
+            "GET {url} exceeded the {MAX_MANIFEST_BODY_BYTES}-byte manifest limit"
+        )));
+    }
+
     let manifest = parse_manifest(&bytes).map_err(|e| {
         Error::state_corrupted(format!("manifest from {url} failed schema validation"))
             .with_source(e)
@@ -445,6 +507,10 @@ mod tests {
         std::fs::read(&path).unwrap_or_else(|e| {
             panic!("could not read manifest fixture at {}: {e}", path.display())
         })
+    }
+    fn manifest_body_limit_usize() -> usize {
+        usize::try_from(MAX_MANIFEST_BODY_BYTES)
+            .expect("MAX_MANIFEST_BODY_BYTES must fit usize for test fixtures")
     }
 
     #[test]
@@ -644,18 +710,90 @@ mod tests {
             .host_str()
             .expect("host")
             .contains("raw.githubusercontent.com"));
+        assert!(
+            urls.iter().all(is_allowed_manifest_source),
+            "fixed Mozilla origins must remain HTTPS-allowed"
+        );
     }
 
-    /// Spin up an in-process HTTP/1.1 stub server on `127.0.0.1:0`,
-    /// serving the fixture on a single GET. Returns the URL once the
-    /// listener is bound.
+    #[test]
+    #[ignore = "hits the fixed live Mozilla manifest origins"]
+    fn fetches_live_manifest_through_restricted_redirect_policy() {
+        let manifest =
+            fetch_manifest_with(&default_urls(), None, CACHE_TTL).expect("live manifest");
+        assert!(!manifest.widevine().expect("vendor").version.is_empty());
+    }
+
+    #[test]
+    fn allows_https_and_loopback_http_only() {
+        let https = Url::parse(
+            "https://hg.mozilla.org/mozilla-central/raw-file/tip/toolkit/content/gmp-sources/widevinecdm.json",
+        )
+        .expect("https url");
+        let loopback = Url::parse("http://127.0.0.1:9/widevinecdm.json").expect("loopback");
+        let localhost = Url::parse("http://localhost/widevinecdm.json").expect("localhost");
+        let ipv6_loopback = Url::parse("http://[::1]/widevinecdm.json").expect("ipv6 loopback");
+        let remote_http = Url::parse("http://example.com/widevinecdm.json").expect("remote http");
+        let file_url = Url::parse("file:///tmp/widevinecdm.json").expect("file url");
+
+        assert!(is_allowed_manifest_source(&https));
+        assert!(is_allowed_manifest_source(&loopback));
+        assert!(is_allowed_manifest_source(&localhost));
+        assert!(is_allowed_manifest_source(&ipv6_loopback));
+        assert!(!is_allowed_manifest_source(&remote_http));
+        assert!(!is_allowed_manifest_source(&file_url));
+
+        ensure_manifest_source_url(&https).expect("https allowed");
+        ensure_manifest_source_url(&loopback).expect("loopback http allowed");
+        let remote_err =
+            ensure_manifest_source_url(&remote_http).expect_err("non-loopback http rejected");
+        assert_eq!(remote_err.category, ErrorCategory::NetworkError);
+        let file_err = ensure_manifest_source_url(&file_url).expect_err("file rejected");
+        assert_eq!(file_err.category, ErrorCategory::NetworkError);
+    }
+
+    /// Non-HTTPS, non-loopback sources fail closed before any client dispatch
+    /// and still collapse to ManifestFetchFailed when the chain is exhausted.
+    #[test]
+    fn rejects_non_https_non_loopback_before_dispatch() {
+        let remote = Url::parse("http://203.0.113.10/widevinecdm.json").expect("remote");
+        let err = fetch_manifest_with(&[remote], None, CACHE_TTL)
+            .expect_err("remote HTTP must fail closed");
+        assert_eq!(err.category, ErrorCategory::ManifestFetchFailed);
+        let source = err
+            .source
+            .as_ref()
+            .and_then(|s| s.downcast_ref::<Error>())
+            .expect("origin refusal retained");
+        assert_eq!(source.category, ErrorCategory::NetworkError);
+        assert!(
+            source.message.contains("explicit HTTPS source"),
+            "expected scheme refusal, got {}",
+            source.message
+        );
+    }
+    fn spawn_fixture_server(body: Vec<u8>) -> Url {
+        spawn_http_server(body, ResponseMode::DeclaredLength)
+    }
+
+    #[derive(Clone, Copy)]
+    enum ResponseMode {
+        /// Honest `Content-Length` header matching the body.
+        DeclaredLength,
+        /// No `Content-Length`; body framed with `Transfer-Encoding: chunked`.
+        Chunked,
+        /// Lie with an oversized `Content-Length` while sending only a tiny body.
+        OversizedDeclaredLength { declared: usize },
+    }
+
+    /// Spin up an in-process HTTP/1.1 stub server on `127.0.0.1:0`.
     ///
     /// We hand-roll the HTTP because pulling in `tiny_http`/`hyper-test`
     /// crates for one test would bloat the dep graph. The protocol we
     /// implement is "read the request line + headers (don't care what
     /// they say), then write a fixed 200 OK response with the fixture
     /// body". `reqwest` is happy with that.
-    fn spawn_fixture_server(body: Vec<u8>) -> Url {
+    fn spawn_http_server(body: Vec<u8>, mode: ResponseMode) -> Url {
         use std::io::{BufRead, BufReader, Write};
         use std::net::TcpListener;
         use std::thread;
@@ -678,12 +816,41 @@ mod tests {
                         break;
                     }
                 }
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.write_all(&body);
+                match mode {
+                    ResponseMode::DeclaredLength => {
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.write_all(&body);
+                    }
+                    ResponseMode::Chunked => {
+                        let header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n";
+                        let _ = stream.write_all(header);
+                        // Stream the body in modest chunks so the client must
+                        // accumulate across multiple reads.
+                        let mut offset = 0;
+                        while offset < body.len() {
+                            let end = (offset + 4096).min(body.len());
+                            let chunk = &body[offset..end];
+                            let _ = write!(stream, "{:X}\r\n", chunk.len());
+                            let _ = stream.write_all(chunk);
+                            let _ = stream.write_all(b"\r\n");
+                            offset = end;
+                        }
+                        let _ = stream.write_all(b"0\r\n\r\n");
+                    }
+                    ResponseMode::OversizedDeclaredLength { declared } => {
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        // Body is irrelevant: the client must refuse before
+                        // buffering `declared` bytes into memory.
+                        let _ = stream.write_all(&body);
+                    }
+                }
                 let _ = stream.flush();
                 let _ = stream.shutdown(std::net::Shutdown::Both);
             }
@@ -789,5 +956,66 @@ mod tests {
         let err =
             fetch_manifest_with(&[url], None, CACHE_TTL).expect_err("404 with no cache must fail");
         assert_eq!(err.category, ErrorCategory::ManifestFetchFailed);
+    }
+
+    /// Declared Content-Length above the manifest cap fails that origin
+    /// without buffering the claimed size, and falls through to the next URL.
+    #[test]
+    fn rejects_oversized_declared_content_length_and_falls_through() {
+        let body_limit = manifest_body_limit_usize();
+        let oversized = spawn_http_server(
+            b"{}".to_vec(),
+            ResponseMode::OversizedDeclaredLength {
+                declared: body_limit + 1,
+            },
+        );
+        let good = spawn_fixture_server(fixture_bytes());
+        let tmp = TempDir::new().expect("tempdir");
+        let cache_path = tmp.path().join("cache.json");
+
+        let manifest = fetch_manifest_with(&[oversized, good], Some(&cache_path), CACHE_TTL)
+            .expect("valid secondary must win after oversized primary");
+        assert!(!manifest.widevine().expect("vendor").version.is_empty());
+        let cached = std::fs::read(&cache_path).expect("cache file written");
+        assert_eq!(cached, fixture_bytes());
+    }
+
+    /// Chunked / undeclared-length streams that cross the body cap fail closed
+    /// for that origin and still advance the fallback chain.
+    #[test]
+    fn rejects_oversized_chunked_body_and_falls_through() {
+        let body_limit = manifest_body_limit_usize();
+        let mut huge = Vec::with_capacity(body_limit + 64);
+        huge.extend(std::iter::repeat_n(b'x', body_limit + 64));
+        let oversized = spawn_http_server(huge, ResponseMode::Chunked);
+        let good = spawn_fixture_server(fixture_bytes());
+
+        let manifest = fetch_manifest_with(&[oversized, good], None, CACHE_TTL)
+            .expect("valid secondary must win after oversized chunked primary");
+        assert!(!manifest.widevine().expect("vendor").version.is_empty());
+    }
+
+    /// Exhausting the chain solely on body-size violations surfaces
+    /// ManifestFetchFailed (never a leaked StateCorrupted / bare network).
+    #[test]
+    fn exhausted_oversized_bodies_are_manifest_fetch_failed() {
+        let body_limit = manifest_body_limit_usize();
+        let mut huge = Vec::with_capacity(body_limit + 8);
+        huge.extend(std::iter::repeat_n(b'y', body_limit + 8));
+        let oversized = spawn_http_server(huge, ResponseMode::Chunked);
+        let err = fetch_manifest_with(&[oversized], None, CACHE_TTL)
+            .expect_err("oversized sole origin must fail the chain");
+        assert_eq!(err.category, ErrorCategory::ManifestFetchFailed);
+        let source = err
+            .source
+            .as_ref()
+            .and_then(|s| s.downcast_ref::<Error>())
+            .expect("last origin failure retained as Error source");
+        assert_eq!(source.category, ErrorCategory::NetworkError);
+        assert!(
+            source.message.contains("manifest limit"),
+            "expected size-limit refusal, got {}",
+            source.message
+        );
     }
 }

@@ -10,6 +10,9 @@
 //! * `filesize` — optional exact size in bytes, bounded before allocation.
 //! * `hash_value` — SHA-512 hex digest the downloaded bytes must match.
 //!
+//! The primary and mirrors must use the exact Google Widevine CDN HTTPS
+//! origins pinned by Silvervine; redirects are disabled.
+//!
 //! Security-sensitive callers receive a [`VerifiedCrx`] containing the exact
 //! authenticated bytes plus a best-effort on-disk cache path. The default
 //! cache path is `~/.cache/silvervine/downloads/<sha-prefix>.crx3`.
@@ -74,6 +77,11 @@ impl VerifiedCrx {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Consume this proof-bearing buffer without reopening its cache path.
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
     }
 
     fn into_path(self) -> PathBuf {
@@ -176,14 +184,22 @@ pub fn download_verified(entry: &PlatformEntry, dir: &Path) -> Result<VerifiedCr
 
     let client = reqwest::blocking::Client::builder()
         .timeout(HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| Error::network("failed to construct HTTP client").with_source(error))?;
 
     let mut last_network_error = None;
-    for url in &urls {
+    for raw_url in &urls {
+        let url = match validate_download_source_url(raw_url) {
+            Ok(url) => url,
+            Err(error) => {
+                last_network_error = Some(error);
+                continue;
+            }
+        };
         match download_one(
             &client,
-            url,
+            &url,
             dir,
             &path,
             &expected_hash,
@@ -206,6 +222,18 @@ pub fn download_verified(entry: &PlatformEntry, dir: &Path) -> Result<VerifiedCr
         error.source = Some(Box::new(source));
     }
     Err(error)
+}
+
+fn validate_download_source_url(raw: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(raw).map_err(|error| {
+        Error::network(format!("invalid CRX download URL {raw}")).with_source(error)
+    })?;
+    if super::is_allowed_cdm_url(&url) {
+        return Ok(url);
+    }
+    Err(Error::network(format!(
+        "refusing CRX download URL {url}: origin is not in the pinned Widevine CDN allowlist"
+    )))
 }
 
 /// Verify an on-disk file matches the expected SHA-512 (and optional size).
@@ -369,7 +397,7 @@ pub fn sha512_hex(bytes: &[u8]) -> String {
 /// file, atomically publish a cache copy, and return the authenticated bytes.
 fn download_one(
     client: &reqwest::blocking::Client,
-    url: &str,
+    url: &reqwest::Url,
     dir: &Path,
     destination: &Path,
     expected_hash: &str,
@@ -377,7 +405,7 @@ fn download_one(
     max_size: u64,
 ) -> Result<VerifiedCrx> {
     let mut response = client
-        .get(url)
+        .get(url.clone())
         .send()
         .map_err(|error| Error::network(format!("GET {url} failed")).with_source(error))?;
     if !response.status().is_success() {
@@ -511,6 +539,30 @@ mod tests {
             }
         });
         (format!("http://{local}/widevine.crx3"), attempts)
+    }
+
+    fn spawn_redirect(location: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let local = listener.local_addr().expect("local_addr");
+        let location = location.to_owned();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0
+                    || line == "\r\n"
+                    || line.is_empty()
+                {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).expect("redirect");
+        });
+        format!("http://{local}/redirect")
     }
 
     #[test]
@@ -683,6 +735,45 @@ mod tests {
         let dir = tmp.path().join("downloads");
         let path = download_to(&entry, &dir).expect("mirror must succeed");
         assert_eq!(std::fs::read(&path).expect("read"), body);
+    }
+
+    #[test]
+    fn download_does_not_follow_manifest_controlled_redirects() {
+        let body = vec![17u8; 64];
+        let (target, target_attempts) = spawn_stub(body.clone());
+        let entry = PlatformEntry::Concrete {
+            file_url: spawn_redirect(&target),
+            mirror_urls: vec![],
+            filesize: Some(body.len() as u64),
+            hash_value: sha512_hex(&body),
+        };
+        let tmp = TempDir::new().expect("tempdir");
+
+        let error = download_verified(&entry, tmp.path()).expect_err("redirect must be rejected");
+
+        assert_eq!(error.category, crate::ErrorCategory::NetworkError);
+        assert_eq!(
+            target_attempts.load(Ordering::SeqCst),
+            0,
+            "redirect target must never receive a request"
+        );
+    }
+
+    #[test]
+    fn download_source_policy_requires_pinned_https_cdn_origin() {
+        for raw in [
+            "http://www.google.com/widevine.crx3",
+            "https://internal.service.corp/widevine.crx3",
+            "https://localhost./widevine.crx3",
+            "https://www.google.com.evil.example/widevine.crx3",
+        ] {
+            let error = validate_download_source_url(raw).expect_err("origin must be rejected");
+            assert_eq!(error.category, crate::ErrorCategory::NetworkError, "{raw}");
+        }
+        validate_download_source_url("https://www.google.com/dl/release2/widevine.crx3")
+            .expect("pinned Google origin");
+        validate_download_source_url("https://edgedl.me.gvt1.com/edgedl/release2/widevine.crx3")
+            .expect("pinned Google mirror origin");
     }
 
     #[test]

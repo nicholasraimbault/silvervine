@@ -38,7 +38,7 @@ In scope:
 - Code execution outside the user's session via a Silvervine-controlled file (configs, hooks, cache).
 - Privilege escalation paths that don't require a sudo prompt the user can refuse.
 - Bundle-write paths that can write outside the targeted browser bundle.
-- Network paths that fetch unsigned content and act on it (Widevine CDM is hash-verified against the manifest; the manifest is fetched over HTTPS but is itself signed by Mozilla).
+- Network paths that fetch unauthenticated content and act on it (Widevine CDM bytes must match a freshly fetched HTTPS manifest's SHA-512 and a CRX3 signature from Silvervine's pinned Widevine component key).
 - Race conditions in the atomic-patch protocol that can leave a browser bundle destroyed.
 - Lockfile / IPC race conditions that can be triggered by an unprivileged local user to interfere with the daemon.
 - Any default-on telemetry. Silvervine ships **no** telemetry or error-reporting endpoint; this should never change without an explicit major-version migration.
@@ -61,10 +61,21 @@ Both prompt the user. Both require user consent each time (Silvervine does not c
 
 User-installed browsers in `~/Applications` (macOS) or `~/.local/...` (Linux) don't require escalation. Custom-path browsers configured in `~/.config/silvervine/config.toml` follow the path's actual permissions.
 
-Executable CDM trust requires a fresh manifest from one of Silvervine's fixed
-Mozilla HTTPS origins (or an explicit user-supplied source) and the manifest's
-SHA-512. Mutable manifest snapshots are write-only. Cached archives are bounded,
-opened without following symlinks, and extracted from the exact verified bytes;
+Executable CDM trust requires a fresh manifest from Silvervine's fixed
+Mozilla/GitHub HTTPS origins (or an explicit user-selected HTTPS source with no
+local/private address literal, whose redirects remain on that exact origin),
+the manifest-carried SHA-512 of the exact CDM archive, and a valid CRX3
+signature from the pinned Widevine component key. The signature binds both the
+component ID and ZIP body.
+Manifest-carried CDM URLs are restricted to the exact Google Widevine CDN
+origins observed in Mozilla's manifest and do not follow redirects. HTTPS
+transport integrity and the fixed manifest-origin list are the
+manifest-authenticity controls; Silvervine does not claim that Mozilla signs
+the manifest JSON itself. Mutable manifest
+snapshots are write-only. Archives are size-bounded, preflighted for entry
+count before ZIP parser allocation, opened without following symlinks, and
+extracted from the exact signature-verified bytes. Duplicate normalized
+outputs, special entries, and expansion-limit violations are rejected;
 colocated cache metadata alone never authorizes a privileged patch.
 
 Silvervine ships **no telemetry or remote error-reporting endpoint**. The
@@ -76,8 +87,12 @@ go through GitHub Issues only when the user chooses to share them.
 
 ## Known limitations
 
-- **macOS `--deep` codesigning is deprecated.** Apple deprecated it as of macOS 13; it still works ad-hoc but Apple may remove it in a future macOS. V2.1 migrates to inside-out signing. Documented in [ROADMAP.md](ROADMAP.md).
-- **No SBOM yet.** V2 ships a list of dependencies via `cargo metadata`; CycloneDX SBOM generation is queued for V2.1.
+- **macOS patches use ad-hoc signing.** Silvervine signs the CDM library,
+  containing framework, and application bundle inside-out. This restores a
+  coherent local signature after modification; it is not Developer ID
+  notarization by the browser vendor.
+- **No SBOM yet.** V2 ships a list of dependencies via `cargo metadata`;
+  CycloneDX SBOM generation is queued for V2.2.
 - **No reproducible builds.** cargo-dist artifacts are deterministic-ish but not bit-reproducible. Working on it.
 
 ## Bug bounty

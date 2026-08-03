@@ -2024,7 +2024,7 @@ dependencies = [
 
 [[package]]
 name = "silvervine"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "block2",
  "clap",
@@ -2045,6 +2045,7 @@ dependencies = [
  "parking_lot",
  "png",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
