@@ -532,6 +532,7 @@ jobs:
           printf '%s\n' "$ANNOUNCEMENT_BODY" > "$notes_file"
           args=(
             release create "$RELEASE_TAG"
+            --repo "$GITHUB_REPOSITORY"
             --verify-tag
             --target "$RELEASE_COMMIT"
             --title "$ANNOUNCEMENT_TITLE"
