@@ -10,6 +10,10 @@ Future entries are generated from
 
 ## [Unreleased]
 
+### Fixed
+
+- Passed the repository explicitly to the no-checkout GitHub release publisher.
+
 ## [2.1.1] - 2026-08-02
 
 ### Changed
