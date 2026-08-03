@@ -1,7 +1,7 @@
 //! macOS host media/GPU passive diagnostics.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use crate::diagnostics::{DiagnosticCheck, DiagnosticStatus, EvidenceSource, FailureDomain};
@@ -17,13 +17,21 @@ pub fn collect_host_checks() -> Vec<DiagnosticCheck> {
     checks
 }
 
-/// Codesign verification for one browser bundle path.
+/// Codesign verification for the browser bundle and Silvervine-managed code.
 #[must_use]
-pub fn codesign_check(bundle: &Path) -> DiagnosticCheck {
-    let Some(codesign) = find_executable("codesign").or_else(|| {
-        let path = PathBuf::from("/usr/bin/codesign");
-        path.is_file().then_some(path)
-    }) else {
+pub fn codesign_check(
+    bundle: &Path,
+    cdm_target: Option<&Path>,
+    cdm_library: Option<&Path>,
+    managed: bool,
+) -> DiagnosticCheck {
+    let paths = codesign_paths(bundle, cdm_target, cdm_library);
+    if let Some(check) = missing_managed_codesign_paths(paths, managed) {
+        return check;
+    }
+    let Some(codesign) =
+        find_executable("/usr/bin/codesign").or_else(|| find_executable("codesign"))
+    else {
         return DiagnosticCheck {
             id: "browser.codesign".into(),
             status: DiagnosticStatus::Unavailable,
@@ -31,87 +39,223 @@ pub fn codesign_check(bundle: &Path) -> DiagnosticCheck {
             failure_domain: FailureDomain::BrowserMediaStack,
             summary: "codesign is unavailable on this host.".into(),
             action: None,
-            details: BTreeMap::from([("path".into(), bundle.display().to_string())]),
+            details: BTreeMap::from([("bundle_path".into(), bundle.display().to_string())]),
         };
     };
+    run_codesign_check(&codesign, paths, managed)
+}
 
-    match run_output_with_timeout(
-        &codesign,
-        &["--verify", "--deep", "--strict", &bundle.to_string_lossy()],
-        UTILITY_TIMEOUT,
-    ) {
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let mut details = BTreeMap::from([
-                ("path".into(), bundle.display().to_string()),
-                ("exit_status".into(), output.status.to_string()),
-                ("timed_out".into(), output.timed_out.to_string()),
-            ]);
-            if !stderr.trim().is_empty() {
-                details.insert(
-                    "evidence".into(),
-                    stderr
-                        .chars()
-                        .filter(|c| !c.is_control())
-                        .take(500)
-                        .collect(),
-                );
-            }
-            if output.timed_out {
-                DiagnosticCheck {
-                    id: "browser.codesign".into(),
-                    status: DiagnosticStatus::Warn,
-                    source: EvidenceSource::HostProbe,
-                    failure_domain: FailureDomain::BrowserMediaStack,
-                    summary: "codesign verification timed out.".into(),
-                    action: None,
-                    details,
-                }
-            } else if output.status.success() {
-                DiagnosticCheck {
-                    id: "browser.codesign".into(),
-                    status: DiagnosticStatus::Pass,
-                    source: EvidenceSource::HostProbe,
-                    failure_domain: FailureDomain::BrowserMediaStack,
-                    summary: "Bundle codesign verification passed.".into(),
-                    action: None,
-                    details,
-                }
+#[derive(Clone, Copy)]
+struct CodesignPaths<'a> {
+    bundle: &'a Path,
+    framework: Option<&'a Path>,
+    cdm_library: Option<&'a Path>,
+}
+
+impl<'a> CodesignPaths<'a> {
+    fn scopes(self, managed: bool) -> [Option<(&'static str, &'a Path)>; 3] {
+        [
+            Some(("bundle", self.bundle)),
+            managed
+                .then_some(self.framework)
+                .flatten()
+                .map(|path| ("framework", path)),
+            managed
+                .then_some(self.cdm_library)
+                .flatten()
+                .map(|path| ("cdm_library", path)),
+        ]
+    }
+}
+
+fn codesign_paths<'a>(
+    bundle: &'a Path,
+    cdm_target: Option<&'a Path>,
+    cdm_library: Option<&'a Path>,
+) -> CodesignPaths<'a> {
+    let framework = cdm_target.and_then(|target| {
+        target
+            .ancestors()
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("framework"))
+    });
+    CodesignPaths {
+        bundle,
+        framework,
+        cdm_library,
+    }
+}
+
+fn missing_managed_codesign_paths(
+    paths: CodesignPaths<'_>,
+    managed: bool,
+) -> Option<DiagnosticCheck> {
+    if !managed {
+        return None;
+    }
+    let missing = match (paths.framework.is_none(), paths.cdm_library.is_none()) {
+        (false, false) => return None,
+        (true, false) => "framework",
+        (false, true) => "cdm_library",
+        (true, true) => "framework,cdm_library",
+    };
+    Some(DiagnosticCheck {
+        id: "browser.codesign".into(),
+        status: DiagnosticStatus::Fail,
+        source: EvidenceSource::HostProbe,
+        failure_domain: FailureDomain::Silvervine,
+        summary: "Silvervine-managed code paths could not be resolved for codesign verification."
+            .into(),
+        action: Some("Run `silvervine repair` to restore the managed macOS CDM layout.".into()),
+        details: BTreeMap::from([
+            ("bundle_path".into(), paths.bundle.display().to_string()),
+            ("missing_managed_scopes".into(), missing.into()),
+        ]),
+    })
+}
+
+fn classify_codesign_result(
+    bundle: [bool; 3],
+    silvervine: [bool; 3],
+    managed: bool,
+) -> (
+    DiagnosticStatus,
+    FailureDomain,
+    &'static str,
+    Option<String>,
+) {
+    let [bundle_invalid, bundle_incomplete, bundle_timed_out] = bundle;
+    let [managed_invalid, managed_incomplete, managed_timed_out] = silvervine;
+    if managed_invalid {
+        (
+            DiagnosticStatus::Fail,
+            FailureDomain::Silvervine,
+            "Codesign verification failed for Silvervine-managed code.",
+            Some(
+                "Re-run `silvervine patch` so managed macOS code is re-signed after CDM install."
+                    .into(),
+            ),
+        )
+    } else if managed_incomplete {
+        (
+            DiagnosticStatus::Unavailable,
+            FailureDomain::Silvervine,
+            if managed_timed_out {
+                "Silvervine-managed codesign verification timed out."
             } else {
-                DiagnosticCheck {
-                    id: "browser.codesign".into(),
-                    status: DiagnosticStatus::Warn,
-                    source: EvidenceSource::HostProbe,
-                    failure_domain: FailureDomain::BrowserMediaStack,
-                    summary: "Bundle codesign verification failed.".into(),
-                    action: Some(
-                        "Re-run `silvervine patch` so the macOS bundle is re-signed after CDM install."
-                            .into(),
-                    ),
-                    details,
+                "Silvervine-managed codesign verification could not complete."
+            },
+            None,
+        )
+    } else if bundle_invalid {
+        (
+            DiagnosticStatus::Warn,
+            FailureDomain::BrowserMediaStack,
+            "Browser bundle codesign verification failed.",
+            Some("Repair or reinstall the browser to restore its code signature.".into()),
+        )
+    } else if bundle_incomplete {
+        (
+            DiagnosticStatus::Unavailable,
+            FailureDomain::BrowserMediaStack,
+            if bundle_timed_out {
+                "Browser bundle codesign verification timed out."
+            } else {
+                "Browser bundle codesign verification could not complete."
+            },
+            None,
+        )
+    } else if managed {
+        (
+            DiagnosticStatus::Pass,
+            FailureDomain::Silvervine,
+            "Codesign verification passed for the browser bundle and Silvervine-managed code.",
+            None,
+        )
+    } else {
+        (
+            DiagnosticStatus::Pass,
+            FailureDomain::BrowserMediaStack,
+            "Browser bundle codesign verification passed.",
+            None,
+        )
+    }
+}
+
+fn run_codesign_check(codesign: &Path, paths: CodesignPaths<'_>, managed: bool) -> DiagnosticCheck {
+    let mut details = BTreeMap::new();
+    let mut bundle_invalid = false;
+    let mut bundle_incomplete = false;
+    let mut bundle_timed_out = false;
+    let mut managed_invalid = false;
+    let mut managed_incomplete = false;
+    let mut managed_timed_out = false;
+    for (scope, path) in paths.scopes(managed).into_iter().flatten() {
+        details.insert(format!("{scope}_path"), path.display().to_string());
+        match run_output_with_timeout(
+            codesign,
+            &["--verify", "--strict", &path.to_string_lossy()],
+            UTILITY_TIMEOUT,
+        ) {
+            Ok(output) => {
+                if output.timed_out {
+                    if scope == "bundle" {
+                        bundle_incomplete = true;
+                        bundle_timed_out = true;
+                    } else {
+                        managed_incomplete = true;
+                        managed_timed_out = true;
+                    }
+                } else if !output.status.success() {
+                    if scope == "bundle" {
+                        bundle_invalid = true;
+                    } else {
+                        managed_invalid = true;
+                    }
                 }
+                details.insert(format!("{scope}_exit_status"), output.status.to_string());
+                details.insert(format!("{scope}_timed_out"), output.timed_out.to_string());
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if !stderr.trim().is_empty() {
+                    details.insert(
+                        format!("{scope}_evidence"),
+                        stderr
+                            .chars()
+                            .filter(|c| !c.is_control())
+                            .take(500)
+                            .collect(),
+                    );
+                }
+            }
+            Err(error) => {
+                if scope == "bundle" {
+                    bundle_incomplete = true;
+                } else {
+                    managed_incomplete = true;
+                }
+                details.insert(format!("{scope}_error"), error.message);
             }
         }
-        Err(error) => DiagnosticCheck {
-            id: "browser.codesign".into(),
-            status: DiagnosticStatus::Warn,
-            source: EvidenceSource::HostProbe,
-            failure_domain: FailureDomain::BrowserMediaStack,
-            summary: "codesign could not run.".into(),
-            action: None,
-            details: BTreeMap::from([
-                ("path".into(), bundle.display().to_string()),
-                ("error".into(), error.message),
-            ]),
-        },
+    }
+
+    let (status, failure_domain, summary, action) = classify_codesign_result(
+        [bundle_invalid, bundle_incomplete, bundle_timed_out],
+        [managed_invalid, managed_incomplete, managed_timed_out],
+        managed,
+    );
+    DiagnosticCheck {
+        id: "browser.codesign".into(),
+        status,
+        source: EvidenceSource::HostProbe,
+        failure_domain,
+        summary: summary.into(),
+        action,
+        details,
     }
 }
 
 fn system_profiler_check() -> DiagnosticCheck {
-    let profiler = find_executable("system_profiler").or_else(|| {
-        let path = PathBuf::from("/usr/sbin/system_profiler");
-        path.is_file().then_some(path)
-    });
+    let profiler =
+        find_executable("/usr/sbin/system_profiler").or_else(|| find_executable("system_profiler"));
     let Some(profiler) = profiler else {
         return DiagnosticCheck {
             id: "host.macos_displays".into(),
@@ -223,12 +367,18 @@ const fn videotoolbox_status(supported: bool) -> DiagnosticStatus {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn query_videotoolbox_support(fourcc: &str) -> bool {
     let code = fourcc_code(fourcc);
     // Safety: public VideoToolbox C API, no pointers exchanged.
     let supported = unsafe { VTIsHardwareDecodeSupported(code) };
     // Apple documents the function as Boolean; treat non-zero as true.
     supported != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn query_videotoolbox_support(_fourcc: &str) -> bool {
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -357,24 +507,22 @@ pub fn fourcc_label(fourcc: &str) -> &'static str {
     }
 }
 
-/// Classify codesign process output for tests.
-#[must_use]
-pub fn classify_codesign_status(success: bool, timed_out: bool) -> DiagnosticStatus {
-    if timed_out {
-        DiagnosticStatus::Warn
-    } else if success {
-        DiagnosticStatus::Pass
-    } else {
-        DiagnosticStatus::Warn
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        classify_codesign_status, fourcc_label, parse_system_profiler_summary, videotoolbox_status,
-    };
-    use crate::diagnostics::DiagnosticStatus;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+
+    use super::{fourcc_label, parse_system_profiler_summary, videotoolbox_status};
+    use crate::diagnostics::{DiagnosticStatus, FailureDomain};
+
+    fn write_fake_codesign(tmp: &tempfile::TempDir, body: &str) -> PathBuf {
+        let tool = tmp.path().join("codesign");
+        fs::write(&tool, body).expect("write fake codesign");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755))
+            .expect("make fake codesign executable");
+        tool
+    }
 
     #[test]
     fn system_profiler_json_parser_reads_chipset_and_metal() {
@@ -409,15 +557,137 @@ mod tests {
     }
 
     #[test]
-    fn codesign_classification_is_conservative() {
+    fn codesign_verification_avoids_recursive_bundle_scan() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let args_path = tmp.path().join("codesign-args");
+        let tool = write_fake_codesign(
+            &tmp,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                args_path.display()
+            ),
+        );
+        let bundle = Path::new("/Applications/Helium.app");
+        let paths = super::codesign_paths(bundle, None, None);
+
+        let check = super::run_codesign_check(&tool, paths, false);
+
+        assert_eq!(check.status, DiagnosticStatus::Pass);
+        let args = fs::read_to_string(args_path).expect("captured codesign args");
+        assert!(args.lines().any(|arg| arg == "--verify"));
+        assert!(args.lines().any(|arg| arg == "--strict"));
+        assert!(
+            args.lines().all(|arg| arg != "--deep"),
+            "recursive verification scans unrelated nested browser code"
+        );
+    }
+    #[test]
+    fn codesign_paths_follow_managed_ownership_scope() {
+        let bundle = Path::new("/Applications/Helium.app");
+        let framework = bundle
+            .join("Contents/Frameworks")
+            .join("Helium Framework.framework");
+        let cdm_target = framework
+            .join("Versions/151.0.7922.71/Libraries")
+            .join("WidevineCdm");
+        let library = cdm_target
+            .join("_platform_specific/mac_arm64")
+            .join("libwidevinecdm.dylib");
+
+        let managed =
+            super::codesign_paths(bundle, Some(cdm_target.as_path()), Some(library.as_path()));
         assert_eq!(
-            classify_codesign_status(true, false),
-            DiagnosticStatus::Pass
+            managed.scopes(true),
+            [
+                Some(("bundle", bundle)),
+                Some(("framework", framework.as_path())),
+                Some(("cdm_library", library.as_path())),
+            ]
+        );
+
+        let nested_target = framework
+            .join("Versions/Current/Libraries/Components")
+            .join("WidevineCdm");
+        let nested = super::codesign_paths(
+            bundle,
+            Some(nested_target.as_path()),
+            Some(library.as_path()),
         );
         assert_eq!(
-            classify_codesign_status(false, false),
-            DiagnosticStatus::Warn
+            nested.framework,
+            Some(framework.as_path()),
+            "framework lookup must not depend on a fixed CDM layout depth"
         );
-        assert_eq!(classify_codesign_status(true, true), DiagnosticStatus::Warn);
+
+        assert_eq!(
+            managed.scopes(false),
+            [Some(("bundle", bundle)), None, None]
+        );
+    }
+
+    #[test]
+    fn managed_signature_failure_is_silvervine_owned_and_blocking() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let tool = write_fake_codesign(&tmp, "#!/bin/sh\nexit 1\n");
+        let bundle = Path::new("/Applications/Helium.app");
+        let target = Path::new(
+            "/Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/1/Libraries/WidevineCdm",
+        );
+        let library = target.join("_platform_specific/mac_arm64/libwidevinecdm.dylib");
+        let paths = super::codesign_paths(bundle, Some(target), Some(&library));
+
+        let check = super::run_codesign_check(&tool, paths, true);
+
+        assert_eq!(check.status, DiagnosticStatus::Fail);
+        assert_eq!(check.failure_domain, FailureDomain::Silvervine);
+    }
+
+    #[test]
+    fn managed_verification_incomplete_takes_precedence_over_bundle_failure() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let tool = write_fake_codesign(&tmp, "#!/bin/sh\nrm \"$0\"\nexit 1\n");
+        let bundle = Path::new("/Applications/Helium.app");
+        let target = Path::new(
+            "/Applications/Helium.app/Contents/Frameworks/Helium Framework.framework/Versions/1/Libraries/WidevineCdm",
+        );
+        let library = target.join("_platform_specific/mac_arm64/libwidevinecdm.dylib");
+        let paths = super::codesign_paths(bundle, Some(target), Some(&library));
+
+        let check = super::run_codesign_check(&tool, paths, true);
+
+        assert_eq!(check.status, DiagnosticStatus::Unavailable);
+        assert_eq!(check.failure_domain, FailureDomain::Silvervine);
+        assert_eq!(
+            check.summary,
+            "Silvervine-managed codesign verification could not complete."
+        );
+    }
+
+    #[test]
+    fn managed_missing_paths_never_report_codesign_pass() {
+        let check = super::codesign_check(Path::new("/Applications/Helium.app"), None, None, true);
+
+        assert_eq!(check.status, DiagnosticStatus::Fail);
+        assert_eq!(check.failure_domain, FailureDomain::Silvervine);
+        assert_eq!(
+            check.details.get("missing_managed_scopes"),
+            Some(&"framework,cdm_library".to_owned())
+        );
+    }
+
+    #[test]
+    fn external_bundle_signature_failure_has_browser_owned_remediation() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let tool = write_fake_codesign(&tmp, "#!/bin/sh\nexit 1\n");
+        let bundle = Path::new("/Applications/Chrome.app");
+        let paths = super::codesign_paths(bundle, None, None);
+
+        let check = super::run_codesign_check(&tool, paths, false);
+
+        assert_eq!(check.status, DiagnosticStatus::Warn);
+        assert_eq!(
+            check.action.as_deref(),
+            Some("Repair or reinstall the browser to restore its code signature.")
+        );
     }
 }

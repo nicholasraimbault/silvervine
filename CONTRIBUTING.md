@@ -55,6 +55,35 @@ cargo clippy --all-targets --jobs 2 -- -D warnings    # linter
 
 `-D warnings` means **any** clippy lint fails CI. If you're adding code that legitimately can't satisfy a lint, document the `#[allow(clippy::lint_name)]` with a comment explaining why.
 
+### Performance validation
+
+Performance-sensitive changes must be measured from
+`cargo build --release --locked`; debug builds and `cargo run` are not useful
+comparisons. Use the budgets and current reference results in
+[ROADMAP.md](ROADMAP.md#performance-budgets).
+
+Warm each command once, then collect nine runs and report median wall time,
+maximum wall time, and peak resident memory. Redirect command output so
+terminal rendering is not part of the measurement:
+
+```sh
+# Linux
+/usr/bin/time -v target/release/silvervine --json doctor --media-stack >/dev/null
+
+# macOS
+/usr/bin/time -lp target/release/silvervine --json doctor --media-stack >/dev/null
+```
+
+Measure `--version`, `--help`, `--json list-browsers --all`, `--json status`,
+`--json doctor`, and `--json doctor --media-stack`. Record the browser set and
+host hardware with the results. For daemon changes, allow startup to settle,
+then sample process CPU and RSS over 60 idle seconds; CPU is reported as a
+percentage of one logical core. Compare before and after on the same host.
+
+Release footprint checks use the uncompressed executable and compressed
+cargo-dist archive for all three shipping targets. A performance PR must
+explain any budget regression rather than averaging it away across platforms.
+
 ## Testing patterns
 
 Silvervine tests heavily on Linux + macOS in CI (matrix: `ubuntu-latest`, `macos-latest`). Tests must:
@@ -67,7 +96,7 @@ Silvervine tests heavily on Linux + macOS in CI (matrix: `ubuntu-latest`, `macos
 |---|---|
 | `SILVERVINE_TEST_DATA_MIGRATION_NOOP=1` | startup Neon V2 data-directory migration |
 | `SILVERVINE_TEST_ESCALATE_NOOP=1` | `platform::escalate_for_patch` and `platform::run_as_root` |
-| `SILVERVINE_TEST_PATCH_NOOP=1` | `xattr -cr` and `codesign --force --deep -s -` (macOS) |
+| `SILVERVINE_TEST_PATCH_NOOP=1` | macOS `xattr` and inside-out ad-hoc codesigning |
 | `SILVERVINE_TEST_LIFECYCLE_NOOP=1` | `daemon::lifecycle::register/unregister` (LaunchAgent / systemd-user) |
 | `SILVERVINE_TEST_POWER_NOOP=1` | `daemon::power::subscribe_wake_events` (NSWorkspace / logind D-Bus) |
 | `SILVERVINE_TEST_NOTIFY_NOOP=1` | `notify::notify_*` (libnotify / NSUserNotificationCenter) |

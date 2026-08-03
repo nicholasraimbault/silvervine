@@ -10,9 +10,22 @@ Future entries are generated from
 
 ## [Unreleased]
 
+### Changed
+
+- Stopped the daemon watcher from rescanning the process table every 500 ms
+  while idle; it now blocks until a filesystem event or a scheduled
+  debounce/deferred-poll deadline.
+- Replaced recursive macOS diagnostic codesign scans with strict checks of the
+  browser bundle plus the framework and CDM library only when Silvervine owns
+  them.
+
 ### Fixed
 
 - Passed the repository explicitly to the no-checkout GitHub release publisher.
+- Prevented fresh browser-update events from retaining a stale deferred callback
+  that could patch the same browser twice.
+- Corrected macOS codesign diagnostics for missing or invalid Silvervine-managed
+  paths and inconclusive host probes.
 
 ## [2.1.1] - 2026-08-02
 

@@ -4,7 +4,7 @@ pub mod binary;
 pub mod collect;
 #[cfg(target_os = "linux")]
 pub mod linux;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 pub mod macos;
 pub mod media;
 pub mod store;

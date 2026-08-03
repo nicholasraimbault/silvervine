@@ -160,7 +160,12 @@ fn collect_browser_at(
     }
     #[cfg(target_os = "macos")]
     {
-        checks.push(macos::codesign_check(browser.install_path()));
+        checks.push(macos::codesign_check(
+            browser.install_path(),
+            cdm.target.as_deref(),
+            cdm.library.as_deref(),
+            cdm.ownership.kind == OwnershipKind::Managed,
+        ));
     }
 
     let fingerprint = if external.profile_scope_complete {
