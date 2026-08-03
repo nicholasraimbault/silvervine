@@ -1,7 +1,7 @@
 # macOS Tray Event Loop Design
 
 Date: 2026-08-01
-Status: Design approved; written-spec review pending
+Status: Approved for implementation
 Target release: 2.1.3
 
 ## Problem
