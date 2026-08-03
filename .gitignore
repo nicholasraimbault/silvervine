@@ -31,3 +31,6 @@ dist/
 
 # Local dev caches
 .cache/
+
+# Agent worktrees
+/.worktrees/
