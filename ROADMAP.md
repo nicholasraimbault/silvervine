@@ -7,8 +7,9 @@ What's shipped, what's queued, what's a stretch goal, and who has to do it.
 Silvervine is maintained by [@nicholasraimbault](https://github.com/nicholasraimbault). I develop on Arch, so **Arch (and Arch-like distros) get first-class testing.** Everything else is best-effort and contributor-driven:
 
 - **macOS** — CI covers builds, lint, and tests on native runners. Silvervine
-  2.1 setup, browser discovery, patch preservation, LaunchAgent registration,
-  and media diagnostics were also exercised on Apple Silicon macOS 26.6.
+  2.1 setup, browser discovery, profile-scoped CDM installation, EME playback
+  capability, LaunchAgent registration, and diagnostics were also exercised on
+  Apple Silicon macOS 26.6.
 - **Debian / Ubuntu / Fedora / RHEL** — V2's musl binary *runs*, but `.deb` / `.rpm` packaging and distro-specific migration paths need volunteers from those distros to verify.
 - **Windows** — speculative, contributor-driven entirely. The protocol is sketched below; the code isn't.
 - **ARM64 Linux** — not in V2's target list; needs Apple Silicon Asahi research or a maintainer with hardware.
@@ -20,7 +21,7 @@ Items below tagged `[contributor]` or `[needs <platform> verifier]` aren't block
 V2 is the first Rust-rewrite release. The prior bash + Swift + Go implementation shipped as `v1.0.0` and is V1.x in retrospect. V2 ships:
 
 - **Single-binary cross-platform CLI + tray daemon.** One Rust executable; the same code path supports macOS (x86_64 + aarch64) and Linux (x86_64-musl).
-- **Atomic patch rollback.** `renameat2(RENAME_EXCHANGE)` on Linux (via `syscall(SYS_renameat2, …)` for musl compatibility) and `renameatx_np(RENAME_SWAP)` on macOS. Privileged patches use exclusive, randomized snapshots under a validated same-filesystem parent and restore after write or verification failures.
+- **Atomic CDM publication.** Linux and macOS stage and verify a complete CDM tree before publishing it with `renameat2(RENAME_EXCHANGE)` or `renameatx_np(RENAME_SWAP)`. Linux privileged patches use exclusive, randomized snapshots under a validated same-filesystem parent and restore after write or verification failures.
 - **Browser-running detection.** Defers patches when the browser is running; retries when it quits (mtime-stable + 1h hard cap).
 - **Tray icon + native notifications.** `ksni` on Linux (StatusNotifierItem directly over D-Bus — zero GTK / libappindicator runtime dep); `tray-icon` on macOS; `notify-rust` for notifications.
 - **Mozilla manifest URL fallback chain.** `hg.mozilla.org` → GitHub mirror; both are fixed HTTPS origins. A successful response may be retained as a diagnostic snapshot, but mutable on-disk snapshots never authorize executable CDM content.
@@ -34,9 +35,9 @@ V2 is the first Rust-rewrite release. The prior bash + Swift + Go implementation
 - **Migration from V1.** Detects bash installs and packaged installs (AUR / .deb / .rpm) with a pkg-manager-aware uninstall hint sniffed from `/etc/os-release`. Probes `/etc/systemd/system/`, `/usr/lib/systemd/system/`, `/lib/systemd/system/`; dedupes merged-usr symlinks. See [MIGRATION.md](MIGRATION.md).
 - **Sleep/wake hooks.** `NSWorkspaceDidWakeNotification` on macOS; `org.freedesktop.login1.PrepareForSleep` on Linux.
 - **Distribution.** `cargo-dist`-driven `curl … | sh` installer + tarballs at GitHub Releases. The old Neon V1 AUR/deb sources and `homebrew-neon` tap are retired; migration remains supported. No Silvervine Homebrew tap is planned.
-- **Inside-out macOS signing.** Patching signs the CDM library, containing
-  Chromium framework, and application bundle in that order; it does not use
-  deprecated `codesign --deep`.
+- **Signature-preserving macOS installation.** Widevine is published under the
+  browser's per-user Chromium component directory, leaving the vendor
+  application bundle, signatures, and entitlements untouched.
 
 V2.1 shipped the initial media-stack diagnostics and reliability hardening.
 The next cycle focuses on operational polish and additional distribution

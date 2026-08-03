@@ -131,7 +131,6 @@ mod tests {
             name: "Chromium".into(),
             install_path: PathBuf::from("/opt/chromium"),
             kind: BrowserKind::Known,
-            framework_name: None,
         }];
         let error = collect(&browsers, Some("Helium"), None).expect_err("filter");
         assert!(error.message.contains("Helium"));

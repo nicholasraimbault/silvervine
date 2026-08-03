@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{Config, CustomBrowserConfig};
 use crate::error::Result;
-use crate::widevine::{CDM_BUNDLE_DIRECTORY, CDM_MANIFEST_FILENAME};
+use crate::widevine::CDM_MANIFEST_FILENAME;
 
 pub mod discovery;
 pub mod known;
@@ -100,8 +100,6 @@ impl BrowserKind {
 /// * Linux: the install root that contains `chrome-sandbox` (or another
 ///   Chromium-family marker) — e.g. `/opt/helium-browser-bin`.
 ///
-/// `framework_name` is only meaningful on macOS (the patch flow walks
-/// `<bundle>/Contents/Frameworks/<framework_name>/Versions/<n>/Libraries/`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Browser {
     /// Display name (e.g. `"Helium"`, `"Thorium"`).
@@ -110,8 +108,6 @@ pub struct Browser {
     pub install_path: PathBuf,
     /// Source classification.
     pub kind: BrowserKind,
-    /// macOS framework directory name; ignored on Linux.
-    pub framework_name: Option<String>,
 }
 
 impl Browser {
@@ -127,68 +123,52 @@ impl Browser {
         &self.install_path
     }
 
-    /// Whether this browser has been patched with the Widevine CDM.
-    ///
-    /// Check whether the Widevine CDM is currently installed in this browser.
-    ///
-    /// Looks for the CDM manifest at the expected per-platform path under
-    /// `install_path`:
-    /// - Linux: `<install_path>/WidevineCdm/manifest.json`
-    /// - macOS: walks `<install_path>/Contents/Frameworks/<framework>.framework/Versions/<n>/Libraries/WidevineCdm/manifest.json`
+    /// Whether this browser has a Widevine CDM at the host patcher's active
+    /// component target.
     ///
     /// Returns `false` if the manifest is missing, unreadable, or the
-    /// browser's framework structure has changed.
+    /// platform-specific target cannot be resolved.
     #[must_use]
     pub fn is_patched(&self) -> bool {
         self.cdm_manifest_path().is_some()
     }
 
-    /// Read the version of the currently-installed Widevine CDM, if
-    /// any. Returns `None` if the browser isn't patched, the manifest
-    /// is unreadable, or the manifest doesn't carry a `version` field.
+    /// Read the version of the active Widevine CDM, if any.
     ///
-    /// Used by `setup` for idempotency: re-running setup against an
-    /// already-patched browser at the cached CDM version is a no-op
-    /// instead of a re-patch (which would error with `BrowserRunning`
-    /// if the user happens to have the browser open).
+    /// Returns `None` if the browser is unpatched, the manifest is unreadable,
+    /// or it does not carry a `version` field.
     #[must_use]
     pub fn installed_cdm_version(&self) -> Option<String> {
         let manifest_path = self.cdm_manifest_path()?;
         crate::widevine::manifest::read_installed_cdm_version(&manifest_path).ok()
     }
 
-    /// Resolve the path to the installed CDM's `manifest.json`, if
-    /// any. Mirrors [`Browser::is_patched`]'s search but returns the
-    /// path so [`Browser::installed_cdm_version`] can read it. macOS
-    /// picks the first version directory containing a manifest
-    /// (matches `is_patched`'s short-circuit order).
-    fn cdm_manifest_path(&self) -> Option<std::path::PathBuf> {
-        if let Some(framework_name) = &self.framework_name {
-            let versions_dir = self
-                .install_path
-                .join("Contents")
-                .join("Frameworks")
-                .join(format!("{framework_name}.framework"))
-                .join("Versions");
-            if let Ok(entries) = std::fs::read_dir(&versions_dir) {
-                for entry in entries.flatten() {
-                    let manifest = entry
-                        .path()
-                        .join("Libraries")
-                        .join(CDM_BUNDLE_DIRECTORY)
-                        .join(CDM_MANIFEST_FILENAME);
-                    if manifest.exists() {
-                        return Some(manifest);
-                    }
-                }
-            }
-            return None;
-        }
-        let manifest = self
-            .install_path
-            .join(CDM_BUNDLE_DIRECTORY)
+    pub(crate) fn is_patched_with(&self, patcher: &dyn crate::patch::PlatformPatcher) -> bool {
+        self.cdm_manifest_path_with(patcher).is_some()
+    }
+
+    pub(crate) fn installed_cdm_version_with(
+        &self,
+        patcher: &dyn crate::patch::PlatformPatcher,
+    ) -> Option<String> {
+        let manifest_path = self.cdm_manifest_path_with(patcher)?;
+        crate::widevine::manifest::read_installed_cdm_version(&manifest_path).ok()
+    }
+
+    fn cdm_manifest_path(&self) -> Option<PathBuf> {
+        let patcher = crate::patch::host_patcher().ok()?;
+        self.cdm_manifest_path_with(patcher.as_ref())
+    }
+
+    fn cdm_manifest_path_with(
+        &self,
+        patcher: &dyn crate::patch::PlatformPatcher,
+    ) -> Option<PathBuf> {
+        let manifest = patcher
+            .cdm_target(&self.install_path)
+            .ok()?
             .join(CDM_MANIFEST_FILENAME);
-        manifest.exists().then_some(manifest)
+        manifest.is_file().then_some(manifest)
     }
 }
 
@@ -267,20 +247,18 @@ pub fn detect_browsers_with(os: Os, roots: &FilesystemRoots, config: &Config) ->
 fn browser_from_custom(os: Os, entry: &CustomBrowserConfig) -> Option<Browser> {
     match os {
         Os::Macos => {
-            // macOS entries set `bundle_path`. The patcher discovers the
-            // framework when `framework_name` is absent.
+            // macOS entries identify the application bundle; profile placement
+            // is derived from its Info.plist by the host patcher.
             entry.bundle_path.as_ref().map(|p| Browser {
                 name: entry.name.clone(),
                 install_path: p.clone(),
                 kind: BrowserKind::Custom,
-                framework_name: entry.framework_name.clone(),
             })
         }
         Os::Linux => entry.install_path.as_ref().map(|p| Browser {
             name: entry.name.clone(),
             install_path: p.clone(),
             kind: BrowserKind::Custom,
-            framework_name: None,
         }),
     }
 }
@@ -467,7 +445,6 @@ mod tests {
             name: "x".into(),
             install_path: tmp.path().to_path_buf(),
             kind: BrowserKind::Detected,
-            framework_name: None,
         };
         assert!(!b.is_patched());
         // Also exercise the convenience accessors.
@@ -476,19 +453,18 @@ mod tests {
     }
 
     #[test]
-    fn is_patched_returns_true_when_linux_cdm_manifest_exists() {
+    fn is_patched_with_flat_target_when_manifest_exists() {
         let tmp = TempDir::new().expect("tempdir");
         let cdm = tmp.path().join("WidevineCdm");
         fs::create_dir_all(&cdm).expect("mkdir cdm");
         fs::write(cdm.join("manifest.json"), b"{\"version\":\"4.10.0.0\"}")
             .expect("touch manifest");
-        let b = Browser {
+        let browser = Browser {
             name: "x".into(),
             install_path: tmp.path().to_path_buf(),
             kind: BrowserKind::Detected,
-            framework_name: None,
         };
-        assert!(b.is_patched());
+        assert!(browser.is_patched_with(&crate::test_support::FlatCdmPatcher));
     }
 
     #[test]
@@ -501,13 +477,17 @@ mod tests {
             br#"{"version":"4.10.2934.0","name":"Widevine CDM"}"#,
         )
         .expect("write manifest");
-        let b = Browser {
+        let browser = Browser {
             name: "x".into(),
             install_path: tmp.path().to_path_buf(),
             kind: BrowserKind::Detected,
-            framework_name: None,
         };
-        assert_eq!(b.installed_cdm_version().as_deref(), Some("4.10.2934.0"));
+        assert_eq!(
+            browser
+                .installed_cdm_version_with(&crate::test_support::FlatCdmPatcher)
+                .as_deref(),
+            Some("4.10.2934.0")
+        );
     }
 
     #[test]
@@ -517,7 +497,6 @@ mod tests {
             name: "x".into(),
             install_path: tmp.path().to_path_buf(),
             kind: BrowserKind::Detected,
-            framework_name: None,
         };
         assert_eq!(b.installed_cdm_version(), None);
     }
@@ -528,35 +507,46 @@ mod tests {
         let cdm = tmp.path().join("WidevineCdm");
         fs::create_dir_all(&cdm).expect("mkdir cdm");
         fs::write(cdm.join("manifest.json"), b"{}").expect("write manifest");
-        let b = Browser {
+        let browser = Browser {
             name: "x".into(),
             install_path: tmp.path().to_path_buf(),
             kind: BrowserKind::Detected,
-            framework_name: None,
         };
-        assert_eq!(b.installed_cdm_version(), None);
+        assert_eq!(
+            browser.installed_cdm_version_with(&crate::test_support::FlatCdmPatcher),
+            None
+        );
     }
 
     #[test]
-    fn is_patched_macos_walks_versions_dir() {
+    fn macos_manifest_path_uses_profile_component_target() {
         let tmp = TempDir::new().expect("tempdir");
         let bundle = tmp.path().join("Helium.app");
-        let framework_versions = bundle
-            .join("Contents")
-            .join("Frameworks")
-            .join("Helium Framework.framework")
-            .join("Versions")
-            .join("147.0.7727.137");
-        let cdm = framework_versions.join("Libraries").join("WidevineCdm");
-        fs::create_dir_all(&cdm).expect("mkdir cdm");
-        fs::write(cdm.join("manifest.json"), b"{}").expect("touch manifest");
-        let b = Browser {
+        fs::create_dir_all(bundle.join("Contents")).expect("bundle contents");
+        fs::write(
+            bundle.join("Contents/Info.plist"),
+            "<plist><dict><key>CFBundleIdentifier</key><string>net.imput.helium</string></dict></plist>",
+        )
+        .expect("Info.plist");
+        let support = tmp.path().join("Library/Application Support");
+        let component = support.join("net.imput.helium/WidevineCdm/4.10.3050.0");
+        fs::create_dir_all(&component).expect("component");
+        fs::write(
+            component.join("manifest.json"),
+            br#"{"version":"4.10.3050.0"}"#,
+        )
+        .expect("manifest");
+        let browser = Browser {
             name: "Helium".into(),
             install_path: bundle,
             kind: BrowserKind::Known,
-            framework_name: Some("Helium Framework".into()),
         };
-        assert!(b.is_patched());
+        let patcher = crate::patch::macos::MacosPatcher::for_application_support(support);
+
+        assert_eq!(
+            browser.cdm_manifest_path_with(&patcher),
+            Some(component.join("manifest.json"))
+        );
     }
 
     #[test]
@@ -610,15 +600,16 @@ mod tests {
     }
 
     #[test]
-    fn browser_from_custom_macos_carries_framework_name() {
+    fn browser_from_custom_macos_ignores_legacy_framework_name() {
+        let bundle = PathBuf::from("/Applications/M.app");
         let mac = CustomBrowserConfig {
             name: "M".into(),
-            bundle_path: Some(PathBuf::from("/Applications/M.app")),
+            bundle_path: Some(bundle.clone()),
             framework_name: Some("M Framework".into()),
             install_path: None,
         };
-        let b = browser_from_custom(Os::Macos, &mac).expect("macos");
-        assert_eq!(b.framework_name.as_deref(), Some("M Framework"));
+        let browser = browser_from_custom(Os::Macos, &mac).expect("macos");
+        assert_eq!(browser.install_path, bundle);
     }
 
     #[test]

@@ -1,9 +1,9 @@
 //! macOS platform impl: `~/Library/...` paths, `osascript`-based
 //! escalation, `renameatx_np`-backed atomic rename.
 //!
-//! ## Privilege escalation strategy
+//! ## Privilege escalation helper
 //!
-//! Per the spec ("macOS → Privilege escalation"):
+//! Explicit privileged operations can invoke:
 //!
 //! > `osascript -e "do shell script ... with administrator privileges"`
 //!
@@ -11,6 +11,9 @@
 //! kept short and is built by quoting the elevated command's argv with
 //! AppleScript-safe escapes (only `\\` and `"` need to be escaped; we
 //! reject anything containing a literal NUL).
+//!
+//! The macOS CDM patcher does not use this helper: it publishes only to the
+//! current user's browser profile and disables patch escalation.
 //!
 //! ## Atomic rename
 //!
@@ -191,17 +194,14 @@ fn shell_quote(arg: &str) -> String {
 ///
 /// Unsupported filesystems fail closed without moving either path.
 pub(super) fn atomic_rename(src: &Path, dst: &Path) -> Result<()> {
-    if !dst.exists() {
-        std::fs::rename(src, dst).map_err(|e| {
-            Error::from(e).with_context(format!(
-                "rename({} -> {}) failed",
-                src.display(),
-                dst.display()
-            ))
-        })?;
-        return Ok(());
+    match renameatx_np_with_flags(src, dst, RENAME_SWAP) {
+        Ok(()) => Ok(()),
+        Err(SwapError::Other(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            renameatx_np_with_flags(src, dst, RENAME_EXCL)
+                .map_err(|error| error.into_error(src, dst))
+        }
+        Err(error) => Err(error.into_error(src, dst)),
     }
-    swap_renameatx_np(src, dst).map_err(|error| error.into_error(src, dst))
 }
 
 enum SwapError {
@@ -223,8 +223,12 @@ impl SwapError {
     }
 }
 
-/// Invoke `renameatx_np(AT_FDCWD, src, AT_FDCWD, dst, RENAME_SWAP)`.
-fn swap_renameatx_np(src: &Path, dst: &Path) -> std::result::Result<(), SwapError> {
+/// Invoke `renameatx_np(AT_FDCWD, src, AT_FDCWD, dst, flags)`.
+fn renameatx_np_with_flags(
+    src: &Path,
+    dst: &Path,
+    flags: libc::c_uint,
+) -> std::result::Result<(), SwapError> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -235,16 +239,16 @@ fn swap_renameatx_np(src: &Path, dst: &Path) -> std::result::Result<(), SwapErro
 
     // SAFETY: `renameatx_np` is a macOS syscall available since 10.12. We
     // pass null-terminated C strings constructed from valid OS strings,
-    // and `AT_FDCWD` resolves both paths against the current working
-    // directory. `RENAME_SWAP = 2` per `<sys/stdio.h>`. The flags fit in
-    // `c_uint`. No memory is shared with the syscall after it returns.
+    // `AT_FDCWD` selects the current working directory, and `flags` is one
+    // of the kernel constants declared below. No memory is shared with the
+    // syscall after it returns.
     let rc = unsafe {
         libc::renameatx_np(
             libc::AT_FDCWD,
             src_c.as_ptr(),
             libc::AT_FDCWD,
             dst_c.as_ptr(),
-            RENAME_SWAP,
+            flags,
         )
     };
     if rc == 0 {
@@ -262,9 +266,9 @@ fn swap_renameatx_np(src: &Path, dst: &Path) -> std::result::Result<(), SwapErro
     }
 }
 
-/// `RENAME_SWAP` from `<sys/stdio.h>`. Hardcoded for the same reason as
-/// the Linux constant: smaller libc surface.
+/// `renameatx_np` flags from `<sys/stdio.h>`.
 const RENAME_SWAP: libc::c_uint = 2;
+const RENAME_EXCL: libc::c_uint = 4;
 
 fn io_invalid(e: std::ffi::NulError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
@@ -375,5 +379,24 @@ mod tests {
         atomic_rename(&a, &b).expect("rename ok");
         assert!(!a.exists());
         assert_eq!(fs::read(&b).unwrap(), b"AAA");
+    }
+
+    #[test]
+    fn rename_exclusive_preserves_existing_destination() {
+        let tmp = TempDir::new().expect("tempdir");
+        let source = tmp.path().join("source");
+        let destination = tmp.path().join("destination");
+        fs::write(&source, b"source").expect("source");
+        fs::write(&destination, b"destination").expect("destination");
+
+        assert!(matches!(
+            renameatx_np_with_flags(&source, &destination, RENAME_EXCL),
+            Err(SwapError::Other(_))
+        ));
+        assert_eq!(fs::read(source).expect("preserved source"), b"source");
+        assert_eq!(
+            fs::read(destination).expect("preserved destination"),
+            b"destination"
+        );
     }
 }

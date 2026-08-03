@@ -272,7 +272,7 @@ fn patch_browser_for_setup(
     out: &mut dyn Write,
     patch_options: &PatchOptions,
 ) -> Result<bool> {
-    let cdm_target = match patcher.cdm_target(browser.install_path()) {
+    let cdm_target = match patcher.cdm_target_for_candidate(browser.install_path(), cdm.version()) {
         Ok(path) => path,
         Err(error) => return report_patch_failure(browser, &error, out),
     };
@@ -507,7 +507,6 @@ mod tests {
             name: name.into(),
             install_path: install,
             kind: BrowserKind::Detected,
-            framework_name: None,
         }
     }
 

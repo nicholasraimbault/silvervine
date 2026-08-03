@@ -96,7 +96,6 @@ Silvervine tests heavily on Linux + macOS in CI (matrix: `ubuntu-latest`, `macos
 |---|---|
 | `SILVERVINE_TEST_DATA_MIGRATION_NOOP=1` | startup Neon V2 data-directory migration |
 | `SILVERVINE_TEST_ESCALATE_NOOP=1` | `platform::escalate_for_patch` and `platform::run_as_root` |
-| `SILVERVINE_TEST_PATCH_NOOP=1` | macOS `xattr` and inside-out ad-hoc codesigning |
 | `SILVERVINE_TEST_LIFECYCLE_NOOP=1` | `daemon::lifecycle::register/unregister` (LaunchAgent / systemd-user) |
 | `SILVERVINE_TEST_POWER_NOOP=1` | `daemon::power::subscribe_wake_events` (NSWorkspace / logind D-Bus) |
 | `SILVERVINE_TEST_NOTIFY_NOOP=1` | `notify::notify_*` (libnotify / NSUserNotificationCenter) |
@@ -196,8 +195,8 @@ The codebase is split into module-level slices of `src/`:
 |---|---|
 | `src/widevine/` | Manifest, download, extract, cache |
 | `src/browsers/` | Known list + auto-discovery + custom paths |
-| `src/patch/{mod,backup}.rs` | Atomic patch protocol, snapshot/rollback |
-| `src/patch/{linux,macos}.rs` | Platform-specific bundle write |
+| `src/patch/{mod,backup}.rs` | Atomic CDM publication protocol and Linux snapshot/rollback |
+| `src/patch/{linux,macos}.rs` | Platform-specific CDM placement |
 | `src/platform/` | Paths trait, escalation, atomic_rename |
 | `src/migration.rs` | Detect + remove V1 install |
 | `src/daemon/{mod,tray,watcher,ipc}.rs` | Tray + watcher + IPC |

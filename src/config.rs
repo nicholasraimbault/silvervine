@@ -11,7 +11,6 @@
 //! name = "MyCustomBrowser"
 //! # macOS:
 //! bundle_path = "/Users/me/Applications/MyCustomBrowser.app"
-//! framework_name = "MyCustomBrowser Framework"
 //! # Linux alternative:
 //! # install_path = "/home/me/dev/my-build"
 //!
@@ -85,9 +84,8 @@ impl Default for NotificationsConfig {
 
 /// One `[[browsers]]` entry in the config.
 ///
-/// The schema is intentionally union-style: macOS users set
-/// `bundle_path` + `framework_name`; Linux users set `install_path`.
-/// The browsers module (`browsers::config`) consumes this to extend
+/// The schema is intentionally union-style: macOS users set `bundle_path`;
+/// Linux users set `install_path`. The browsers module consumes this to extend
 /// the auto-discovered list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -97,8 +95,8 @@ pub struct CustomBrowserConfig {
     /// macOS: absolute path to the `.app` bundle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_path: Option<PathBuf>,
-    /// macOS: name of the framework directory inside the bundle
-    /// (e.g. `"MyCustomBrowser Framework"`).
+    /// Legacy macOS framework hint retained for V2 configuration compatibility.
+    /// Profile-scoped CDM placement ignores this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub framework_name: Option<String>,
     /// Linux: absolute path to the install directory.

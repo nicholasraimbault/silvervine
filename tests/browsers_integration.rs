@@ -115,10 +115,6 @@ fn macos_full_pipeline_finds_apps_in_applications() {
         .find(|b| b.name == "Helium")
         .expect("helium");
     assert_eq!(helium_entry.install_path, helium);
-    assert_eq!(
-        helium_entry.framework_name.as_deref(),
-        Some("Helium Framework")
-    );
     assert_eq!(helium_entry.kind, BrowserKind::Known);
 
     let weird_entry = browsers

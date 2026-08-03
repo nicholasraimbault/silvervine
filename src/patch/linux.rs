@@ -35,7 +35,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::patch::{ManagedWrite, PlatformPatcher};
+use crate::patch::{ManagedWrite, PlatformPatcher, TargetAuthorization};
 use crate::platform::process::run_output_with_timeout;
 use crate::widevine::ownership::{self, ManagedMarker};
 use crate::widevine::{
@@ -65,10 +65,34 @@ impl PlatformPatcher for LinuxPatcher {
     fn write_managed_cdm(
         &self,
         target: &Path,
+        cdm_target: &Path,
         cdm_source: &Path,
         parent_marker: &ManagedMarker,
     ) -> Result<ManagedWrite> {
-        write_managed_cdm_into(target, cdm_source, parent_marker)?;
+        let authorization = TargetAuthorization::capture(cdm_target)?;
+        self.write_authorized_managed_cdm(
+            target,
+            cdm_target,
+            cdm_source,
+            parent_marker,
+            &authorization,
+        )
+    }
+
+    fn write_authorized_managed_cdm(
+        &self,
+        target: &Path,
+        cdm_target: &Path,
+        cdm_source: &Path,
+        parent_marker: &ManagedMarker,
+        authorization: &TargetAuthorization,
+    ) -> Result<ManagedWrite> {
+        if self.cdm_target_for_candidate(target, &parent_marker.cdm_version)? != cdm_target {
+            return Err(Error::state_corrupted(
+                "Linux CDM target changed after ownership authorization",
+            ));
+        }
+        write_managed_cdm_into(target, cdm_source, parent_marker, authorization)?;
         Ok(ManagedWrite::MarkerCommitted)
     }
 
@@ -114,8 +138,10 @@ fn write_cdm_into(target: &Path, cdm_source: &Path) -> Result<()> {
         )));
     }
 
+    let authorization = TargetAuthorization::capture(&target.join(CDM_SUBDIR))?;
     replace_cdm_transactionally(
         target,
+        &authorization,
         |staged| copy_recursive(cdm_source, staged),
         verify_cdm_at,
     )
@@ -124,6 +150,7 @@ fn write_managed_cdm_into(
     target: &Path,
     cdm_source: &Path,
     parent_marker: &ManagedMarker,
+    authorization: &TargetAuthorization,
 ) -> Result<()> {
     if !cdm_source.exists() {
         return Err(Error::unknown_bundle_structure(format!(
@@ -139,6 +166,7 @@ fn write_managed_cdm_into(
     }
     replace_cdm_transactionally(
         target,
+        authorization,
         |staged| {
             copy_recursive(cdm_source, staged)?;
             let copied = ownership::marker_for_finalized_payload(staged, parent_marker)?;
@@ -228,10 +256,15 @@ fn revalidate_privileged_install_identity(
 }
 
 fn publication_exchanged(staged: &Path) -> bool {
-    staged.exists()
+    fs::symlink_metadata(staged).is_ok()
 }
 
-fn replace_cdm_transactionally<F, V>(target: &Path, populate: F, validate_live: V) -> Result<()>
+fn replace_cdm_transactionally<F, V>(
+    target: &Path,
+    authorization: &TargetAuthorization,
+    populate: F,
+    validate_live: V,
+) -> Result<()>
 where
     F: FnOnce(&Path) -> Result<()>,
     V: FnOnce(&Path) -> Result<()>,
@@ -255,43 +288,48 @@ where
     verify_cdm_at(staging.path())?;
     revalidate_privileged_install_identity(target, privileged_identity)?;
     let destination = target.join(CDM_SUBDIR);
+    authorization.validate(&destination)?;
+    let published_authorization = TargetAuthorization::capture(&staged)?;
     crate::platform::atomic_rename(&staged, &destination)?;
     let exchanged = publication_exchanged(&staged);
-    let live_validation = revalidate_privileged_install_identity(target, privileged_identity)
+    let live_validation = authorization
+        .validate(&staged)
+        .and_then(|()| revalidate_privileged_install_identity(target, privileged_identity))
         .and_then(|()| validate_live(target));
     if let Err(verify_error) = live_validation {
-        let rollback = if exchanged {
-            crate::platform::atomic_rename(&staged, &destination)
-        } else {
-            fs::remove_dir_all(&destination).map_err(Error::from)
-        };
+        let rollback = published_authorization
+            .validate(&destination)
+            .and_then(|()| {
+                if exchanged {
+                    authorization.validate(&staged)?;
+                    crate::platform::atomic_rename(&staged, &destination)
+                } else {
+                    crate::platform::atomic_rename(&destination, &staged)
+                }
+            })
+            .and_then(|()| authorization.validate(&destination))
+            .and_then(|()| published_authorization.validate(&staged));
         if let Err(rollback_error) = rollback {
-            let recovery = if exchanged {
-                Some(staging.keep())
-            } else {
-                None
-            };
+            let recovery = staging.keep();
             let category = verify_error.category;
-            let recovery = recovery.map_or_else(
-                || "no retired payload was available".to_owned(),
-                |path| format!("the retired payload was preserved at {}", path.display()),
-            );
             let message = format!(
-                "{}; rollback also failed and {recovery}",
-                verify_error.message
+                "{}; rollback also failed and transaction state was preserved at {}",
+                verify_error.message,
+                recovery.display()
             );
             return Err(Error::new(category, message).with_source(rollback_error));
+        }
+        if let Err(cleanup_error) =
+            super::close_authorized_staging(staging, &staged, &published_authorization, target)
+        {
+            let category = verify_error.category;
+            let message = format!("{}; {}", verify_error.message, cleanup_error.message);
+            return Err(Error::new(category, message).with_source(cleanup_error));
         }
         return Err(verify_error);
     }
 
-    if let Err(error) = staging.close() {
-        tracing::warn!(
-            path = %target.display(),
-            error = %error,
-            "could not remove retired Linux CDM staging directory"
-        );
-    }
+    super::close_authorized_staging(staging, &staged, authorization, target)?;
     Ok(())
 }
 
@@ -478,6 +516,7 @@ fn context_err(io_err: std::io::Error, ctx: String) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::fs;
     use tempfile::TempDir;
 
@@ -557,9 +596,11 @@ mod tests {
         let live = install.join(CDM_SUBDIR);
         fs::create_dir_all(&live).unwrap();
         fs::write(live.join("manifest.json"), b"old").unwrap();
+        let authorization = TargetAuthorization::capture(&live).expect("live target");
 
         let result = replace_cdm_transactionally(
             &install,
+            &authorization,
             |staged| {
                 fs::write(staged.join("partial"), b"incomplete").unwrap();
                 Err(Error::other("injected staging failure"))
@@ -580,9 +621,11 @@ mod tests {
         let live = install.join(CDM_SUBDIR);
         fs::create_dir(&live).expect("live CDM");
         fs::write(live.join("retired"), b"old").expect("retired payload");
+        let authorization = TargetAuthorization::capture(&live).expect("live target");
 
         let error = replace_cdm_transactionally(
             &install,
+            &authorization,
             |staged| copy_recursive(&cdm, staged),
             |_| Err(Error::other("injected live validation failure")),
         )
@@ -591,6 +634,98 @@ mod tests {
         assert_eq!(error.message, "injected live validation failure");
         assert_eq!(fs::read(live.join("retired")).unwrap(), b"old");
         assert!(!live.join("manifest.json").exists());
+    }
+
+    #[test]
+    fn publication_preserves_target_created_after_authorization() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cdm = make_cdm_source(tmp.path());
+        let install = make_install(tmp.path());
+        let live = install.join(CDM_SUBDIR);
+        let authorization = TargetAuthorization::capture(&live).expect("missing target");
+        fs::create_dir(&live).expect("concurrent external target");
+        fs::write(live.join("external-sentinel"), b"preserve").expect("external sentinel");
+
+        let error = replace_cdm_transactionally(
+            &install,
+            &authorization,
+            |staged| copy_recursive(&cdm, staged),
+            |_| Ok(()),
+        )
+        .expect_err("a target created after authorization must be preserved");
+
+        assert_eq!(error.category, crate::ErrorCategory::StateCorrupted);
+        assert_eq!(
+            fs::read(live.join("external-sentinel")).expect("preserved external target"),
+            b"preserve"
+        );
+        assert!(!live.join("manifest.json").exists());
+    }
+
+    #[test]
+    fn failed_plain_move_preserves_concurrent_live_replacement() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cdm = make_cdm_source(tmp.path());
+        let install = make_install(tmp.path());
+        let live = install.join(CDM_SUBDIR);
+        let authorization = TargetAuthorization::capture(&live).expect("missing target");
+
+        let error = replace_cdm_transactionally(
+            &install,
+            &authorization,
+            |staged| copy_recursive(&cdm, staged),
+            |live_root| {
+                let live = live_root.join(CDM_SUBDIR);
+                fs::remove_dir_all(&live).expect("retire published payload");
+                fs::create_dir(&live).expect("concurrent external target");
+                fs::write(live.join("external-sentinel"), b"preserve").expect("external sentinel");
+                Err(Error::other("injected live validation failure"))
+            },
+        )
+        .expect_err("live validation must fail");
+
+        assert!(error.message.contains("injected live validation failure"));
+        assert_eq!(
+            fs::read(live.join("external-sentinel")).expect("preserved external target"),
+            b"preserve"
+        );
+    }
+
+    #[test]
+    fn successful_publication_preserves_replaced_retired_target() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cdm = make_cdm_source(tmp.path());
+        let install = make_install(tmp.path());
+        let live = install.join(CDM_SUBDIR);
+        fs::create_dir(&live).expect("live target");
+        fs::write(live.join("retired"), b"old").expect("retired payload");
+        let authorization = TargetAuthorization::capture(&live).expect("live target");
+        let retired_path = RefCell::new(None::<std::path::PathBuf>);
+
+        let error = replace_cdm_transactionally(
+            &install,
+            &authorization,
+            |staged| {
+                retired_path.replace(Some(staged.to_path_buf()));
+                copy_recursive(&cdm, staged)
+            },
+            |_| {
+                let retired = retired_path.borrow().clone().expect("retired path");
+                fs::remove_dir_all(&retired).expect("remove authorized retired target");
+                fs::create_dir(&retired).expect("concurrent retired replacement");
+                fs::write(retired.join("external-sentinel"), b"preserve")
+                    .expect("external sentinel");
+                Ok(())
+            },
+        )
+        .expect_err("changed rollback state must not be discarded");
+
+        assert_eq!(error.category, crate::ErrorCategory::StateCorrupted);
+        let retired = retired_path.into_inner().expect("retired path");
+        assert_eq!(
+            fs::read(retired.join("external-sentinel")).expect("preserved rollback state"),
+            b"preserve"
+        );
     }
 
     #[test]

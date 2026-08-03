@@ -101,7 +101,7 @@ silvervine status
 
 If cleanup requiring elevation was cancelled, rerun `silvervine setup`. If a package-managed `/usr/lib/neon` or `neon-fix-drm.*` artifact is reported as skipped, remove the `neon-drm` package with the suggested host package manager and rerun setup.
 
-Browser bundles remain patched only until the browser next updates. If playback stops after migration, close the browser and run `silvervine patch`.
+On Linux, browser-bundle patches last until the browser updates. On macOS, Silvervine installs Widevine in the browser's per-user profile without modifying the application bundle. If playback stops after migration, close the browser and run `silvervine patch`.
 
 ## Compatibility commitment
 

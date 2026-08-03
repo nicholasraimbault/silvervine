@@ -51,6 +51,29 @@ pub fn env_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Flat `WidevineCdm` target used by cross-platform status tests.
+#[cfg(test)]
+pub(crate) struct FlatCdmPatcher;
+
+#[cfg(test)]
+impl crate::patch::PlatformPatcher for FlatCdmPatcher {
+    fn write_cdm(
+        &self,
+        _target: &std::path::Path,
+        _cdm_source: &std::path::Path,
+    ) -> crate::Result<()> {
+        unreachable!("FlatCdmPatcher only resolves test targets")
+    }
+
+    fn verify_post_patch(&self, _target: &std::path::Path) -> crate::Result<()> {
+        unreachable!("FlatCdmPatcher only resolves test targets")
+    }
+
+    fn read_browser_version(&self, _target: &std::path::Path) -> Option<String> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

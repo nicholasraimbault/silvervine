@@ -58,6 +58,20 @@ impl BrowserStatus {
             last_patched_at: None,
         }
     }
+
+    pub(crate) fn from_browser_with(
+        browser: &Browser,
+        patcher: &dyn crate::patch::PlatformPatcher,
+    ) -> Self {
+        let cdm_version = browser.installed_cdm_version_with(patcher);
+        Self {
+            name: browser.name().to_string(),
+            install_path: browser.install_path().display().to_string(),
+            patched: cdm_version.is_some() || browser.is_patched_with(patcher),
+            cdm_version,
+            last_patched_at: None,
+        }
+    }
 }
 
 /// Top-level status report rendered by `silvervine status`.
@@ -84,7 +98,22 @@ pub fn build_status(
     heartbeat_at: Option<u64>,
     current_cdm_version: Option<String>,
 ) -> StatusReport {
-    let browsers = detected.iter().map(BrowserStatus::from_browser).collect();
+    build_status_with_patcher(detected, heartbeat_at, current_cdm_version, None)
+}
+
+fn build_status_with_patcher(
+    detected: &[Browser],
+    heartbeat_at: Option<u64>,
+    current_cdm_version: Option<String>,
+    patcher: Option<&dyn crate::patch::PlatformPatcher>,
+) -> StatusReport {
+    let browsers = detected
+        .iter()
+        .map(|browser| match patcher {
+            Some(patcher) => BrowserStatus::from_browser_with(browser, patcher),
+            None => BrowserStatus::from_browser(browser),
+        })
+        .collect();
     StatusReport {
         browsers,
         heartbeat_at,
@@ -293,7 +322,6 @@ mod tests {
             name: name.into(),
             install_path: install,
             kind: BrowserKind::Detected,
-            framework_name: None,
         }
     }
 
@@ -336,7 +364,12 @@ mod tests {
         std::fs::write(cdm.join("manifest.json"), r#"{"version":"4.10.2934.0"}"#).unwrap();
         let detected = vec![fake_browser("Helium", install)];
 
-        let report = build_status(&detected, None, None);
+        let report = build_status_with_patcher(
+            &detected,
+            None,
+            None,
+            Some(&crate::test_support::FlatCdmPatcher),
+        );
 
         assert!(report.browsers[0].patched);
         assert_eq!(
@@ -354,7 +387,10 @@ mod tests {
             std::fs::create_dir_all(&cdm).unwrap();
             std::fs::write(cdm.join("manifest.json"), manifest).unwrap();
 
-            let status = BrowserStatus::from_browser(&fake_browser("Helium", install));
+            let status = BrowserStatus::from_browser_with(
+                &fake_browser("Helium", install),
+                &crate::test_support::FlatCdmPatcher,
+            );
 
             assert!(status.patched);
             assert_eq!(status.cdm_version, None);

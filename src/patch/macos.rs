@@ -1,167 +1,207 @@
-//! macOS implementation of [`crate::patch::PlatformPatcher`].
+//! macOS implementation of [`crate::patch::PlatformPatcher`] using Chromium's
+//! per-user component directory.
 //!
-//! The patcher clones the application into a sibling staging directory,
-//! writes the CDM into that clone, clears extended attributes, ad-hoc signs
-//! and verifies the clone, then exchanges it with the live bundle. The live
-//! application is not modified before publication.
-//!
-//! ## Bundle layout
-//!
-//! macOS Chromium-family bundles look like:
+//! Silvervine never modifies or re-signs the browser application. Widevine is
+//! installed at:
 //!
 //! ```text
-//! /Applications/Helium.app/
-//! └── Contents/
-//!     ├── Info.plist
-//!     ├── MacOS/
-//!     │   └── Helium
-//!     └── Frameworks/
-//!         └── Helium Framework.framework/
-//!             └── Versions/
-//!                 └── 128.0.6613.119/
-//!                     └── Libraries/
-//!                         └── WidevineCdm/  ← final live location
+//! ~/Library/Application Support/<browser>/WidevineCdm/<version>/
 //! ```
 //!
-//! The `<n>` (version) directory under `Versions/` is the active version
-//! for the bundle. macOS Chromium uses `Versions/Current` as a symlink
-//! pointing at the live version, but writing into the symlink target
-//! (the actual versioned directory) is what survives bundle updates.
-//!
-//! ## xattr clearing
-//!
-//! The staged clone may carry quarantine or other extended attributes that
-//! prevent Chromium from loading the inserted library. Before publication we
-//! clear attributes recursively on the clone:
-//!
-//! ```sh
-//! xattr -cr <staged-bundle>
-//! ```
-//!
-//! Verified during design that `xattr -r` exists on macOS — the previous
-//! Bash implementation regressed to `xattr -c` (non-recursive) at one
-//! point and broke patches; we explicitly use `-cr` here.
-//!
-//! ## Codesign
-//!
-//! Updating the staged clone invalidates its copied application signature.
-//! Before publication we re-sign that clone ad hoc:
-//!
-//! ```sh
-//! codesign --force -s - <staged-libwidevinecdm.dylib>
-//! # Silvervine hashes the signed dylib and writes its ownership marker.
-//! xattr -cr <staged-bundle>
-//! codesign --force -s - <staged-framework>
-//! codesign --force -s - <staged-bundle>
-//! ```
-//!
-//! The `-s -` identity produces an ad-hoc signature. Signing inside-out,
-//! without `--deep`, keeps the finalized dylib bytes stable after their digest
-//! is committed to the ownership marker.
-//!
-//! ## Test mode
-//!
-//! The actual `xattr` and `codesign` invocations are gated on
-//! `SILVERVINE_TEST_PATCH_NOOP=1`. CI runners don't have `codesign` available
-//! anyway (and on Linux runners the binaries don't exist), so tests use
-//! the no-op path and assert the bundle layout is correct.
+//! Chromium discovers that component layout at startup. Keeping the CDM in the
+//! user profile preserves the vendor's application signature, hardened runtime,
+//! entitlements, and update path.
 
+use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::error::{Error, Result};
-use crate::patch::PlatformPatcher;
+use crate::patch::{ManagedWrite, PlatformPatcher, TargetAuthorization};
 use crate::widevine::ownership::{self, ManagedMarker};
-use crate::widevine::CDM_BUNDLE_DIRECTORY;
+use crate::widevine::{
+    platform_directory, platform_library, Platform, CDM_BUNDLE_DIRECTORY,
+    PLATFORM_SPECIFIC_DIRECTORY,
+};
 
-/// macOS platform patcher.
-///
-/// Implements [`PlatformPatcher`] for the macOS `.app`-bundle layout.
-/// Construct with [`MacosPatcher::new`].
-#[derive(Debug, Clone, Default)]
+const ABSENT_COMPONENT_TARGET: &str = ".silvervine-absent";
+
+/// macOS patcher for Chromium-family per-user component directories.
+#[derive(Debug, Clone)]
 pub struct MacosPatcher {
-    framework_name: Option<String>,
-    framework_version: Option<String>,
+    application_support: Option<PathBuf>,
+}
+
+impl Default for MacosPatcher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MacosPatcher {
-    /// Build a patcher that discovers the framework for normal user flows.
+    /// Build a patcher rooted in the current login user's Application Support.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            application_support: dirs::home_dir()
+                .map(|home| home.join("Library").join("Application Support")),
+        }
     }
 
-    /// Pin resolution to the exact framework and version selected by the
-    /// unprivileged parent. The privileged child never scans either level.
-    #[must_use]
-    pub fn for_layout(framework_name: &str, framework_version: &str) -> Self {
+    #[cfg(test)]
+    pub(crate) fn for_application_support(application_support: PathBuf) -> Self {
         Self {
-            framework_name: Some(framework_name.to_owned()),
-            framework_version: Some(framework_version.to_owned()),
+            application_support: Some(application_support),
         }
+    }
+
+    fn application_support(&self) -> Result<&Path> {
+        self.application_support.as_deref().ok_or_else(|| {
+            Error::state_corrupted(
+                "cannot resolve macOS Application Support directory (no login home)",
+            )
+        })
+    }
+
+    fn profile_root(&self, application: &Path) -> Result<PathBuf> {
+        checked_application_bundle(application)?;
+        let suffix = profile_suffix_for_application(application)?;
+        Ok(self.application_support()?.join(suffix))
+    }
+
+    fn component_root(&self, application: &Path) -> Result<PathBuf> {
+        Ok(self.profile_root(application)?.join(CDM_BUNDLE_DIRECTORY))
+    }
+
+    fn ensure_component_root_for_target(&self, target: &Path) -> Result<PathBuf> {
+        let component = target.parent().ok_or_else(|| {
+            Error::unknown_bundle_structure("macOS Widevine target has no component root")
+        })?;
+        if component.file_name() != Some(std::ffi::OsStr::new(CDM_BUNDLE_DIRECTORY)) {
+            return Err(Error::unknown_bundle_structure(
+                "macOS Widevine target is not inside a WidevineCdm component root",
+            ));
+        }
+        let profile = component.parent().ok_or_else(|| {
+            Error::unknown_bundle_structure("macOS Widevine component root has no browser profile")
+        })?;
+        let support = self.application_support()?;
+        if profile.parent() != Some(support) {
+            return Err(Error::state_corrupted(
+                "macOS Widevine target escaped the authorized Application Support directory",
+            ));
+        }
+
+        ensure_directory_with_parent(support, "Application Support")?;
+        ensure_direct_directory(profile, "browser profile")?;
+        ensure_direct_directory(component, "Widevine component root")?;
+        Ok(component.to_path_buf())
+    }
+
+    fn candidate_target(&self, application: &Path, version: &str) -> Result<PathBuf> {
+        validate_version(version)?;
+        Ok(self.component_root(application)?.join(version))
     }
 }
 
 impl PlatformPatcher for MacosPatcher {
-    fn write_cdm(&self, target: &Path, cdm_source: &Path) -> Result<()> {
-        let layout = resolve_bundle_layout_for(
-            target,
-            self.framework_name.as_deref(),
-            self.framework_version.as_deref(),
+    fn write_cdm(&self, application: &Path, cdm_source: &Path) -> Result<()> {
+        reject_root_profile_write()?;
+        let version = crate::widevine::manifest::read_installed_cdm_version(
+            &cdm_source.join("manifest.json"),
         )?;
-        let framework_name = framework_name_from_path(&layout.framework)?;
-        let framework_version = layout.version;
-        write_bundle_transactionally(target, cdm_source, &framework_name, &framework_version)
+        validate_version(&version)?;
+        let destination = self.candidate_target(application, &version)?;
+        let authorization = TargetAuthorization::capture(&destination)?;
+        let component_root = self.ensure_component_root_for_target(&destination)?;
+        replace_version_transactionally(
+            &component_root,
+            &destination,
+            &version,
+            cdm_source,
+            None,
+            &authorization,
+            || self.candidate_target(application, &version),
+        )
     }
 
     fn write_managed_cdm(
         &self,
-        target: &Path,
+        application: &Path,
+        cdm_target: &Path,
         cdm_source: &Path,
         parent_marker: &ManagedMarker,
-    ) -> Result<crate::patch::ManagedWrite> {
-        let layout = resolve_bundle_layout_for(
-            target,
-            self.framework_name.as_deref(),
-            self.framework_version.as_deref(),
-        )?;
-        let framework_name = framework_name_from_path(&layout.framework)?;
-        let framework_version = layout.version;
-        write_managed_bundle_transactionally(
-            target,
+    ) -> Result<ManagedWrite> {
+        let authorization = TargetAuthorization::capture(cdm_target)?;
+        self.write_authorized_managed_cdm(
+            application,
+            cdm_target,
             cdm_source,
             parent_marker,
-            &framework_name,
-            &framework_version,
+            &authorization,
+        )
+    }
+
+    fn write_authorized_managed_cdm(
+        &self,
+        application: &Path,
+        cdm_target: &Path,
+        cdm_source: &Path,
+        parent_marker: &ManagedMarker,
+        authorization: &TargetAuthorization,
+    ) -> Result<ManagedWrite> {
+        reject_root_profile_write()?;
+        validate_version(&parent_marker.cdm_version)?;
+        let expected = self.candidate_target(application, &parent_marker.cdm_version)?;
+        if expected != cdm_target {
+            return Err(Error::state_corrupted(
+                "macOS browser profile changed after target authorization",
+            ));
+        }
+        let component_root = self.ensure_component_root_for_target(cdm_target)?;
+        replace_version_transactionally(
+            &component_root,
+            cdm_target,
+            &parent_marker.cdm_version,
+            cdm_source,
+            Some(parent_marker),
+            authorization,
+            || self.candidate_target(application, &parent_marker.cdm_version),
         )?;
-        Ok(crate::patch::ManagedWrite::MarkerCommitted)
+        Ok(ManagedWrite::MarkerCommitted)
     }
 
-    fn cdm_target(&self, target: &Path) -> Result<PathBuf> {
-        Ok(resolve_bundle_layout_for(
-            target,
-            self.framework_name.as_deref(),
-            self.framework_version.as_deref(),
-        )?
-        .cdm_target)
+    fn cdm_target(&self, application: &Path) -> Result<PathBuf> {
+        let component_root = self.component_root(application)?;
+        latest_version_directory(&component_root)
+            .map(|target| target.unwrap_or_else(|| component_root.join(ABSENT_COMPONENT_TARGET)))
     }
 
-    fn verify_post_patch(&self, target: &Path) -> Result<()> {
-        let layout = resolve_bundle_layout_for(
-            target,
-            self.framework_name.as_deref(),
-            self.framework_version.as_deref(),
-        )?;
-        verify_cdm_at(&layout)
+    fn cdm_target_for_candidate(&self, application: &Path, version: &str) -> Result<PathBuf> {
+        self.candidate_target(application, version)
     }
 
-    fn read_browser_version(&self, target: &Path) -> Option<String> {
-        read_browser_version_at(target)
+    fn verify_post_patch(&self, application: &Path) -> Result<()> {
+        let target = self.cdm_target(application)?;
+        verify_payload_at(&target)
     }
 
-    fn write_access_root<'a>(&self, target: &'a Path) -> &'a Path {
-        target.parent().unwrap_or(target)
+    fn read_browser_version(&self, application: &Path) -> Option<String> {
+        read_browser_version_at(application)
+    }
+
+    fn write_access_root(&self, _application: &Path) -> Result<PathBuf> {
+        let support = self.application_support()?;
+        if support.is_dir() {
+            return Ok(support.to_path_buf());
+        }
+        support.parent().map(Path::to_path_buf).ok_or_else(|| {
+            Error::state_corrupted("macOS Application Support directory has no parent")
+        })
+    }
+
+    fn supports_elevation(&self) -> bool {
+        false
     }
 
     fn writes_transactionally(&self) -> bool {
@@ -169,1022 +209,971 @@ impl PlatformPatcher for MacosPatcher {
     }
 }
 
-/// Resolved on-disk layout for a Chromium-family `.app` bundle.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BundleLayout {
-    /// `.app` bundle root (e.g. `/Applications/Helium.app`).
-    pub bundle: PathBuf,
-    /// Framework directory (e.g. `Contents/Frameworks/Helium Framework.framework`).
-    pub framework: PathBuf,
-    /// Active version directory (e.g. `Frameworks/.../Versions/128.0.6613.119`).
-    pub version_dir: PathBuf,
-    /// Where the CDM goes (`<version_dir>/Libraries/WidevineCdm/`).
-    pub cdm_target: PathBuf,
-    /// Detected version string (the directory name under `Versions/`).
-    pub version: String,
-}
-
-/// Walk into `target` (a `.app` bundle), find the framework directory,
-/// and resolve the active version directory.
+/// Known macOS profile directory suffixes, in runtime preference order.
 ///
-/// Algorithm:
-///
-/// 1. Look in `<target>/Contents/Frameworks/`.
-/// 2. Take the first `*.framework` entry that has a `Versions/` directory.
-/// 3. Inside `Versions/`, prefer `Current` if it exists and is a symlink;
-///    otherwise pick the only non-symlink `<version>` entry.
-///
-/// # Errors
-///
-/// Returns [`crate::ErrorCategory::UnknownBundleStructure`] if any step
-/// fails — the caller (the orchestrator) categorizes the error and
-/// surfaces it through the patch flow.
-pub fn resolve_bundle_layout(target: &Path) -> Result<BundleLayout> {
-    resolve_bundle_layout_for(target, None, None)
-}
-
-/// Resolve the exact framework name in the unprivileged, locked parent.
-/// The privileged child receives this value and never scans the bundle.
-/// When `requested` is present, it must be a single framework-name component
-/// and must resolve inside the selected browser bundle.
-///
-/// # Errors
-/// Returns `UnknownBundleStructure` when no usable framework exists or a
-/// requested name could escape `Contents/Frameworks`.
-pub fn resolve_privileged_layout(
-    target: &Path,
-    requested: Option<&str>,
-) -> Result<(String, String)> {
-    if let Some(name) = requested {
-        validate_layout_component("framework", name)?;
+/// Diagnostics inspect every suffix. The patcher writes only the first suffix,
+/// which is the browser's current canonical component root.
+pub(crate) fn profile_support_suffixes(browser_name: &str) -> &'static [&'static str] {
+    match browser_name {
+        "helium" => &["net.imput.helium", "Helium"],
+        "thorium" => &["Thorium"],
+        "ungoogled-chromium" | "chromium" => &["Chromium", "ungoogled-chromium"],
+        _ => &[],
     }
-    let layout = resolve_bundle_layout_for(target, requested, None)?;
-    Ok((framework_name_from_path(&layout.framework)?, layout.version))
 }
 
-/// Validate a parent-pinned layout without scanning frameworks or versions.
-/// The privileged child calls this before creating a snapshot.
-///
-/// # Errors
-/// Returns `UnknownBundleStructure` when a pinned component is missing,
-/// symlinked, invalid, or escapes the selected browser bundle.
-pub fn validate_privileged_layout(target: &Path, framework: &str, version: &str) -> Result<()> {
-    resolve_bundle_layout_for(target, Some(framework), Some(version)).map(|_| ())
-}
+fn profile_suffix_for_application(application: &Path) -> Result<String> {
+    let plist = read_info_plist(application)?;
 
-fn framework_name_from_path(framework: &Path) -> Result<String> {
-    let file_name = framework
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| Error::unknown_bundle_structure("framework name is not valid UTF-8"))?;
-    file_name
-        .strip_suffix(".framework")
-        .map(str::to_owned)
+    if let Some(value) = plist_dictionary_string(&plist, "CrProductDirName") {
+        validate_profile_suffix(value)?;
+        return Ok(value.to_owned());
+    }
+
+    let identifier =
+        plist_dictionary_string(&plist, "CFBundleIdentifier").map(str::to_ascii_lowercase);
+    if identifier.as_deref() == Some("net.imput.helium") {
+        return Ok("net.imput.helium".into());
+    }
+
+    if let Some(value) = plist_dictionary_string(&plist, "CFBundleName") {
+        validate_profile_suffix(value)?;
+        return Ok(value.to_owned());
+    }
+
+    if let Some(identifier) = identifier {
+        if identifier.contains("thorium") {
+            return Ok("Thorium".into());
+        }
+        if identifier.contains("chromium") {
+            return Ok("Chromium".into());
+        }
+    }
+
+    let stem = application
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
         .ok_or_else(|| {
-            Error::unknown_bundle_structure("framework directory lacks .framework suffix")
-        })
+            Error::unknown_bundle_structure(format!(
+                "browser application has no valid name: {}",
+                application.display()
+            ))
+        })?;
+    match stem.to_ascii_lowercase().as_str() {
+        "helium" => return Ok("net.imput.helium".into()),
+        "thorium" => return Ok("Thorium".into()),
+        "chromium" | "ungoogled-chromium" => return Ok("Chromium".into()),
+        _ => {}
+    }
+
+    validate_profile_suffix(stem)?;
+    Ok(stem.to_owned())
 }
 
-pub(crate) fn validate_layout_component(kind: &str, name: &str) -> Result<()> {
-    let mut components = Path::new(name).components();
-    let is_single_normal = matches!(components.next(), Some(std::path::Component::Normal(_)))
+fn validate_profile_suffix(suffix: &str) -> Result<()> {
+    let mut components = Path::new(suffix).components();
+    let valid = !suffix.is_empty()
+        && matches!(components.next(), Some(std::path::Component::Normal(_)))
         && components.next().is_none();
-    if name.is_empty() || !is_single_normal {
+    if !valid {
         return Err(Error::unknown_bundle_structure(format!(
-            "{kind} name must be one path component"
+            "macOS browser profile name is not one safe path component: {suffix}"
         )));
     }
     Ok(())
 }
 
-fn resolve_bundle_layout_for(
-    target: &Path,
-    framework_name: Option<&str>,
-    framework_version: Option<&str>,
-) -> Result<BundleLayout> {
-    checked_directory(target, "browser bundle")?;
-    let contents = target.join("Contents");
-    checked_directory(&contents, "Contents")?;
-    let frameworks = contents.join("Frameworks");
-    checked_directory(&frameworks, "Frameworks")?;
-
-    let framework = if let Some(name) = framework_name {
-        validate_layout_component("framework", name)?;
-        let framework = frameworks.join(format!("{name}.framework"));
-        checked_directory(&framework, "requested framework")?;
-        framework
-    } else {
-        first_framework_dir(&frameworks)?
-    };
-    ensure_contained(target, &framework, "framework")?;
-
-    let versions = framework.join("Versions");
-    checked_directory(&versions, "Versions")?;
-    let version_dir = if let Some(version) = framework_version {
-        validate_layout_component("framework version", version)?;
-        let path = versions.join(version);
-        checked_directory(&path, "requested framework version")?;
-        path
-    } else {
-        active_version_dir(&versions)?
-    };
-    ensure_contained(&framework, &version_dir, "framework version")?;
-    let version = version_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| Error::unknown_bundle_structure("framework version is not valid UTF-8"))?
-        .to_string();
-    let libraries = version_dir.join("Libraries");
-    checked_directory(&libraries, "framework Libraries")?;
-    ensure_contained(&version_dir, &libraries, "framework Libraries")?;
-    let cdm_target = libraries.join(CDM_BUNDLE_DIRECTORY);
-    Ok(BundleLayout {
-        bundle: target.to_path_buf(),
-        framework,
-        version_dir,
-        cdm_target,
-        version,
-    })
+fn reject_root_profile_write() -> Result<()> {
+    if crate::platform::is_running_as_root() {
+        return Err(Error::permission_denied(
+            "macOS Widevine must be installed as the login user, not root",
+        ));
+    }
+    Ok(())
 }
 
-fn checked_directory(path: &Path, kind: &str) -> Result<()> {
+fn checked_application_bundle(application: &Path) -> Result<()> {
+    checked_directory(application, "browser application")?;
+    let contents = application.join("Contents");
+    checked_directory(&contents, "browser Contents directory")?;
+    checked_regular_file(&contents.join("Info.plist"), "browser Info.plist")
+}
+
+fn checked_directory(path: &Path, label: &str) -> Result<()> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            Error::unknown_bundle_structure(format!("{kind} is missing: {}", path.display()))
-        } else {
-            ctx_err(error, format!("inspect {kind} {}", path.display()))
-        }
+        ctx_err(
+            error,
+            format!("could not inspect {label} {}", path.display()),
+        )
     })?;
-    if metadata.file_type().is_symlink() {
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
         return Err(Error::unknown_bundle_structure(format!(
-            "{kind} must not be a symlink: {}",
-            path.display()
-        )));
-    }
-    if !metadata.is_dir() {
-        return Err(Error::unknown_bundle_structure(format!(
-            "{kind} is not a directory: {}",
+            "{label} is not a non-symlink directory: {}",
             path.display()
         )));
     }
     Ok(())
 }
 
-fn ensure_contained(root: &Path, path: &Path, kind: &str) -> Result<()> {
-    let canonical_root = fs::canonicalize(root)
-        .map_err(|error| ctx_err(error, format!("canonicalize {}", root.display())))?;
-    let canonical_path = fs::canonicalize(path)
-        .map_err(|error| ctx_err(error, format!("canonicalize {}", path.display())))?;
-    if !canonical_path.starts_with(&canonical_root) {
+fn checked_regular_file(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        ctx_err(
+            error,
+            format!("could not inspect {label} {}", path.display()),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
         return Err(Error::unknown_bundle_structure(format!(
-            "{kind} escapes {}",
-            canonical_root.display()
+            "{label} is not a non-symlink regular file: {}",
+            path.display()
         )));
     }
     Ok(())
 }
 
-/// Find the first `*.framework` directory inside `frameworks` that has
-/// a `Versions/` subdirectory.
-fn first_framework_dir(frameworks: &Path) -> Result<PathBuf> {
-    for entry in fs::read_dir(frameworks)
-        .map_err(|e| ctx_err(e, format!("read_dir({})", frameworks.display())))?
-    {
-        let entry = entry.map_err(|e| ctx_err(e, format!("iter {}", frameworks.display())))?;
-        let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        let file_type = entry
-            .file_type()
-            .map_err(|error| ctx_err(error, format!("file_type({})", path.display())))?;
-        if file_type.is_dir()
-            && name_str.ends_with(".framework")
-            && checked_directory(&path.join("Versions"), "Versions").is_ok()
-        {
-            return Ok(path);
-        }
+fn ensure_directory_with_parent(path: &Path, label: &str) -> Result<()> {
+    if path.exists() {
+        return checked_directory(path, label);
     }
-    Err(Error::unknown_bundle_structure(format!(
-        "no Chromium-family framework directory under {}",
-        frameworks.display()
-    )))
+    let parent = path.parent().ok_or_else(|| {
+        Error::unknown_bundle_structure(format!("{label} has no parent: {}", path.display()))
+    })?;
+    checked_directory(parent, "Application Support parent")?;
+    fs::create_dir(path).map_err(|error| {
+        ctx_err(
+            error,
+            format!("could not create {label} {}", path.display()),
+        )
+    })?;
+    checked_directory(path, label)
 }
 
-/// Resolve the active version dir under `versions`. A `Current` symlink is
-/// accepted only when it names one direct child. Absolute or escaping links
-/// are rejected rather than followed.
-fn active_version_dir(versions: &Path) -> Result<PathBuf> {
-    let current = versions.join("Current");
-    match fs::symlink_metadata(&current) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            let target = fs::read_link(&current)
-                .map_err(|error| ctx_err(error, format!("readlink {}", current.display())))?;
-            let target = target.to_str().ok_or_else(|| {
-                Error::unknown_bundle_structure("Current symlink target is not valid UTF-8")
-            })?;
-            validate_layout_component("Current symlink target", target)?;
-            let resolved = versions.join(target);
-            checked_directory(&resolved, "Current framework version")?;
-            return Ok(resolved);
+fn ensure_direct_directory(path: &Path, label: &str) -> Result<()> {
+    if path.exists() {
+        return checked_directory(path, label);
+    }
+    let parent = path.parent().ok_or_else(|| {
+        Error::unknown_bundle_structure(format!("{label} has no parent: {}", path.display()))
+    })?;
+    checked_directory(parent, "component parent")?;
+    fs::create_dir(path).map_err(|error| {
+        ctx_err(
+            error,
+            format!("could not create {label} {}", path.display()),
+        )
+    })?;
+    checked_directory(path, label)
+}
+
+fn validate_version(version: &str) -> Result<()> {
+    let mut components = Path::new(version).components();
+    let single_component = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    if !single_component || numeric_version(version).is_none() {
+        return Err(Error::unknown_bundle_structure(format!(
+            "Widevine version is not a dotted numeric path component: {version}"
+        )));
+    }
+    Ok(())
+}
+
+fn numeric_version(version: &str) -> Option<Vec<u64>> {
+    if version.is_empty() {
+        return None;
+    }
+    version
+        .split('.')
+        .map(str::parse)
+        .collect::<std::result::Result<_, _>>()
+        .ok()
+}
+
+fn compare_numeric_versions(left: &[u64], right: &[u64]) -> Ordering {
+    let width = left.len().max(right.len());
+    (0..width)
+        .map(|index| {
+            left.get(index)
+                .copied()
+                .unwrap_or_default()
+                .cmp(&right.get(index).copied().unwrap_or_default())
+        })
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+}
+
+fn latest_version_directory(component_root: &Path) -> Result<Option<PathBuf>> {
+    let metadata = match fs::symlink_metadata(component_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(ctx_err(
+                error,
+                format!("could not inspect {}", component_root.display()),
+            ));
         }
-        Ok(metadata) if metadata.is_dir() => return Ok(current),
-        Ok(_) => {
-            return Err(Error::unknown_bundle_structure(format!(
-                "Versions/Current is neither a directory nor symlink: {}",
-                current.display()
-            )));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(ctx_err(error, format!("inspect {}", current.display()))),
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(Error::unknown_bundle_structure(format!(
+            "Widevine component root is not a non-symlink directory: {}",
+            component_root.display()
+        )));
     }
 
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    for entry in fs::read_dir(versions)
-        .map_err(|error| ctx_err(error, format!("read_dir({})", versions.display())))?
-    {
-        let entry =
-            entry.map_err(|error| ctx_err(error, format!("iter {}", versions.display())))?;
-        if entry.file_name() == "Current" {
+    let mut best: Option<(Vec<u64>, PathBuf)> = None;
+    for entry in fs::read_dir(component_root).map_err(|error| {
+        ctx_err(
+            error,
+            format!("could not read {}", component_root.display()),
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            ctx_err(
+                error,
+                format!("could not inspect entry in {}", component_root.display()),
+            )
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            ctx_err(
+                error,
+                format!("could not inspect {}", entry.path().display()),
+            )
+        })?;
+        if !file_type.is_dir() || file_type.is_symlink() {
             continue;
         }
-        let file_type = entry
-            .file_type()
-            .map_err(|error| ctx_err(error, format!("file_type({})", entry.path().display())))?;
-        if file_type.is_dir() {
-            candidates.push(entry.path());
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(version) = numeric_version(&name) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(current, _)| {
+            compare_numeric_versions(&version, current) == Ordering::Greater
+        }) {
+            best = Some((version, entry.path()));
         }
     }
-    match candidates.as_slice() {
-        [only] => Ok(only.clone()),
-        [] => Err(Error::unknown_bundle_structure(format!(
-            "no version directory under {}",
-            versions.display()
-        ))),
-        _ => Err(Error::unknown_bundle_structure(format!(
-            "multiple version directories under {} and no Current symlink",
-            versions.display()
-        ))),
-    }
+    Ok(best.map(|(_, path)| path))
 }
 
-fn write_bundle_transactionally(
-    target: &Path,
-    cdm_source: &Path,
-    framework_name: &str,
-    framework_version: &str,
-) -> Result<()> {
-    replace_bundle_transactionally(
-        target,
-        |staged_bundle| {
-            let staged_layout = resolve_bundle_layout_for(
-                staged_bundle,
-                Some(framework_name),
-                Some(framework_version),
-            )?;
-            write_cdm_into(&staged_layout, cdm_source)?;
-            run_codesign_adhoc(&cdm_library_path(&staged_layout))?;
-            run_xattr_clear(staged_bundle)?;
-            run_codesign_adhoc(&staged_layout.framework)?;
-            run_codesign_adhoc(staged_bundle)?;
-            verify_cdm_at(&staged_layout)
-        },
-        |live_bundle, &()| {
-            let live_layout = resolve_bundle_layout_for(
-                live_bundle,
-                Some(framework_name),
-                Some(framework_version),
-            )?;
-            verify_cdm_at(&live_layout)
-        },
-    )
-}
-
-fn write_managed_bundle_transactionally(
-    target: &Path,
-    cdm_source: &Path,
-    parent_marker: &ManagedMarker,
-    framework_name: &str,
-    framework_version: &str,
-) -> Result<ManagedMarker> {
-    replace_bundle_transactionally(
-        target,
-        |staged_bundle| {
-            let staged_layout = resolve_bundle_layout_for(
-                staged_bundle,
-                Some(framework_name),
-                Some(framework_version),
-            )?;
-            write_cdm_into(&staged_layout, cdm_source)?;
-            let copied =
-                ownership::marker_for_finalized_payload(&staged_layout.cdm_target, parent_marker)?;
-            if &copied != parent_marker {
-                return Err(Error::invalid_marker(
-                    "macOS CDM copy changed the parent-selected payload",
-                ));
-            }
-
-            run_codesign_adhoc(&cdm_library_path(&staged_layout))?;
-            let finalized =
-                ownership::marker_for_finalized_payload(&staged_layout.cdm_target, parent_marker)?;
-            ownership::write_marker(&staged_layout.cdm_target, &finalized)?;
-            run_xattr_clear(staged_bundle)?;
-            run_codesign_adhoc(&staged_layout.framework)?;
-            run_codesign_adhoc(staged_bundle)?;
-            verify_cdm_at(&staged_layout)?;
-            let installed = ownership::validate_installed_cdm(&staged_layout.cdm_target)?;
-            if installed.marker() != &finalized {
-                return Err(Error::invalid_marker(
-                    "macOS staging committed an unexpected ownership marker",
-                ));
-            }
-            Ok(finalized)
-        },
-        |live_bundle, finalized| {
-            let live_layout = resolve_bundle_layout_for(
-                live_bundle,
-                Some(framework_name),
-                Some(framework_version),
-            )?;
-            verify_cdm_at(&live_layout)?;
-            let installed = ownership::validate_installed_cdm(&live_layout.cdm_target)?;
-            if installed.marker() != finalized {
-                return Err(Error::invalid_marker(
-                    "macOS live publication committed an unexpected ownership marker",
-                ));
-            }
-            Ok(())
-        },
-    )
-}
-
-fn replace_bundle_transactionally<F, V, T>(bundle: &Path, prepare: F, validate_live: V) -> Result<T>
+fn validate_published_component<F>(
+    component_root: &Path,
+    destination: &Path,
+    parent_marker: Option<&ManagedMarker>,
+    resolve_destination: &F,
+) -> Result<()>
 where
-    F: FnOnce(&Path) -> Result<T>,
-    V: FnOnce(&Path, &T) -> Result<()>,
+    F: Fn() -> Result<PathBuf>,
 {
-    let parent = bundle.parent().ok_or_else(|| {
-        Error::unknown_bundle_structure(format!(
-            "browser bundle has no parent: {}",
-            bundle.display()
-        ))
-    })?;
-    let bundle_name = bundle.file_name().ok_or_else(|| {
-        Error::unknown_bundle_structure(format!(
-            "browser bundle has no filename: {}",
-            bundle.display()
-        ))
-    })?;
+    verify_payload_at(destination)?;
+    if let Some(marker) = parent_marker {
+        let installed = ownership::validate_installed_cdm(destination)?;
+        if installed.marker() != marker {
+            return Err(Error::invalid_marker(
+                "macOS profile publication committed an unexpected ownership marker",
+            ));
+        }
+    }
+    if resolve_destination()? != destination {
+        return Err(Error::state_corrupted(
+            "macOS browser profile changed during CDM publication",
+        ));
+    }
+    let active = latest_version_directory(component_root)?;
+    if active.as_deref() != Some(destination) {
+        let active = active.map_or_else(|| "<none>".to_owned(), |path| path.display().to_string());
+        return Err(Error::state_corrupted(format!(
+            "published macOS CDM did not become active; active target is {active}"
+        )));
+    }
+    Ok(())
+}
+
+fn replace_version_transactionally<F>(
+    component_root: &Path,
+    destination: &Path,
+    version: &str,
+    cdm_source: &Path,
+    parent_marker: Option<&ManagedMarker>,
+    authorization: &TargetAuthorization,
+    resolve_destination: F,
+) -> Result<()>
+where
+    F: Fn() -> Result<PathBuf>,
+{
+    checked_directory(cdm_source, "cached Widevine payload")?;
+    checked_directory(component_root, "Widevine component root")?;
+    if component_root.join(version) != destination {
+        return Err(Error::state_corrupted(
+            "macOS publication target does not match the selected CDM version",
+        ));
+    }
+
     let staging = tempfile::Builder::new()
-        .prefix(".silvervine-bundle-")
-        .tempdir_in(parent)
+        .prefix(".silvervine-widevine-")
+        .tempdir_in(component_root)
         .map_err(|error| {
             ctx_err(
                 error,
-                format!("create bundle staging directory in {}", parent.display()),
+                format!(
+                    "could not create staging directory in {}",
+                    component_root.display()
+                ),
             )
         })?;
-    let staged_bundle = staging.path().join(bundle_name);
-    clone_bundle(bundle, &staged_bundle)?;
-    let prepared = prepare(&staged_bundle)?;
-    crate::platform::atomic_rename(&staged_bundle, bundle)?;
-
-    if let Err(validation_error) = validate_live(bundle, &prepared) {
-        if let Err(rollback_error) = crate::platform::atomic_rename(&staged_bundle, bundle) {
-            let recovery = staging.keep();
-            let category = validation_error.category;
-            let message = format!(
-                "{}; rollback failed and the retired application was preserved at {}",
-                validation_error.message,
-                recovery.display()
-            );
-            return Err(Error::new(category, message).with_source(rollback_error));
-        }
-        return Err(validation_error);
-    }
-
-    if let Err(error) = staging.close() {
-        tracing::warn!(
-            path = %bundle.display(),
-            error = %error,
-            "could not remove retired macOS bundle staging directory"
-        );
-    }
-    Ok(prepared)
-}
-
-fn clone_bundle(source: &Path, destination: &Path) -> Result<()> {
-    if std::env::var_os("SILVERVINE_TEST_PATCH_NOOP").is_some() {
-        fs::create_dir(destination).map_err(|error| {
-            ctx_err(
-                error,
-                format!("create test bundle clone {}", destination.display()),
-            )
-        })?;
-        return copy_recursive(source, destination);
-    }
-    clone_bundle_native(source, destination)
-}
-
-fn clone_bundle_native(source: &Path, destination: &Path) -> Result<()> {
-    let clone_attempt = Command::new("/bin/cp")
-        .arg("-cRp")
-        .arg(source)
-        .arg(destination)
-        .output();
-    if clone_attempt
-        .as_ref()
-        .is_ok_and(|output| output.status.success())
-    {
-        return Ok(());
-    }
-
-    if destination.exists() {
-        fs::remove_dir_all(destination).map_err(|error| {
-            ctx_err(
-                error,
-                format!("remove partial bundle clone {}", destination.display()),
-            )
-        })?;
-    }
-    let copy_attempt = Command::new("/usr/bin/ditto")
-        .args(["--rsrc", "--extattr", "--acl"])
-        .arg(source)
-        .arg(destination)
-        .output();
-    if copy_attempt
-        .as_ref()
-        .is_ok_and(|output| output.status.success())
-    {
-        return Ok(());
-    }
-
-    Err(Error::other(format!(
-        "could not stage macOS bundle {}: cp: {}; ditto: {}",
-        source.display(),
-        command_failure(&clone_attempt),
-        command_failure(&copy_attempt)
-    )))
-}
-
-fn command_failure(result: &std::io::Result<std::process::Output>) -> String {
-    match result {
-        Ok(output) => format!(
-            "{}: {}",
-            crate::platform::format_exit_status(output.status),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-        Err(error) => error.to_string(),
-    }
-}
-
-fn write_cdm_into(layout: &BundleLayout, cdm_source: &Path) -> Result<()> {
-    if !cdm_source.exists() {
-        return Err(Error::unknown_bundle_structure(format!(
-            "CDM source directory does not exist: {}",
-            cdm_source.display()
-        )));
-    }
-    if layout.cdm_target.exists() {
-        fs::remove_dir_all(&layout.cdm_target).map_err(|e| {
-            ctx_err(
-                e,
-                format!("could not clear {}", layout.cdm_target.display()),
-            )
-        })?;
-    }
-    fs::create_dir_all(&layout.cdm_target).map_err(|e| {
+    let staged = staging.path().join(version);
+    fs::create_dir(&staged).map_err(|error| {
         ctx_err(
-            e,
-            format!("could not create {}", layout.cdm_target.display()),
+            error,
+            format!("could not create staged payload {}", staged.display()),
         )
     })?;
-    copy_recursive(cdm_source, &layout.cdm_target)?;
-    Ok(())
-}
+    copy_recursive(cdm_source, &staged)?;
+    verify_payload_at(&staged)?;
 
-fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
-    for entry in
-        fs::read_dir(src).map_err(|e| ctx_err(e, format!("read_dir({})", src.display())))?
-    {
-        let entry = entry.map_err(|e| ctx_err(e, format!("iter {}", src.display())))?;
-        let path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        let file_type = entry
-            .file_type()
-            .map_err(|e| ctx_err(e, format!("file_type({})", path.display())))?;
-        if file_type.is_dir() {
-            fs::create_dir_all(&dst_path)
-                .map_err(|e| ctx_err(e, format!("mkdir {}", dst_path.display())))?;
-            copy_recursive(&path, &dst_path)?;
-        } else if file_type.is_file() {
-            fs::copy(&path, &dst_path).map_err(|e| {
-                ctx_err(
-                    e,
-                    format!("copy {} -> {}", path.display(), dst_path.display()),
-                )
-            })?;
+    if let Some(marker) = parent_marker {
+        let copied = ownership::marker_for_finalized_payload(&staged, marker)?;
+        if &copied != marker {
+            return Err(Error::invalid_marker(
+                "macOS profile copy changed the parent-selected CDM payload",
+            ));
+        }
+        ownership::write_marker(&staged, marker)?;
+        let installed = ownership::validate_installed_cdm(&staged)?;
+        if installed.marker() != marker {
+            return Err(Error::invalid_marker(
+                "macOS profile staging committed an unexpected ownership marker",
+            ));
         }
     }
+
+    if resolve_destination()? != destination {
+        return Err(Error::state_corrupted(
+            "macOS browser profile changed after target authorization",
+        ));
+    }
+    authorization.validate(destination)?;
+    let published_authorization = TargetAuthorization::capture(&staged)?;
+    crate::platform::atomic_rename(&staged, destination)?;
+    let exchanged = fs::symlink_metadata(&staged).is_ok();
+
+    let live_validation = authorization.validate(&staged).and_then(|()| {
+        validate_published_component(
+            component_root,
+            destination,
+            parent_marker,
+            &resolve_destination,
+        )
+    });
+    if let Err(verify_error) = live_validation {
+        let rollback = published_authorization
+            .validate(destination)
+            .and_then(|()| {
+                if exchanged {
+                    authorization.validate(&staged)?;
+                    crate::platform::atomic_rename(&staged, destination)
+                } else {
+                    crate::platform::atomic_rename(destination, &staged)
+                }
+            })
+            .and_then(|()| authorization.validate(destination))
+            .and_then(|()| published_authorization.validate(&staged));
+        if let Err(rollback_error) = rollback {
+            let recovery = staging.keep();
+            return Err(Error::new(
+                verify_error.category,
+                format!(
+                    "{}; rollback also failed and transaction state was preserved at {}",
+                    verify_error.message,
+                    recovery.display()
+                ),
+            )
+            .with_source(rollback_error));
+        }
+        if let Err(cleanup_error) = super::close_authorized_staging(
+            staging,
+            &staged,
+            &published_authorization,
+            component_root,
+        ) {
+            let category = verify_error.category;
+            let message = format!("{}; {}", verify_error.message, cleanup_error.message);
+            return Err(Error::new(category, message).with_source(cleanup_error));
+        }
+        return Err(verify_error);
+    }
+
+    super::close_authorized_staging(staging, &staged, authorization, component_root)?;
     Ok(())
 }
 
-const fn cdm_platform_dir() -> &'static str {
-    if cfg!(target_arch = "aarch64") {
-        "mac_arm64"
-    } else {
-        "mac_x64"
-    }
-}
-
-fn cdm_library_path(layout: &BundleLayout) -> PathBuf {
-    let platform = cdm_platform_dir();
-    layout
-        .cdm_target
-        .join("_platform_specific")
-        .join(platform)
-        .join("libwidevinecdm.dylib")
-}
-
-fn verify_cdm_at(layout: &BundleLayout) -> Result<()> {
-    let chosen = cdm_library_path(layout);
-    let meta = fs::metadata(&chosen).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            Error::unknown_bundle_structure(format!(
-                "post-patch verify: missing {}",
-                chosen.display()
-            ))
-            .with_source(error)
-        } else {
+fn copy_recursive(source: &Path, destination: &Path) -> Result<()> {
+    for entry in fs::read_dir(source)
+        .map_err(|error| ctx_err(error, format!("could not read {}", source.display())))?
+    {
+        let entry = entry.map_err(|error| {
             ctx_err(
                 error,
-                format!("post-patch verify: stat {}", chosen.display()),
+                format!("could not inspect entry in {}", source.display()),
             )
+        })?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type().map_err(|error| {
+            ctx_err(
+                error,
+                format!("could not inspect {}", source_path.display()),
+            )
+        })?;
+        if file_type.is_dir() {
+            fs::create_dir(&destination_path).map_err(|error| {
+                ctx_err(
+                    error,
+                    format!("could not create {}", destination_path.display()),
+                )
+            })?;
+            copy_recursive(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &destination_path).map_err(|error| {
+                ctx_err(
+                    error,
+                    format!(
+                        "could not copy {} to {}",
+                        source_path.display(),
+                        destination_path.display()
+                    ),
+                )
+            })?;
+        } else {
+            return Err(Error::unknown_bundle_structure(format!(
+                "cached Widevine payload contains a non-regular entry: {}",
+                source_path.display()
+            )));
         }
+    }
+    Ok(())
+}
+
+fn verify_payload_at(version_root: &Path) -> Result<()> {
+    checked_directory(version_root, "Widevine version directory")?;
+    let manifest = version_root.join("manifest.json");
+    checked_nonempty_regular_file(&manifest, "Widevine manifest")?;
+    let library = version_root
+        .join(PLATFORM_SPECIFIC_DIRECTORY)
+        .join(platform_directory(mac_platform()))
+        .join(platform_library(mac_platform()));
+    checked_nonempty_regular_file(&library, "Widevine library")
+}
+
+fn checked_nonempty_regular_file(path: &Path, label: &str) -> Result<()> {
+    checked_regular_file(path, label)?;
+    let metadata = fs::metadata(path).map_err(|error| {
+        ctx_err(
+            error,
+            format!("could not inspect {label} {}", path.display()),
+        )
     })?;
-    if !meta.is_file() || meta.len() == 0 {
+    if metadata.len() == 0 {
         return Err(Error::unknown_bundle_structure(format!(
-            "post-patch verify: {} is missing, empty, or not a regular file",
-            chosen.display()
+            "{label} is empty: {}",
+            path.display()
         )));
     }
     Ok(())
 }
 
-/// Clear extended attributes recursively on the bundle.
-///
-/// Honors `SILVERVINE_TEST_PATCH_NOOP=1` for tests that don't have `xattr`
-/// available.
-fn run_xattr_clear(bundle: &Path) -> Result<()> {
-    if std::env::var_os("SILVERVINE_TEST_PATCH_NOOP").is_some() {
-        return Ok(());
+#[cfg(not(test))]
+const fn mac_platform() -> Platform {
+    #[cfg(target_arch = "aarch64")]
+    {
+        Platform::DarwinAarch64
     }
-    let bundle_str = bundle
-        .to_str()
-        .ok_or_else(|| Error::other(format!("bundle path not UTF-8: {}", bundle.display())))?;
-    let output = Command::new("xattr")
-        .args(["-cr", bundle_str])
-        .output()
-        .map_err(|e| ctx_err(e, "spawn xattr".into()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::other(format!(
-            "xattr -cr {} failed (exit {:?}): {}",
-            bundle_str,
-            output.status.code(),
-            stderr.trim()
-        )));
-    }
-    Ok(())
-}
-
-/// Ad-hoc sign one code object without recursively re-signing nested code.
-///
-/// Honors `SILVERVINE_TEST_PATCH_NOOP=1`.
-fn run_codesign_adhoc(bundle: &Path) -> Result<()> {
-    if std::env::var_os("SILVERVINE_TEST_PATCH_NOOP").is_some() {
-        return Ok(());
-    }
-    let path_str = bundle
-        .to_str()
-        .ok_or_else(|| Error::other(format!("code path not UTF-8: {}", bundle.display())))?;
-    let output = Command::new("codesign")
-        .args(["--force", "-s", "-", path_str])
-        .output()
-        .map_err(|e| ctx_err(e, "spawn codesign".into()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::other(format!(
-            "codesign --force -s - {} failed (exit {:?}): {}",
-            path_str,
-            output.status.code(),
-            stderr.trim()
-        )));
-    }
-    Ok(())
-}
-
-fn read_browser_version_at(target: &Path) -> Option<String> {
-    // Read CFBundleShortVersionString from Contents/Info.plist.
-    let plist = target.join("Contents/Info.plist");
-    let text = fs::read_to_string(&plist).ok()?;
-    parse_cfbundle_short_version_string(&text)
-}
-
-/// Parse `CFBundleShortVersionString` out of an Info.plist XML. The plist
-/// crate would be a heavier dependency than necessary for one key; we
-/// just look for the canonical XML fragment.
-fn parse_cfbundle_short_version_string(plist: &str) -> Option<String> {
-    let key = "<key>CFBundleShortVersionString</key>";
-    let key_idx = plist.find(key)?;
-    let after_key = &plist[key_idx + key.len()..];
-    // Find the next `<string>...</string>`.
-    let open = after_key.find("<string>")?;
-    let after_open = &after_key[open + "<string>".len()..];
-    let close = after_open.find("</string>")?;
-    let value = after_open[..close].trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        Platform::DarwinX86_64
     }
 }
 
-fn ctx_err(io_err: std::io::Error, ctx: String) -> Error {
-    let mut err = Error::from(io_err);
-    if err.message.is_empty() {
-        err.message = ctx;
-    } else {
-        err.message = format!("{ctx}: {}", err.message);
+#[cfg(test)]
+fn mac_platform() -> Platform {
+    crate::widevine::current_platform_key().expect("test host platform")
+}
+
+fn read_info_plist(application: &Path) -> Result<plist::Dictionary> {
+    let path = application.join("Contents").join("Info.plist");
+    let value = plist::Value::from_file(&path).map_err(|error| {
+        Error::unknown_bundle_structure(format!(
+            "could not parse browser metadata {}: {error}",
+            path.display()
+        ))
+    })?;
+    match value {
+        plist::Value::Dictionary(dictionary) => Ok(dictionary),
+        _ => Err(Error::unknown_bundle_structure(format!(
+            "browser metadata is not a property-list dictionary: {}",
+            path.display()
+        ))),
     }
-    err
+}
+
+fn plist_dictionary_string<'a>(dictionary: &'a plist::Dictionary, key: &str) -> Option<&'a str> {
+    dictionary
+        .get(key)?
+        .as_string()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+pub(crate) fn read_info_plist_string(application: &Path, key: &str) -> Result<Option<String>> {
+    let dictionary = read_info_plist(application)?;
+    Ok(plist_dictionary_string(&dictionary, key).map(str::to_owned))
+}
+
+fn read_browser_version_at(application: &Path) -> Option<String> {
+    read_info_plist_string(application, "CFBundleShortVersionString")
+        .ok()
+        .flatten()
+}
+
+fn ctx_err(error: std::io::Error, context: String) -> Error {
+    Error::from(error).with_context(context)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink;
+
     use tempfile::TempDir;
 
-    /// Build a synthesized `.app` bundle layout under `root` and return
-    /// the bundle path.
-    fn make_app_bundle(root: &Path, app_name: &str, framework: &str, version: &str) -> PathBuf {
-        let app = root.join(format!("{app_name}.app"));
-        let frameworks = app.join("Contents").join("Frameworks");
-        let fw_dir = frameworks.join(format!("{framework}.framework"));
-        let versions = fw_dir.join("Versions");
-        let v = versions.join(version);
-        let libs = v.join("Libraries");
-        fs::create_dir_all(&libs).unwrap();
-        // Optional: a Versions/Current symlink that points at <version>
-        #[cfg(unix)]
-        {
-            // We'd normally make Current → <version>; some tests exercise
-            // the no-symlink path instead, so the helper writes it
-            // unconditionally and tests can `remove_file` it.
-            let _ = symlink(version, versions.join("Current"));
-        }
-        // Info.plist with a CFBundleShortVersionString.
+    use super::*;
+    use crate::widevine::cache::CachedCdm;
+
+    fn make_application(root: &Path, name: &str, identifier: &str) -> PathBuf {
+        let application = root.join(format!("{name}.app"));
+        let contents = application.join("Contents");
+        fs::create_dir_all(&contents).expect("application contents");
         fs::write(
-            app.join("Contents/Info.plist"),
+            contents.join("Info.plist"),
             format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>CFBundleShortVersionString</key>
-<string>{version}</string>
-</dict></plist>
-"#
+                "<plist><dict><key>CFBundleIdentifier</key><string>{identifier}</string><key>CFBundleShortVersionString</key><string>150.0.7871.186</string></dict></plist>"
             ),
         )
-        .unwrap();
-        app
+        .expect("Info.plist");
+        fs::write(contents.join("vendor-signature-sentinel"), b"unchanged")
+            .expect("signature sentinel");
+        application
     }
 
-    /// Build a fake CDM source matching `extract::extract_crx3` output.
-    fn make_cdm_source(root: &Path) -> PathBuf {
-        let dir = root.join("source");
-        let mac = dir.join("_platform_specific").join(cdm_platform_dir());
-        fs::create_dir_all(&mac).unwrap();
-        fs::write(mac.join("libwidevinecdm.dylib"), b"fake-mac-dylib").unwrap();
-        fs::write(dir.join("manifest.json"), br#"{"version":"4.10.0.0"}"#).unwrap();
-        dir
-    }
-
-    #[test]
-    fn resolve_bundle_layout_finds_framework_and_version() {
-        let tmp = TempDir::new().unwrap();
-        let app = make_app_bundle(tmp.path(), "Helium", "Helium Framework", "128.0.6613.119");
-        let layout = resolve_bundle_layout(&app).expect("layout ok");
-        assert_eq!(layout.bundle, app);
-        assert_eq!(layout.version, "128.0.6613.119");
-        assert!(layout.framework.ends_with("Helium Framework.framework"));
-        assert!(layout.cdm_target.ends_with("Libraries/WidevineCdm"));
-    }
-
-    #[test]
-    fn parent_resolves_exact_layout_for_privileged_handoff() {
-        let tmp = TempDir::new().unwrap();
-        let app = make_app_bundle(tmp.path(), "Custom", "Selected Framework", "1.0");
-        assert_eq!(
-            resolve_privileged_layout(&app, None).unwrap(),
-            ("Selected Framework".into(), "1.0".into())
-        );
-    }
-
-    #[test]
-    fn framework_name_rejects_path_traversal() {
-        let tmp = TempDir::new().unwrap();
-        let error = resolve_privileged_layout(tmp.path(), Some("../../Outside"))
-            .expect_err("path traversal must be rejected before bundle resolution");
-        assert!(error.to_string().contains("one path component"));
-    }
-
-    #[test]
-    fn pinned_layout_resolves_exact_parent_selection_without_scanning_versions() {
-        let tmp = TempDir::new().unwrap();
-        let app = make_app_bundle(tmp.path(), "Custom", "Wrong Framework", "1.0");
-        let exact =
-            app.join("Contents/Frameworks/Exact Framework.framework/Versions/2.0/Libraries");
-        fs::create_dir_all(&exact).unwrap();
-        fs::create_dir_all(
-            exact
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("3.0/Libraries"),
+    fn make_cached_payload(root: &Path, version: &str) -> CachedCdm {
+        let payload = root.join("payload");
+        let platform = payload
+            .join(PLATFORM_SPECIFIC_DIRECTORY)
+            .join(platform_directory(mac_platform()));
+        fs::create_dir_all(&platform).expect("platform directory");
+        fs::write(
+            payload.join("manifest.json"),
+            format!(r#"{{"name":"WidevineCdm","version":"{version}"}}"#),
         )
-        .unwrap();
-        let layout = resolve_bundle_layout_for(&app, Some("Exact Framework"), Some("2.0")).unwrap();
-        assert!(layout.framework.ends_with("Exact Framework.framework"));
-        assert_eq!(layout.version, "2.0");
-        assert!(resolve_bundle_layout_for(&app, Some("Missing Framework"), Some("2.0")).is_err());
+        .expect("manifest");
+        fs::write(
+            platform.join(platform_library(mac_platform())),
+            b"signed-dylib",
+        )
+        .expect("library");
+        let marker = ownership::marker_for_payload(&payload).expect("payload marker");
+        CachedCdm::from_verified_payload(
+            version.to_owned(),
+            payload,
+            marker.library_sha512,
+            marker.manifest_sha512,
+        )
+    }
+
+    fn write_test_payload(target: &Path, version: &str, library: &[u8]) {
+        let platform = target
+            .join(PLATFORM_SPECIFIC_DIRECTORY)
+            .join(platform_directory(mac_platform()));
+        fs::create_dir_all(&platform).expect("platform directory");
+        fs::write(
+            target.join("manifest.json"),
+            format!(r#"{{"name":"WidevineCdm","version":"{version}"}}"#),
+        )
+        .expect("manifest");
+        fs::write(platform.join(platform_library(mac_platform())), library).expect("library");
+    }
+
+    fn install_managed_component(target: &Path, cached: &CachedCdm) {
+        fs::create_dir_all(target).expect("component target");
+        copy_recursive(cached.cdm_dir(), target).expect("copy cached component");
+        let marker = ownership::marker_for_cached(cached).expect("managed marker");
+        ownership::write_marker(target, &marker).expect("write managed marker");
     }
 
     #[test]
-    fn framework_symlink_is_rejected() {
-        let tmp = TempDir::new().unwrap();
-        let app = make_app_bundle(tmp.path(), "Custom", "Linked Framework", "1.0");
-        let framework = app.join("Contents/Frameworks/Linked Framework.framework");
-        let outside = tmp.path().join("outside.framework");
-        fs::create_dir_all(outside.join("Versions/1.0/Libraries")).unwrap();
-        fs::remove_dir_all(&framework).unwrap();
-        symlink(&outside, &framework).unwrap();
-        assert!(resolve_privileged_layout(&app, Some("Linked Framework")).is_err());
-    }
+    fn helium_candidate_target_is_versioned_profile_component() {
+        let tmp = TempDir::new().expect("tempdir");
+        let application = make_application(tmp.path(), "Helium", "net.imput.helium");
+        let support = tmp.path().join("Library/Application Support");
+        fs::create_dir_all(&support).expect("application support");
+        let patcher = MacosPatcher::for_application_support(support.clone());
 
-    #[test]
-    fn absolute_and_escaping_current_symlinks_are_rejected() {
-        let tmp = TempDir::new().unwrap();
-        let app = make_app_bundle(tmp.path(), "Custom", "Selected Framework", "1.0");
-        let versions = app.join("Contents/Frameworks/Selected Framework.framework/Versions");
-        let current = versions.join("Current");
-        let outside = tmp.path().join("outside-version");
-        fs::create_dir_all(outside.join("Libraries")).unwrap();
-        fs::remove_file(&current).unwrap();
-        symlink(&outside, &current).unwrap();
-        assert!(resolve_privileged_layout(&app, None).is_err());
+        let target = patcher
+            .cdm_target_for_candidate(&application, "4.10.3050.0")
+            .expect("profile target");
 
-        fs::remove_file(&current).unwrap();
-        symlink("../../../../../../outside-version", &current).unwrap();
-        assert!(resolve_privileged_layout(&app, None).is_err());
-    }
-
-    #[test]
-    fn resolve_bundle_layout_handles_missing_current_symlink() {
-        let tmp = TempDir::new().unwrap();
-        let app = make_app_bundle(tmp.path(), "Helium", "Helium Framework", "128.0.6613.119");
-        let versions = app.join("Contents/Frameworks/Helium Framework.framework/Versions");
-        let _ = fs::remove_file(versions.join("Current"));
-        let layout = resolve_bundle_layout(&app).expect("ok without Current");
-        assert_eq!(layout.version, "128.0.6613.119");
-    }
-
-    #[test]
-    fn resolve_bundle_layout_errors_when_frameworks_missing() {
-        let tmp = TempDir::new().unwrap();
-        let app = tmp.path().join("Empty.app");
-        fs::create_dir_all(app.join("Contents")).unwrap();
-        let r = resolve_bundle_layout(&app);
-        assert!(r.is_err());
         assert_eq!(
-            r.unwrap_err().category,
-            crate::ErrorCategory::UnknownBundleStructure
+            target,
+            support
+                .join("net.imput.helium")
+                .join("WidevineCdm")
+                .join("4.10.3050.0")
         );
     }
 
     #[test]
-    fn resolve_bundle_layout_errors_when_versions_missing() {
-        let tmp = TempDir::new().unwrap();
-        let app = tmp.path().join("X.app");
-        fs::create_dir_all(app.join("Contents/Frameworks/X.framework")).unwrap();
-        let r = resolve_bundle_layout(&app);
-        assert!(r.is_err());
+    fn managed_write_installs_profile_component_without_touching_application() {
+        let tmp = TempDir::new().expect("tempdir");
+        let application = make_application(tmp.path(), "Helium", "net.imput.helium");
+        let support = tmp.path().join("Library/Application Support");
+        fs::create_dir_all(&support).expect("application support");
+        let patcher = MacosPatcher::for_application_support(support.clone());
+        let cached = make_cached_payload(tmp.path(), "4.10.3050.0");
+        let marker = ownership::marker_for_cached(&cached).expect("candidate marker");
+        let installed = support.join("net.imput.helium/WidevineCdm/4.10.3050.0");
+
+        let outcome = patcher
+            .write_managed_cdm(&application, &installed, cached.cdm_dir(), &marker)
+            .expect("profile write");
+
+        assert_eq!(outcome, ManagedWrite::MarkerCommitted);
+        assert_eq!(
+            ownership::validate_installed_cdm(&installed)
+                .expect("installed marker")
+                .marker(),
+            &marker
+        );
+        assert_eq!(
+            fs::read(application.join("Contents/vendor-signature-sentinel"))
+                .expect("application sentinel"),
+            b"unchanged"
+        );
+        assert!(!application.join("Contents/Frameworks/WidevineCdm").exists());
     }
 
     #[test]
-    fn write_cdm_writes_into_versions_libraries() {
-        let tmp = TempDir::new().unwrap();
-        let app = make_app_bundle(tmp.path(), "Thorium", "Thorium Framework", "128.0.6613.119");
-        let cdm = make_cdm_source(tmp.path());
-        // SAFETY: env var mutation in serial test thread.
-        let _guard = crate::test_support::env_lock();
-        unsafe { std::env::set_var("SILVERVINE_TEST_PATCH_NOOP", "1") };
-        let p = MacosPatcher::new();
-        p.write_cdm(&app, &cdm).expect("write ok");
-        unsafe { std::env::remove_var("SILVERVINE_TEST_PATCH_NOOP") };
+    fn managed_write_preserves_target_created_after_authorization() {
+        let tmp = TempDir::new().expect("tempdir");
+        let application = make_application(tmp.path(), "Helium", "net.imput.helium");
+        let support = tmp.path().join("Library/Application Support");
+        fs::create_dir_all(&support).expect("application support");
+        let patcher = MacosPatcher::for_application_support(support.clone());
+        let cached = make_cached_payload(tmp.path(), "4.10.3050.0");
+        let marker = ownership::marker_for_cached(&cached).expect("candidate marker");
+        let installed = support.join("net.imput.helium/WidevineCdm/4.10.3050.0");
+        let authorization =
+            crate::patch::TargetAuthorization::capture(&installed).expect("missing target");
+        fs::create_dir_all(&installed).expect("concurrent external target");
+        fs::write(installed.join("external-sentinel"), b"preserve").expect("external sentinel");
 
-        let layout = resolve_bundle_layout(&app).unwrap();
-        let dylib = cdm_library_path(&layout);
-        assert!(dylib.exists());
-        assert_eq!(fs::read(&dylib).unwrap(), b"fake-mac-dylib");
+        let error = patcher
+            .write_authorized_managed_cdm(
+                &application,
+                &installed,
+                cached.cdm_dir(),
+                &marker,
+                &authorization,
+            )
+            .expect_err("a target created after authorization must be preserved");
+
+        assert_eq!(error.category, crate::ErrorCategory::StateCorrupted);
+        assert_eq!(
+            fs::read(installed.join("external-sentinel")).expect("preserved external target"),
+            b"preserve"
+        );
+        assert!(!installed.join(ownership::MANAGED_MARKER_FILENAME).exists());
     }
-
     #[test]
-    fn write_cdm_clobbers_existing_widevine_cdm_directory() {
-        let tmp = TempDir::new().unwrap();
-        let app = make_app_bundle(tmp.path(), "Helium", "Helium Framework", "1.0.0.0");
-        let cdm = make_cdm_source(tmp.path());
-        // Pre-populate WidevineCdm with a stale file.
-        let layout = resolve_bundle_layout(&app).unwrap();
-        fs::create_dir_all(&layout.cdm_target).unwrap();
-        fs::write(layout.cdm_target.join("stale.txt"), b"old").unwrap();
+    fn patch_preserves_higher_active_external_component() {
+        let tmp = TempDir::new().expect("tempdir");
+        let application = make_application(tmp.path(), "Helium", "net.imput.helium");
+        let support = tmp.path().join("Library/Application Support");
+        let component_root = support.join("net.imput.helium/WidevineCdm");
+        fs::create_dir_all(&component_root).expect("component root");
+        let active = component_root.join("4.10.4000.0");
+        write_test_payload(&active, "4.10.4000.0", b"external-dylib");
+        let candidate = make_cached_payload(&tmp.path().join("candidate"), "4.10.3050.0");
+        let candidate_target = component_root.join(candidate.version());
+        let patcher = MacosPatcher::for_application_support(support);
+        let browser = crate::browsers::Browser {
+            name: "Helium".into(),
+            install_path: application,
+            kind: crate::browsers::BrowserKind::Known,
+        };
 
-        let _guard = crate::test_support::env_lock();
-        unsafe { std::env::set_var("SILVERVINE_TEST_PATCH_NOOP", "1") };
-        let p = MacosPatcher::new();
-        p.write_cdm(&app, &cdm).expect("write ok");
-        unsafe { std::env::remove_var("SILVERVINE_TEST_PATCH_NOOP") };
-
-        assert!(!layout.cdm_target.join("stale.txt").exists());
-        assert!(layout.cdm_target.join("manifest.json").exists());
-    }
-
-    #[test]
-    fn staged_bundle_failure_preserves_live_application() {
-        let tmp = TempDir::new().unwrap();
-        let app = make_app_bundle(tmp.path(), "Helium", "Helium Framework", "1.0.0.0");
-        fs::write(app.join("live-marker"), b"original").unwrap();
-
-        let _guard = crate::test_support::env_lock();
-        unsafe { std::env::set_var("SILVERVINE_TEST_PATCH_NOOP", "1") };
-        let result: Result<()> = replace_bundle_transactionally(
-            &app,
-            |staged| {
-                fs::write(staged.join("live-marker"), b"modified").unwrap();
-                Err(Error::other("injected bundle staging failure"))
+        let error = crate::patch::patch_browser(
+            &browser,
+            &candidate,
+            &patcher,
+            &crate::patch::PatchOptions {
+                force_while_running: true,
+                lock_path: Some(tmp.path().join("patch.lock")),
+                ..Default::default()
             },
-            |_, ()| Ok(()),
-        );
-        unsafe { std::env::remove_var("SILVERVINE_TEST_PATCH_NOOP") };
+        )
+        .expect_err("active external component must be preserved");
 
-        assert!(result.is_err());
-        assert_eq!(fs::read(app.join("live-marker")).unwrap(), b"original");
+        assert_eq!(error.category, crate::ErrorCategory::ExternalCdm);
+        assert!(!candidate_target.exists());
+        assert!(active.exists());
     }
 
     #[test]
-    fn live_validation_failure_restores_retired_application() {
-        let tmp = TempDir::new().unwrap();
-        let app = make_app_bundle(tmp.path(), "Helium", "Helium Framework", "1.0.0.0");
-        fs::write(app.join("live-marker"), b"original").unwrap();
+    fn patch_rolls_back_candidate_that_cannot_become_active() {
+        let tmp = TempDir::new().expect("tempdir");
+        let application = make_application(tmp.path(), "Helium", "net.imput.helium");
+        let support = tmp.path().join("Library/Application Support");
+        let component_root = support.join("net.imput.helium/WidevineCdm");
+        let active_cache = make_cached_payload(&tmp.path().join("active"), "4.10.4000.0");
+        let active = component_root.join(active_cache.version());
+        install_managed_component(&active, &active_cache);
+        let candidate = make_cached_payload(&tmp.path().join("candidate"), "4.10.3050.0");
+        let candidate_target = component_root.join(candidate.version());
+        let patcher = MacosPatcher::for_application_support(support);
+        let browser = crate::browsers::Browser {
+            name: "Helium".into(),
+            install_path: application,
+            kind: crate::browsers::BrowserKind::Known,
+        };
 
-        let _guard = crate::test_support::env_lock();
-        unsafe { std::env::set_var("SILVERVINE_TEST_PATCH_NOOP", "1") };
-        let result = replace_bundle_transactionally(
-            &app,
-            |staged| {
-                fs::write(staged.join("live-marker"), b"modified").unwrap();
-                Ok(())
+        let error = crate::patch::patch_browser(
+            &browser,
+            &candidate,
+            &patcher,
+            &crate::patch::PatchOptions {
+                force_while_running: true,
+                lock_path: Some(tmp.path().join("patch.lock")),
+                ..Default::default()
             },
-            |_, ()| Err(Error::invalid_marker("injected live validation failure")),
-        );
-        unsafe { std::env::remove_var("SILVERVINE_TEST_PATCH_NOOP") };
+        )
+        .expect_err("an inactive candidate must not report success");
 
-        assert!(result.is_err());
-        assert_eq!(fs::read(app.join("live-marker")).unwrap(), b"original");
+        assert!(error.message.contains("active"));
+        assert!(!candidate_target.exists());
+        assert!(ownership::validate_installed_cdm(&active).is_ok());
     }
 
     #[test]
-    fn verify_post_patch_passes_after_write() {
-        let tmp = TempDir::new().unwrap();
-        let app = make_app_bundle(tmp.path(), "Helium", "Helium Framework", "1.0.0.0");
-        let cdm = make_cdm_source(tmp.path());
-        let _guard = crate::test_support::env_lock();
-        unsafe { std::env::set_var("SILVERVINE_TEST_PATCH_NOOP", "1") };
-        let p = MacosPatcher::new();
-        p.write_cdm(&app, &cdm).unwrap();
-        p.verify_post_patch(&app).expect("verify ok");
-        unsafe { std::env::remove_var("SILVERVINE_TEST_PATCH_NOOP") };
+    fn managed_write_rejects_profile_change_after_target_authorization() {
+        let tmp = TempDir::new().expect("tempdir");
+        let application = make_application(tmp.path(), "Helium", "net.imput.helium");
+        let support = tmp.path().join("Library/Application Support");
+        fs::create_dir_all(&support).expect("application support");
+        let patcher = MacosPatcher::for_application_support(support.clone());
+        let cached = make_cached_payload(&tmp.path().join("candidate"), "4.10.3050.0");
+        let marker = ownership::marker_for_cached(&cached).expect("candidate marker");
+        let authorized = patcher
+            .cdm_target_for_candidate(&application, cached.version())
+            .expect("authorized target");
+        fs::write(
+            application.join("Contents/Info.plist"),
+            "<plist><dict><key>CFBundleIdentifier</key><string>org.chromium.Thorium</string></dict></plist>",
+        )
+        .expect("changed Info.plist");
+
+        let error = patcher
+            .write_managed_cdm(&application, &authorized, cached.cdm_dir(), &marker)
+            .expect_err("profile remapping must invalidate the authorized target");
+
+        assert!(error.message.contains("profile"));
+        assert!(!authorized.exists());
+        assert!(!support
+            .join("Thorium/WidevineCdm")
+            .join(cached.version())
+            .exists());
     }
 
     #[test]
-    fn write_access_root_is_bundle_parent() {
-        let tmp = TempDir::new().unwrap();
-        let app = tmp.path().join("Helium.app");
-        let patcher = MacosPatcher::new();
+    fn current_target_uses_highest_numeric_component_version() {
+        let tmp = TempDir::new().expect("tempdir");
+        let application = make_application(tmp.path(), "Helium", "net.imput.helium");
+        let support = tmp.path().join("Library/Application Support");
+        let root = support.join("net.imput.helium/WidevineCdm");
+        fs::create_dir_all(root.join("4.10.999.0")).expect("old version");
+        fs::create_dir_all(root.join("4.10.3050.0")).expect("new version");
+        let patcher = MacosPatcher::for_application_support(support);
 
-        assert_eq!(patcher.write_access_root(&app), tmp.path());
-    }
-
-    #[test]
-    fn verify_post_patch_fails_when_dylib_missing() {
-        let tmp = TempDir::new().unwrap();
-        let app = make_app_bundle(tmp.path(), "Helium", "Helium Framework", "1.0.0.0");
-        let p = MacosPatcher::new();
-        let r = p.verify_post_patch(&app);
-        assert!(r.is_err());
         assert_eq!(
-            r.unwrap_err().category,
-            crate::ErrorCategory::UnknownBundleStructure
+            patcher.cdm_target(&application).expect("target"),
+            root.join("4.10.3050.0")
         );
     }
 
     #[test]
-    fn read_browser_version_parses_cfbundle_short_version_string() {
-        let tmp = TempDir::new().unwrap();
-        let app = make_app_bundle(tmp.path(), "Helium", "Helium Framework", "128.0.6613.119");
-        let p = MacosPatcher::new();
-        let v = p.read_browser_version(&app);
-        assert_eq!(v.as_deref(), Some("128.0.6613.119"));
-    }
+    fn empty_component_root_classifies_as_missing() {
+        let tmp = TempDir::new().expect("tempdir");
+        let application = make_application(tmp.path(), "Helium", "net.imput.helium");
+        let support = tmp.path().join("Library/Application Support");
+        let root = support.join("net.imput.helium/WidevineCdm");
+        fs::create_dir_all(&root).expect("empty component root");
+        let patcher = MacosPatcher::for_application_support(support);
+        let target = patcher.cdm_target(&application).expect("target");
+        let browser = crate::browsers::Browser {
+            name: "Helium".into(),
+            install_path: application,
+            kind: crate::browsers::BrowserKind::Known,
+        };
 
-    #[test]
-    fn read_browser_version_returns_none_when_plist_missing() {
-        let tmp = TempDir::new().unwrap();
-        let p = MacosPatcher::new();
-        let v = p.read_browser_version(&tmp.path().join("nope.app"));
-        assert!(v.is_none());
-    }
-
-    #[test]
-    fn parse_cfbundle_short_version_string_handles_multiline_xml() {
-        let plist = r"
-            <key>CFBundleName</key>
-            <string>Helium</string>
-            <key>CFBundleShortVersionString</key>
-            <string>128.0.6613.119</string>
-            <key>CFBundleVersion</key>
-            <string>128.0.6613.119</string>
-        ";
+        assert_eq!(target, root.join(ABSENT_COMPONENT_TARGET));
         assert_eq!(
-            parse_cfbundle_short_version_string(plist).as_deref(),
-            Some("128.0.6613.119")
+            ownership::classify_without_candidate(&browser, &target)
+                .expect("ownership")
+                .kind,
+            crate::widevine::ownership::OwnershipKind::Missing
         );
-    }
-
-    #[test]
-    fn parse_cfbundle_short_version_string_returns_none_when_absent() {
-        let plist = "<plist><dict></dict></plist>";
-        assert_eq!(parse_cfbundle_short_version_string(plist), None);
-    }
-
-    #[test]
-    fn write_cdm_errors_when_source_missing() {
-        let tmp = TempDir::new().unwrap();
-        let app = make_app_bundle(tmp.path(), "Helium", "Helium Framework", "1.0.0.0");
-        let _guard = crate::test_support::env_lock();
-        unsafe { std::env::set_var("SILVERVINE_TEST_PATCH_NOOP", "1") };
-        let p = MacosPatcher::new();
-        let r = p.write_cdm(&app, &tmp.path().join("nope"));
-        unsafe { std::env::remove_var("SILVERVINE_TEST_PATCH_NOOP") };
-        assert!(r.is_err());
         assert_eq!(
-            r.unwrap_err().category,
-            crate::ErrorCategory::UnknownBundleStructure
+            crate::daemon::select_patch_action(&browser, None, false, &target),
+            crate::daemon::PatchSelection::Patch
         );
     }
 
-    /// `resolve_bundle_layout` errors if multiple non-symlink version
-    /// directories exist and there's no `Current` symlink to disambiguate.
     #[test]
-    fn resolve_bundle_layout_errors_on_ambiguous_versions() {
-        let tmp = TempDir::new().unwrap();
-        let app = make_app_bundle(tmp.path(), "X", "X Framework", "1.0.0.0");
-        // Add a second versioned directory and remove the Current symlink.
-        let versions = app.join("Contents/Frameworks/X Framework.framework/Versions");
-        fs::create_dir_all(versions.join("2.0.0.0")).unwrap();
-        let _ = fs::remove_file(versions.join("Current"));
-        let r = resolve_bundle_layout(&app);
-        assert!(r.is_err());
+    fn helium_profile_mapping_keeps_diagnostics_fallback_after_canonical_root() {
+        assert_eq!(
+            profile_support_suffixes("helium"),
+            &["net.imput.helium", "Helium"]
+        );
     }
 
     #[test]
-    fn run_xattr_clear_short_circuits_in_test_mode() {
-        let _guard = crate::test_support::env_lock();
-        unsafe { std::env::set_var("SILVERVINE_TEST_PATCH_NOOP", "1") };
-        let r = run_xattr_clear(std::path::Path::new("/Applications/whatever"));
-        assert!(r.is_ok());
-        unsafe { std::env::remove_var("SILVERVINE_TEST_PATCH_NOOP") };
+    fn write_access_root_is_application_support_not_application_parent() {
+        let tmp = TempDir::new().expect("tempdir");
+        let support = tmp.path().join("Library/Application Support");
+        fs::create_dir_all(&support).expect("application support");
+        let patcher = MacosPatcher::for_application_support(support.clone());
+
+        assert_eq!(
+            patcher
+                .write_access_root(Path::new("/Applications/Helium.app"))
+                .expect("write root"),
+            support
+        );
+        assert!(!patcher.supports_elevation());
     }
 
     #[test]
-    fn run_codesign_adhoc_short_circuits_in_test_mode() {
-        let _guard = crate::test_support::env_lock();
-        unsafe { std::env::set_var("SILVERVINE_TEST_PATCH_NOOP", "1") };
-        let r = run_codesign_adhoc(std::path::Path::new("/Applications/whatever"));
-        assert!(r.is_ok());
-        unsafe { std::env::remove_var("SILVERVINE_TEST_PATCH_NOOP") };
+    fn read_browser_version_parses_info_plist() {
+        let tmp = TempDir::new().expect("tempdir");
+        let application = make_application(tmp.path(), "Helium", "net.imput.helium");
+        let patcher = MacosPatcher::for_application_support(tmp.path().to_path_buf());
+
+        assert_eq!(
+            patcher.read_browser_version(&application).as_deref(),
+            Some("150.0.7871.186")
+        );
+    }
+
+    #[test]
+    fn binary_info_plist_resolves_profile_and_browser_version() {
+        let tmp = TempDir::new().expect("tempdir");
+        let application = make_application(tmp.path(), "Helium", "net.imput.helium");
+        let mut dictionary = plist::Dictionary::new();
+        dictionary.insert(
+            "CFBundleIdentifier".into(),
+            plist::Value::String("net.imput.helium".into()),
+        );
+        dictionary.insert(
+            "CFBundleShortVersionString".into(),
+            plist::Value::String("150.0.7871.186".into()),
+        );
+        plist::Value::Dictionary(dictionary)
+            .to_file_binary(application.join("Contents/Info.plist"))
+            .expect("binary Info.plist");
+        let support = tmp.path().join("Library/Application Support");
+        fs::create_dir_all(&support).expect("application support");
+        let patcher = MacosPatcher::for_application_support(support.clone());
+
+        assert_eq!(
+            patcher
+                .cdm_target_for_candidate(&application, "4.10.3050.0")
+                .expect("binary plist target"),
+            support.join("net.imput.helium/WidevineCdm/4.10.3050.0")
+        );
+        assert_eq!(
+            patcher.read_browser_version(&application).as_deref(),
+            Some("150.0.7871.186")
+        );
+    }
+
+    #[test]
+    fn explicit_product_directory_precedes_chromium_bundle_heuristic() {
+        let tmp = TempDir::new().expect("tempdir");
+        let application = make_application(tmp.path(), "Customium", "org.chromium.Customium");
+        fs::write(
+            application.join("Contents/Info.plist"),
+            "<plist><dict>\
+             <key>CFBundleIdentifier</key><string>org.chromium.Customium</string>\
+             <key>CrProductDirName</key><string>Customium Data</string>\
+             </dict></plist>",
+        )
+        .expect("custom Info.plist");
+        let support = tmp.path().join("Library/Application Support");
+        fs::create_dir_all(&support).expect("application support");
+        let patcher = MacosPatcher::for_application_support(support.clone());
+
+        assert_eq!(
+            patcher
+                .cdm_target_for_candidate(&application, "4.10.3050.0")
+                .expect("custom profile target"),
+            support.join("Customium Data/WidevineCdm/4.10.3050.0")
+        );
+    }
+
+    #[test]
+    fn candidate_target_rejects_path_like_version() {
+        let tmp = TempDir::new().expect("tempdir");
+        let application = make_application(tmp.path(), "Helium", "net.imput.helium");
+        let patcher = MacosPatcher::for_application_support(tmp.path().to_path_buf());
+
+        let error = patcher
+            .cdm_target_for_candidate(&application, "../escape")
+            .expect_err("path-like version must fail");
+        assert_eq!(error.category, crate::ErrorCategory::UnknownBundleStructure);
+    }
+
+    #[test]
+    fn custom_browser_uses_declared_product_profile_directory() {
+        let tmp = TempDir::new().expect("tempdir");
+        let application = make_application(tmp.path(), "Customium", "org.example.customium");
+        fs::write(
+            application.join("Contents/Info.plist"),
+            "<plist><dict><key>CFBundleIdentifier</key><string>org.example.customium</string><key>CrProductDirName</key><string>Customium Data</string></dict></plist>",
+        )
+        .expect("custom Info.plist");
+        let support = tmp.path().join("Library/Application Support");
+        fs::create_dir_all(&support).expect("application support");
+        let patcher = MacosPatcher::for_application_support(support.clone());
+
+        assert_eq!(
+            patcher
+                .cdm_target_for_candidate(&application, "4.10.3050.0")
+                .expect("custom profile target"),
+            support.join("Customium Data/WidevineCdm/4.10.3050.0")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_target_rejects_symlinked_application() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let real = make_application(tmp.path(), "RealHelium", "net.imput.helium");
+        let linked = tmp.path().join("Helium.app");
+        symlink(real, &linked).expect("application symlink");
+        let patcher = MacosPatcher::for_application_support(tmp.path().to_path_buf());
+
+        assert!(patcher
+            .cdm_target_for_candidate(&linked, "4.10.3050.0")
+            .is_err());
     }
 }

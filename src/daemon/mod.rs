@@ -973,7 +973,6 @@ mod tests {
             name: name.into(),
             install_path: install,
             kind: BrowserKind::Detected,
-            framework_name: None,
         }
     }
 

@@ -106,13 +106,36 @@ pub fn build_diagnostics(
     tray: TrayAvailability,
     now: u64,
 ) -> Diagnostics {
+    build_diagnostics_with_patcher(
+        detected,
+        heartbeat_at,
+        current_cdm_version,
+        legacy_install_present,
+        tray,
+        now,
+        None,
+    )
+}
+
+fn build_diagnostics_with_patcher(
+    detected: &[crate::browsers::Browser],
+    heartbeat_at: Option<u64>,
+    current_cdm_version: Option<String>,
+    legacy_install_present: bool,
+    tray: TrayAvailability,
+    now: u64,
+    patcher: Option<&dyn crate::patch::PlatformPatcher>,
+) -> Diagnostics {
     let heartbeat_stale = match heartbeat_at {
         Some(ts) => now.saturating_sub(ts) > HEARTBEAT_STALE_AFTER_SECS,
         None => false,
     };
     let browsers_snapshot = detected
         .iter()
-        .map(crate::cli::status::BrowserStatus::from_browser)
+        .map(|browser| match patcher {
+            Some(patcher) => crate::cli::status::BrowserStatus::from_browser_with(browser, patcher),
+            None => crate::cli::status::BrowserStatus::from_browser(browser),
+        })
         .collect();
     Diagnostics {
         silvervine_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -686,13 +709,12 @@ mod tests {
             name: name.into(),
             install_path: install,
             kind: BrowserKind::Detected,
-            framework_name: None,
         }
     }
 
-    /// Build a fake patched browser whose `WidevineCdm/manifest.json`
-    /// reports the given CDM version. Used to exercise the doctor's
-    /// version-freshness rendering.
+    /// Build a fake browser with a flat `WidevineCdm/manifest.json` target
+    /// reporting the given CDM version. Tests inject the matching flat target
+    /// resolver into diagnostics.
     fn fake_patched_browser(name: &str, tmp: &TempDir, cdm_version: &str) -> Browser {
         let install = tmp.path().join(name);
         let cdm = install.join("WidevineCdm");
@@ -807,13 +829,14 @@ mod tests {
     fn build_diagnostics_populates_installed_cdm_version() {
         let tmp = TempDir::new().unwrap();
         let detected = vec![fake_patched_browser("Helium", &tmp, "4.10.2891.0")];
-        let d = build_diagnostics(
+        let d = build_diagnostics_with_patcher(
             &detected,
             None,
             Some("4.10.2934.0".into()),
             false,
             TrayAvailability::Available,
             0,
+            Some(&crate::test_support::FlatCdmPatcher),
         );
         assert_eq!(d.browsers[0].cdm_version.as_deref(), Some("4.10.2891.0"));
     }
@@ -824,13 +847,14 @@ mod tests {
     fn render_text_shows_cdm_version_when_patched() {
         let tmp = TempDir::new().unwrap();
         let detected = vec![fake_patched_browser("Helium", &tmp, "4.10.2934.0")];
-        let d = build_diagnostics(
+        let d = build_diagnostics_with_patcher(
             &detected,
             None,
             Some("4.10.2934.0".into()),
             false,
             TrayAvailability::Available,
             0,
+            Some(&crate::test_support::FlatCdmPatcher),
         );
         let mut buf = Vec::new();
         render_text(&d, &mut buf).unwrap();
@@ -848,13 +872,14 @@ mod tests {
     fn render_text_flags_stale_cdm() {
         let tmp = TempDir::new().unwrap();
         let detected = vec![fake_patched_browser("Helium", &tmp, "4.10.2891.0")];
-        let d = build_diagnostics(
+        let d = build_diagnostics_with_patcher(
             &detected,
             None,
             Some("4.10.2934.0".into()),
             false,
             TrayAvailability::Available,
             0,
+            Some(&crate::test_support::FlatCdmPatcher),
         );
         let mut buf = Vec::new();
         render_text(&d, &mut buf).unwrap();

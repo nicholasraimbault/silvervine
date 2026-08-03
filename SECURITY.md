@@ -37,9 +37,13 @@ In scope:
 
 - Code execution outside the user's session via a Silvervine-controlled file (configs, hooks, cache).
 - Privilege escalation paths that don't require a sudo prompt the user can refuse.
-- Bundle-write paths that can write outside the targeted browser bundle.
-- Network paths that fetch unauthenticated content and act on it (Widevine CDM bytes must match a freshly fetched HTTPS manifest's SHA-512 and a CRX3 signature from Silvervine's pinned Widevine component key).
-- Race conditions in the atomic-patch protocol that can leave a browser bundle destroyed.
+- CDM-publication paths that can escape the selected Linux browser root or
+  macOS user-profile component root.
+- Race conditions in the atomic-patch protocol that can leave the active CDM
+  target destroyed.
+- Network paths that fetch unauthenticated content and act on it (Widevine CDM
+  bytes must match a freshly fetched HTTPS manifest's SHA-512 and a CRX3
+  signature from Silvervine's pinned Widevine component key).
 - Lockfile / IPC race conditions that can be triggered by an unprivileged local user to interfere with the daemon.
 - Any default-on telemetry. Silvervine ships **no** telemetry or error-reporting endpoint; this should never change without an explicit major-version migration.
 
@@ -52,14 +56,29 @@ Out of scope:
 
 ## Scope: privilege model
 
-Silvervine V2 runs **entirely in the user session** — the daemon is a LaunchAgent (macOS) or systemd-user unit (Linux), not a root daemon. The CDM patches require write access to browser bundles in `/Applications` (macOS) or `/opt`, `/usr/lib/`, etc. (Linux), so the patch path itself escalates via:
+Silvervine V2 runs **entirely in the user session** — the daemon is a
+LaunchAgent (macOS) or systemd-user unit (Linux), not a root daemon.
 
-- `osascript -e "do shell script ... with administrator privileges"` on macOS — system password prompt.
-- `pkexec` (preferred) → `sudo` (fallback) on Linux — system password prompt.
+On macOS, Silvervine publishes Widevine under the current user's
+`~/Library/Application Support/<browser-id>/.../WidevineCdm/<version>/`
+component tree. The patcher explicitly disables elevation: it neither writes
+to `/Applications` nor modifies, clears attributes from, or re-signs the
+vendor application bundle. The Widevine library retains Google's signature,
+and the browser retains its vendor signature and entitlements.
 
-Both prompt the user. Both require user consent each time (Silvervine does not cache credentials). The escalated child runs only the hidden filesystem-only privileged patch operation — never discovery, configuration, network, cache, logging, migration, or hooks. Its auditable arguments carry the parent's exact browser path, bounded parent-authenticated CDM staging payload/version, trusted same-filesystem backup parent, browser display name, and force decision; on macOS they also carry the exact parent-selected framework and framework version.
+Linux system installations under `/opt`, `/usr/lib`, and similar roots may
+require elevation through `pkexec` (preferred) or `sudo` (fallback). Both
+require a system password prompt that the user can refuse; Silvervine does not
+cache credentials. The elevated child runs only the hidden filesystem-only
+privileged patch operation — never discovery, configuration, network, cache,
+logging, migration, or hooks. Its auditable arguments carry the parent's exact
+browser path, bounded parent-authenticated CDM staging payload and version,
+trusted same-filesystem backup parent, browser display name, and force
+decision.
 
-User-installed browsers in `~/Applications` (macOS) or `~/.local/...` (Linux) don't require escalation. Custom-path browsers configured in `~/.config/silvervine/config.toml` follow the path's actual permissions.
+User-owned Linux browser installations do not require elevation. A custom
+macOS bundle path is used only to validate the browser identity and derive its
+user-profile component directory.
 
 Executable CDM trust requires a fresh manifest from Silvervine's fixed
 Mozilla/GitHub HTTPS origins (or an explicit user-selected HTTPS source with no
@@ -76,7 +95,7 @@ snapshots are write-only. Archives are size-bounded, preflighted for entry
 count before ZIP parser allocation, opened without following symlinks, and
 extracted from the exact signature-verified bytes. Duplicate normalized
 outputs, special entries, and expansion-limit violations are rejected;
-colocated cache metadata alone never authorizes a privileged patch.
+colocated cache metadata alone never authorizes an elevated Linux patch.
 
 Silvervine ships **no telemetry or remote error-reporting endpoint**. The
 explicit `silvervine test` command POSTs its browser capability result only to
@@ -87,10 +106,6 @@ go through GitHub Issues only when the user chooses to share them.
 
 ## Known limitations
 
-- **macOS patches use ad-hoc signing.** Silvervine signs the CDM library,
-  containing framework, and application bundle inside-out. This restores a
-  coherent local signature after modification; it is not Developer ID
-  notarization by the browser vendor.
 - **No SBOM yet.** V2 ships a list of dependencies via `cargo metadata`;
   CycloneDX SBOM generation is queued for V2.2.
 - **No reproducible builds.** cargo-dist artifacts are deterministic-ish but not bit-reproducible. Working on it.
