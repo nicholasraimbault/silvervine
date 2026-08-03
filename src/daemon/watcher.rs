@@ -71,6 +71,7 @@ pub const DEFAULT_DEBOUNCE_MS: u64 = 2_000;
 /// How long the bundle's mtime must stay constant before we consider the
 /// browser "quit" (after a deferred-because-running event).
 pub const POST_QUIT_STABLE_S: u64 = 30;
+const DEFERRED_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// User callback signature. The watcher passes the affected [`Browser`].
 ///
@@ -173,6 +174,8 @@ struct DeferredState {
     last_check: Instant,
     /// First time we noticed this deferred path.
     first_seen: Instant,
+    /// Next time process state and bundle stability need rechecking.
+    poll_at: Instant,
 }
 
 /// Internal events passed to the dispatch thread.
@@ -404,9 +407,9 @@ fn interesting_event(kind: EventKind) -> bool {
     }
 }
 
-/// Dispatch loop body. Runs on the watcher's dedicated thread. A fixed
-/// receive deadline drives periodic work without a second ticker thread, and
-/// filesystem-event traffic cannot postpone that deadline.
+/// Dispatch loop body. Runs on the watcher's dedicated thread. It blocks
+/// indefinitely while idle and wakes only for filesystem events, shutdown, or
+/// the nearest debounce/deferred-poll deadline.
 fn run_dispatch(
     event_rx: &Receiver<WatcherEvent>,
     inner: &Arc<Mutex<WatcherState>>,
@@ -415,36 +418,62 @@ fn run_dispatch(
     running_source: &RunningSource,
     debounce: Duration,
 ) {
-    const TICK_INTERVAL: Duration = Duration::from_millis(500);
-    let mut next_tick = Instant::now() + TICK_INTERVAL;
-
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        let timeout = next_tick.saturating_duration_since(Instant::now());
-        match event_rx.recv_timeout(timeout) {
-            Ok(WatcherEvent::FsEvent(path)) => handle_fs_event(&path, inner, debounce),
-            Ok(WatcherEvent::Wake) | Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+        let deadline = next_wake_deadline(&inner.lock());
+        let event = match deadline {
+            Some(deadline) => {
+                match event_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(event) => Some(event),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            None => match event_rx.recv() {
+                Ok(event) => Some(event),
+                Err(_) => break,
+            },
+        };
+        match event {
+            Some(WatcherEvent::FsEvent(path)) => handle_fs_event(&path, inner, debounce),
+            Some(WatcherEvent::Wake) | None => {}
+        }
+        if stop.load(Ordering::SeqCst) {
+            break;
         }
 
         let now = Instant::now();
-        if now >= next_tick {
+        let work_is_due = next_wake_deadline(&inner.lock()).is_some_and(|deadline| deadline <= now);
+        if work_is_due {
             let running = running_source.snapshot();
             handle_tick_with_snapshot(inner, callback, &running);
-            while next_tick <= now {
-                next_tick += TICK_INTERVAL;
-            }
         }
     }
+}
+
+fn next_wake_deadline(state: &WatcherState) -> Option<Instant> {
+    state
+        .entries
+        .values()
+        .filter_map(|entry| {
+            let poll_at = entry.deferred.as_ref().map(|deferred| deferred.poll_at);
+            match (entry.dispatch_at, poll_at) {
+                (Some(dispatch_at), Some(poll_at)) => Some(dispatch_at.min(poll_at)),
+                (Some(dispatch_at), None) => Some(dispatch_at),
+                (None, Some(poll_at)) => Some(poll_at),
+                (None, None) => None,
+            }
+        })
+        .min()
 }
 
 /// Process one filesystem event: resolve which browser it's for and
 /// (re-)arm the trailing-edge debounce timer for that install path.
 ///
-/// The callback is *not* fired here. The tick loop drains
-/// [`WatcherState::next_dispatch_at`] once a path has been quiet for the
+/// The callback is *not* fired here. The dispatch loop drains
+/// [`WatchedEntry::dispatch_at`] once a path has been quiet for the
 /// full debounce window. This avoids patching on top of an in-flight
 /// browser update (the prior leading-edge behavior fired on the very
 /// first event of a 30-event update storm, before the browser bundle
@@ -459,14 +488,15 @@ fn handle_fs_event(path: &Path, inner: &Arc<Mutex<WatcherState>>, debounce: Dura
     else {
         return;
     };
-    // Every event resets the timer — the path needs `debounce` of quiet
-    // before the tick loop will fire the callback.
+    // Fresh activity supersedes any older browser-running deferral and resets
+    // the trailing-edge timer.
+    entry.deferred = None;
     entry.dispatch_at = Some(now + debounce);
 }
 
-/// Periodic tick: walk deferred entries, fire any whose bundle's mtime
-/// has been stable for [`POST_QUIT_STABLE_S`] seconds and the browser is
-/// no longer running.
+/// Scheduled check: walk deferred entries, firing any whose bundle's mtime has
+/// been stable for [`POST_QUIT_STABLE_S`] seconds and whose browser is no
+/// longer running.
 fn handle_tick_with_snapshot(
     inner: &Arc<Mutex<WatcherState>>,
     callback: &WatcherCallback,
@@ -495,6 +525,7 @@ fn handle_tick_with_snapshot(
                     last_mtime: mtime_of(entry.browser.install_path()),
                     last_check: now,
                     first_seen: now,
+                    poll_at: now + DEFERRED_POLL_INTERVAL,
                 });
             } else {
                 to_fire.push(entry.browser.clone());
@@ -507,6 +538,10 @@ fn handle_tick_with_snapshot(
             let Some(deferred) = entry.deferred.as_mut() else {
                 continue;
             };
+            if now < deferred.poll_at {
+                continue;
+            }
+            deferred.poll_at = now + DEFERRED_POLL_INTERVAL;
             let current_mtime = mtime_of(install);
             if deferred.last_mtime != current_mtime {
                 deferred.last_mtime = current_mtime;
@@ -598,6 +633,31 @@ mod tests {
                 entry.dispatch_at = Some(Instant::now());
             }
         }
+    }
+
+    #[test]
+    fn wake_deadline_exists_only_for_scheduled_work() {
+        let tmp = TempDir::new().unwrap();
+        let browser = fake_browser("Test", tmp.path().join("install"));
+        let inner = state_with(browser);
+
+        assert_eq!(next_wake_deadline(&inner.lock()), None);
+
+        let now = Instant::now();
+        let dispatch_at = now + Duration::from_secs(2);
+        let poll_at = now + Duration::from_millis(500);
+        {
+            let mut state = inner.lock();
+            let entry = state.entries.values_mut().next().unwrap();
+            entry.dispatch_at = Some(dispatch_at);
+            entry.deferred = Some(DeferredState {
+                last_mtime: None,
+                last_check: now,
+                first_seen: now,
+                poll_at,
+            });
+        }
+        assert_eq!(next_wake_deadline(&inner.lock()), Some(poll_at));
     }
 
     /// An event inside a watched directory fires only after its debounce
@@ -724,6 +784,58 @@ mod tests {
             "callback must not fire while browser appears running"
         );
         watcher.close();
+    }
+
+    #[test]
+    fn new_event_supersedes_deferred_callback() {
+        let tmp = TempDir::new().unwrap();
+        let install = tmp.path().join("install");
+        fs::create_dir_all(&install).unwrap();
+        let browser = fake_browser("Test", install.clone());
+        let inner = state_with(browser);
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_for_cb = Arc::clone(&count);
+        let callback: WatcherCallback = Arc::new(move |_browser| {
+            count_for_cb.fetch_add(1, Ordering::SeqCst);
+        });
+        let running: RunningPredicate = Arc::new(|_| true);
+        let stopped: RunningPredicate = Arc::new(|_| false);
+
+        handle_fs_event(&install.join("first"), &inner, Duration::ZERO);
+        handle_tick(&inner, &callback, &running);
+        {
+            let mut state = inner.lock();
+            let deferred = state
+                .entries
+                .values_mut()
+                .next()
+                .unwrap()
+                .deferred
+                .as_mut()
+                .expect("first event should be deferred");
+            let now = Instant::now();
+            deferred.poll_at = now;
+            deferred.last_check = now
+                .checked_sub(Duration::from_secs(POST_QUIT_STABLE_S + 1))
+                .expect("test instant supports a 31-second offset");
+        }
+
+        handle_fs_event(&install.join("second"), &inner, Duration::ZERO);
+        handle_tick(&inner, &callback, &stopped);
+
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "a fresh event must replace, not duplicate, deferred work"
+        );
+        assert!(inner
+            .lock()
+            .entries
+            .values()
+            .next()
+            .unwrap()
+            .deferred
+            .is_none());
     }
 
     /// Watch + unwatch removes the browser from internal state.
