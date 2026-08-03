@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::widevine::manifest::{Manifest, Platform};
 use crate::widevine::{
-    download, extract, platform_directory, platform_library, CDM_MANIFEST_FILENAME,
+    crx3, download, extract, platform_directory, platform_library, CDM_MANIFEST_FILENAME,
     PLATFORM_SPECIFIC_DIRECTORY,
 };
 
@@ -276,10 +276,10 @@ impl CdmCache {
 /// # Behavior
 ///
 /// 1. Resolve the platform entry from the manifest.
-/// 2. Authenticate the vendor CRX against its manifest SHA-512 and extract
-///    those exact verified bytes into a staging directory.
-/// 3. Derive library and root-manifest digests from the in-memory CRX ZIP
-///    body, then prove the staged extraction matches those digests.
+/// 2. Authenticate the vendor CRX against its manifest SHA-512 and pinned
+///    Widevine component signature.
+/// 3. Derive library and root-manifest digests from the signature-verified ZIP
+///    body, extract those exact bytes, then prove the staging output matches.
 /// 4. Reuse an existing version only when both current library and root
 ///    manifest digests match the vendor-authenticated archive values.
 /// 5. Otherwise replace the unauthenticated entry with the staged payload.
@@ -289,8 +289,8 @@ impl CdmCache {
 /// # Errors
 ///
 /// * `NetworkError` / `ManifestFetchFailed` — download chain failed.
-/// * `HashMismatch` — bytes verified differently than the manifest claimed.
-/// * `UnknownBundleStructure` — extracted CRX3 doesn't have the expected layout.
+/// * `HashMismatch` — the manifest digest or pinned CRX signature does not match.
+/// * `UnknownBundleStructure` — the CRX3 envelope or extracted layout is malformed.
 /// * `Other` — disk I/O failures.
 pub fn ensure_cdm_for(manifest: &Manifest) -> Result<CachedCdm> {
     let root = default_cache_root().ok_or_else(|| {
@@ -317,6 +317,14 @@ pub fn ensure_cdm_for_with(
 }
 
 fn ensure_unlocked(cache: &CdmCache, manifest: &Manifest) -> Result<CachedCdm> {
+    ensure_unlocked_with_authenticator(cache, manifest, crx3::authenticate_widevine_crx)
+}
+
+fn ensure_unlocked_with_authenticator(
+    cache: &CdmCache,
+    manifest: &Manifest,
+    authenticate: fn(download::VerifiedCrx) -> Result<crx3::AuthenticatedCrx>,
+) -> Result<CachedCdm> {
     let vendor = manifest.widevine()?;
     let version = vendor.version.clone();
     validate_version(&version)?;
@@ -327,8 +335,10 @@ fn ensure_unlocked(cache: &CdmCache, manifest: &Manifest) -> Result<CachedCdm> {
     let staging = cache.root.join(format!(".staging-{version}"));
     remove_cache_entry(&staging)?;
     let crx = download::download_verified(entry, &cache.root.join("downloads"))?;
-    let archive = authenticated_payload_digests_from_crx(crx.bytes(), cache.platform)?;
-    extract::extract_crx3_bytes(crx.bytes(), &staging)?;
+    let authenticated_crx = authenticate(crx)?;
+    let archive =
+        authenticated_payload_digests_from_zip(authenticated_crx.archive(), cache.platform)?;
+    extract::extract_zip_body(authenticated_crx.archive(), &staging)?;
     let staged = CachedCdm::new(version.clone(), staging.clone());
     validate_extracted_cdm(&staged, cache.platform)?;
     prove_extracted_matches_archive(&staged, cache.platform, &archive)?;
@@ -636,56 +646,104 @@ struct AuthenticatedPayloadDigests {
     library_size: u64,
 }
 
+/// Hash exactly the ZIP entry size validated during metadata preflight.
+///
+/// `zip` exposes the central-directory size but may yield more decompressed
+/// bytes from a forged stream. Reading at most one byte beyond the declaration
+/// makes that mismatch observable without unbounded CPU work.
+fn authenticated_zip_entry_digest(
+    reader: impl Read,
+    expected_size: u64,
+    name: &str,
+) -> Result<String> {
+    let read_limit = expected_size.checked_add(1).ok_or_else(|| {
+        Error::unknown_bundle_structure("authenticated ZIP entry size limit overflow")
+    })?;
+    let mut bounded = reader.take(read_limit);
+    let digest = download::sha512_reader(&mut bounded)?;
+    let actual_size = read_limit - bounded.limit();
+    if actual_size != expected_size {
+        return Err(Error::unknown_bundle_structure(format!(
+            "authenticated ZIP entry {name} yielded {actual_size} bytes while hashing; declared {expected_size}"
+        )));
+    }
+    Ok(digest)
+}
+
 /// Derive library and root-manifest digests from the authenticated in-memory
 /// CRX ZIP body before trusting any extracted on-disk bytes.
-fn authenticated_payload_digests_from_crx(
-    crx_bytes: &[u8],
+fn authenticated_payload_digests_from_zip(
+    zip_body: &[u8],
     platform: Platform,
 ) -> Result<AuthenticatedPayloadDigests> {
-    let zip_offset = extract::parse_crx3_header(crx_bytes)?;
-    let zip_body = &crx_bytes[zip_offset..];
+    extract::validate_zip_entry_count(zip_body)?;
     let cursor = std::io::Cursor::new(zip_body);
     let mut archive = zip::ZipArchive::new(cursor).map_err(|error| {
         Error::unknown_bundle_structure("CRX3 ZIP body is malformed").with_source(error)
     })?;
 
-    let library_name = format!(
-        "{PLATFORM_SPECIFIC_DIRECTORY}/{}/{}",
-        platform_directory(platform),
-        platform_library(platform)
-    );
+    let mut declared_total = 0u64;
+    let mut archive_paths = std::collections::HashSet::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|error| {
+            Error::unknown_bundle_structure(format!("zip entry {index}")).with_source(error)
+        })?;
+        let rel = extract::validate_zip_entry_metadata(&entry, &mut declared_total)?;
+        if !archive_paths.insert(rel) {
+            return Err(Error::unknown_bundle_structure(format!(
+                "CRX3 contains duplicate normalized ZIP path {}",
+                entry.name()
+            )));
+        }
+    }
+
+    let library_path = PathBuf::from(PLATFORM_SPECIFIC_DIRECTORY)
+        .join(platform_directory(platform))
+        .join(platform_library(platform));
+    let library_name = library_path.display().to_string();
     let mut library_digest = None;
     let mut manifest_digest = None;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|error| {
             Error::unknown_bundle_structure(format!("zip entry {index}")).with_source(error)
         })?;
-        let Some(rel) = entry.enclosed_name() else {
-            return Err(Error::unknown_bundle_structure(format!(
-                "zip entry {} has unsafe path",
-                entry.name()
-            )));
-        };
+        let rel = extract::normalized_zip_entry_path(&entry)?;
         if entry.is_dir() {
             continue;
         }
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
-        if rel_str == CDM_MANIFEST_FILENAME {
+        if rel == Path::new(CDM_MANIFEST_FILENAME) {
+            if manifest_digest.is_some() {
+                return Err(Error::unknown_bundle_structure(
+                    "CRX3 contains duplicate normalized root manifest.json entries",
+                ));
+            }
             let size = entry.size();
             if size == 0 || size > MAX_CACHED_MANIFEST_BYTES {
                 return Err(Error::unknown_bundle_structure(
                     "CRX3 root manifest.json has an invalid size",
                 ));
             }
-            manifest_digest = Some(download::sha512_reader(&mut entry)?);
-        } else if rel_str == library_name {
+            manifest_digest = Some(authenticated_zip_entry_digest(
+                &mut entry,
+                size,
+                CDM_MANIFEST_FILENAME,
+            )?);
+        } else if rel == library_path {
+            if library_digest.is_some() {
+                return Err(Error::unknown_bundle_structure(format!(
+                    "CRX3 contains duplicate normalized library entries for {library_name}"
+                )));
+            }
             let size = entry.size();
             if size == 0 || size > MAX_CACHED_LIBRARY_BYTES {
                 return Err(Error::hash_mismatch(
                     "CRX3 Widevine library entry has an invalid size",
                 ));
             }
-            library_digest = Some((download::sha512_reader(&mut entry)?, size));
+            library_digest = Some((
+                authenticated_zip_entry_digest(&mut entry, size, &library_name)?,
+                size,
+            ));
         }
     }
 
@@ -1084,6 +1142,157 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::widevine::manifest::{GmpVendor, PlatformEntry};
+
+    fn zip_eocd_with_entry_count(count: u16) -> Vec<u8> {
+        let mut eocd = Vec::with_capacity(22);
+        eocd.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        eocd.extend_from_slice(&0u16.to_le_bytes());
+        eocd.extend_from_slice(&0u16.to_le_bytes());
+        eocd.extend_from_slice(&count.to_le_bytes());
+        eocd.extend_from_slice(&count.to_le_bytes());
+        eocd.extend_from_slice(&0u32.to_le_bytes());
+        eocd.extend_from_slice(&0u32.to_le_bytes());
+        eocd.extend_from_slice(&0u16.to_le_bytes());
+        eocd
+    }
+
+    #[test]
+    fn authenticated_digest_rejects_declared_entry_count_before_zip_parsing() {
+        let err = authenticated_payload_digests_from_zip(
+            &zip_eocd_with_entry_count(257),
+            Platform::LinuxX86_64,
+        )
+        .expect_err("entry count");
+
+        assert_eq!(err.category, crate::ErrorCategory::UnknownBundleStructure);
+        assert!(
+            err.message.contains("entry"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn authenticated_digest_rejects_expansion_past_declared_size() {
+        use std::io::{Cursor, Write};
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let mut body = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut body));
+            let options =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zip.start_file(CDM_MANIFEST_FILENAME, options)
+                .expect("manifest entry");
+            zip.write_all(b"{}").expect("manifest bytes");
+            zip.start_file(
+                format!(
+                    "{}/{}/{}",
+                    PLATFORM_SPECIFIC_DIRECTORY,
+                    platform_directory(Platform::LinuxX86_64),
+                    platform_library(Platform::LinuxX86_64)
+                ),
+                options,
+            )
+            .expect("library entry");
+            zip.write_all(b"library").expect("library bytes");
+            zip.finish().expect("finish ZIP");
+        }
+
+        let local = body
+            .windows(4)
+            .position(|window| window == 0x0403_4b50u32.to_le_bytes())
+            .expect("local header");
+        body[local + 22..local + 26].copy_from_slice(&1u32.to_le_bytes());
+        let central = body
+            .windows(4)
+            .position(|window| window == 0x0201_4b50u32.to_le_bytes())
+            .expect("central header");
+        body[central + 24..central + 28].copy_from_slice(&1u32.to_le_bytes());
+
+        let error = authenticated_payload_digests_from_zip(&body, Platform::LinuxX86_64)
+            .expect_err("entry must not expand past its declared size");
+
+        assert_eq!(error.category, crate::ErrorCategory::UnknownBundleStructure);
+    }
+
+    #[test]
+    fn authenticated_digest_rejects_duplicate_normalized_targets() {
+        use std::io::{Cursor, Write};
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let mut body = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut body));
+            let options =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("manifest.json", options).expect("manifest");
+            zip.write_all(br#"{"version":"1"}"#).expect("write");
+            zip.start_file("./manifest.json", options)
+                .expect("duplicate manifest");
+            zip.write_all(br#"{"version":"2"}"#).expect("write");
+            zip.start_file("_platform_specific/linux_x64/libwidevinecdm.so", options)
+                .expect("library");
+            zip.write_all(b"\x7fELF-test").expect("write");
+            zip.finish().expect("finish");
+        }
+
+        let err = authenticated_payload_digests_from_zip(&body, Platform::LinuxX86_64)
+            .expect_err("duplicate normalized target");
+
+        assert_eq!(err.category, crate::ErrorCategory::UnknownBundleStructure);
+        assert!(
+            err.message.contains("duplicate"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn authenticated_digest_validates_all_entry_metadata_before_hashing() {
+        use std::io::{Cursor, Write};
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let mut body = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut body));
+            let options =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("manifest.json", options).expect("manifest");
+            zip.write_all(br#"{"version":"1"}"#).expect("write");
+            zip.start_file("_platform_specific/linux_x64/libwidevinecdm.so", options)
+                .expect("library");
+            zip.write_all(b"\x7fELF-test").expect("write");
+            zip.add_symlink("unrelated-link", "manifest.json", options)
+                .expect("symlink");
+            zip.finish().expect("finish");
+        }
+
+        let err = authenticated_payload_digests_from_zip(&body, Platform::LinuxX86_64)
+            .expect_err("unsafe metadata");
+
+        assert_eq!(err.category, crate::ErrorCategory::UnknownBundleStructure);
+        assert!(
+            err.message.contains("symlink") || err.message.contains("special"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    fn ensure_cdm_for_with(
+        manifest: &Manifest,
+        platform: Platform,
+        cache_root: &Path,
+    ) -> Result<CachedCdm> {
+        let cache = CdmCache::new(cache_root, platform);
+        fs::create_dir_all(cache.root()).map_err(Error::from)?;
+        cache.with_mutation_lock(|| {
+            ensure_unlocked_with_authenticator(&cache, manifest, crx3::trust_unsigned_crx_for_test)
+        })
+    }
 
     /// Build a synthetic manifest with one Linux entry whose hash matches
     /// `body`.
@@ -1541,6 +1750,46 @@ mod tests {
         assert!(!names.contains(&"current"));
         assert!(!names.contains(&"previous"));
         assert!(!names.iter().any(|n| n.starts_with('.')));
+    }
+
+    #[test]
+    fn production_ensure_rejects_unsigned_manifest_matched_crx() {
+        let crx = build_synthetic_crx3("1.0.0");
+        let url = spawn_crx_server(crx.clone());
+        let manifest = manifest_for_crx(&url, &crx, "1.0.0");
+        let tmp = TempDir::new().expect("tempdir");
+
+        let error = super::ensure_cdm_for_with(&manifest, Platform::LinuxX86_64, tmp.path())
+            .expect_err("manifest SHA-512 alone must not authorize executable CDM bytes");
+
+        assert_eq!(error.category, crate::ErrorCategory::UnknownBundleStructure);
+        assert!(!tmp.path().join("current").exists());
+        assert!(!tmp.path().join("1.0.0").exists());
+    }
+
+    #[test]
+    #[ignore = "requires a current vendor CRX3 and matching version in the environment"]
+    fn production_ensure_accepts_current_vendor_crx() {
+        let path = std::env::var_os("SILVERVINE_TEST_WIDEVINE_CRX")
+            .expect("set SILVERVINE_TEST_WIDEVINE_CRX");
+        let version = std::env::var("SILVERVINE_TEST_WIDEVINE_VERSION")
+            .expect("set SILVERVINE_TEST_WIDEVINE_VERSION");
+        let crx = fs::read(path).expect("read vendor CRX3");
+        let url = spawn_crx_server(crx.clone());
+        let manifest = manifest_for_crx(&url, &crx, &version);
+        let tmp = TempDir::new().expect("tempdir");
+
+        let cdm = super::ensure_cdm_for_with(&manifest, Platform::LinuxX86_64, tmp.path())
+            .expect("pinned signature and bounded extraction must admit the vendor CRX");
+
+        assert_eq!(cdm.version(), version);
+        assert!(cdm.cdm_dir().join(CDM_MANIFEST_FILENAME).is_file());
+        assert!(cdm
+            .cdm_dir()
+            .join(PLATFORM_SPECIFIC_DIRECTORY)
+            .join(platform_directory(Platform::LinuxX86_64))
+            .join(platform_library(Platform::LinuxX86_64))
+            .is_file());
     }
 
     #[test]

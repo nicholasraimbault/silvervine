@@ -10,6 +10,8 @@ Future entries are generated from
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-08-02
+
 ### Changed
 
 - Reduced multi-browser `doctor --media-stack` latency with bounded concurrent
@@ -22,6 +24,28 @@ Future entries are generated from
 - Restricted macOS browser auto-discovery to patchable
   `<app> Framework.framework/Versions/<version>/Libraries` layouts so setup no
   longer attempts to patch unrelated Qt, Python, or application frameworks.
+
+- Corrected legacy cleanup reporting so cancelled, failed, no-op, and
+  dangling-symlink elevated removals remain visible as skipped instead of
+  being reported as removed.
+
+### Security
+
+- Added pinned Widevine CRX3 developer-signature verification before any CDM
+  archive member can enter the executable cache; the signed component ID and
+  ZIP body must also match the HTTPS manifest's SHA-512.
+- Pinned default manifest requests and redirects to exact Mozilla/GitHub HTTPS
+  origins, constrained explicit custom-manifest redirects to the same origin,
+  restricted manifest-carried CRX URLs to exact Google Widevine CDN origins,
+  rejected explicit local/private address literals, and disabled CRX redirects.
+- Preflighted ZIP central-directory entry counts before eager parser
+  allocation, validated every entry before authenticated payload hashing, and
+  rejected duplicate normalized extraction paths plus per-entry/aggregate
+  expansion-limit violations.
+- Reduced release automation privilege, checksum-pinned its cargo-dist
+  installer, pinned third-party actions by commit, required exact-commit CI,
+  MSRV, dependency-policy, and shipping-target build gates, restricted matching
+  `v*` tag creation to the maintainer, and made created release tags immutable.
 
 ## [2.1.0] - 2026-08-02
 
@@ -329,7 +353,8 @@ rc.1 has a hard deadlock on the patch path.
   scripts. Both bugs are obsoleted by the rewrite, but the reports
   were on the money.
 
-[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.1...v2.1.0
 [2.0.1]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.0-rc.2...v2.0.0
