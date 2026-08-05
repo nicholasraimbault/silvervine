@@ -126,7 +126,10 @@ objc2-foundation = { version = "0.3", features = [
     "NSOperation",
     "block2",
 ] }
-objc2-app-kit = { version = "0.3", features = ["NSWorkspace"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSRunningApplication",
+    "NSWorkspace",
+] }
 block2 = "0.6"
 # NSStatusItem-backed tray for macOS via Tauri's tray-icon crate.
 # Default features pull libxdo for keyboard accelerators we don't use,
@@ -145,6 +148,11 @@ zbus = { version = "5" }
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 [dev-dependencies]
 plist = "1"
+
+[[test]]
+name = "macos_tray_runtime"
+path = "tests/macos_tray_runtime.rs"
+harness = false
 
 [profile.release]
 opt-level = 3
