@@ -650,6 +650,13 @@ impl Tray {
     /// clicks and status-item updates are delivered on the daemon main
     /// thread without calling `NSApplication::run`. Elsewhere (and for
     /// headless trays) this is a plain sleep of the same duration.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            clippy::unused_self,
+            reason = "receiver is used only by the macOS branch; kept for one cross-platform call boundary"
+        )
+    )]
     pub(crate) fn wait_for_platform_event(&self, timeout: std::time::Duration) {
         #[cfg(target_os = "macos")]
         if let Some(inner) = &self.inner {
@@ -761,16 +768,18 @@ fn build_tray_icon(state: &MenuState, tx: Sender<TrayCommand>) -> Result<TrayInn
     let routes = std::sync::Arc::new(Mutex::new(build_routes(state, generation)));
     let routes_for_handler = std::sync::Arc::clone(&routes);
     let tx_for_handler = tx.clone();
-    tray_icon::menu::MenuEvent::set_event_handler(Some(move |event| {
-        let command = routes_for_handler
-            .lock()
-            .unwrap()
-            .get(&event.id().0)
-            .cloned();
-        if let Some(command) = command {
-            let _ = tx_for_handler.send(command);
-        }
-    }));
+    tray_icon::menu::MenuEvent::set_event_handler(Some(
+        move |event: tray_icon::menu::MenuEvent| {
+            let command = routes_for_handler
+                .lock()
+                .unwrap()
+                .get(&event.id().0)
+                .cloned();
+            if let Some(command) = command {
+                let _ = tx_for_handler.send(command);
+            }
+        },
+    ));
 
     let menu = build_macos_menu(state, generation);
     let mut builder = TrayIconBuilder::new()
@@ -851,7 +860,11 @@ impl TrayInner {
     fn pump_events(&self, timeout: std::time::Duration) {
         use objc2::rc::autoreleasepool;
         use objc2_app_kit::NSEventMask;
-        use objc2_foundation::{NSDate, NSDefaultRunLoopMode};
+        use objc2_foundation::NSDate;
+
+        // SAFETY: Foundation exports `NSDefaultRunLoopMode` as an immutable
+        // process-lifetime constant; reading the extern static once is sound.
+        let default_mode = unsafe { objc2_foundation::NSDefaultRunLoopMode };
 
         autoreleasepool(|_| {
             let deadline = NSDate::dateWithTimeIntervalSinceNow(timeout.as_secs_f64());
@@ -860,7 +873,7 @@ impl TrayInner {
                 .nextEventMatchingMask_untilDate_inMode_dequeue(
                     NSEventMask::Any,
                     Some(&deadline),
-                    NSDefaultRunLoopMode,
+                    default_mode,
                     true,
                 )
             {
@@ -873,7 +886,7 @@ impl TrayInner {
                 .nextEventMatchingMask_untilDate_inMode_dequeue(
                     NSEventMask::Any,
                     Some(&drain_deadline),
-                    NSDefaultRunLoopMode,
+                    default_mode,
                     true,
                 )
             {
