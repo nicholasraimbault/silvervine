@@ -167,38 +167,119 @@ git commit -m "fix: generation-scope macOS tray routes"
 ### Task 2: Bootstrap and pump AppKit on the daemon main thread
 
 **Files:**
-- Modify: `Cargo.toml:113-134`
+- Modify: `Cargo.toml:113-148`
 - Modify: `Cargo.lock`
+- Create: `tests/macos_tray_runtime.rs`
 - Modify: `src/daemon/tray.rs:53-55,300-319,516-616,715-790`
 - Modify: `src/daemon/mod.rs:514-568`
-- Test: existing `src/daemon/mod.rs:1287-1324` and `src/daemon/tray.rs:792-1172`
+- Test: `tests/macos_tray_runtime.rs`, existing `src/daemon/mod.rs:1287-1324`, and `src/daemon/tray.rs:792-1172`
 
 **Interfaces:**
 - Consumes: generation-aware `build_routes` and `menu_item_id` from Task 1.
-- Produces: `Tray::wait_for_platform_event(&self, timeout: Duration)`, retained macOS `NSApplication`, live mutable `TrayIcon`, and shared current-generation route state.
+- Produces: `Tray::wait_for_platform_event(&self, timeout: Duration)`, retained macOS `NSApplication`, live mutable `TrayIcon`, shared current-generation route state, and a no-harness native regression executable.
 
-- [ ] **Step 1: Reproduce the released runtime failure before editing behavior**
+- [ ] **Step 1: Write the failing native activation-policy regression**
 
-Against the official 2.1.2 LaunchAgent, resolve its PID and run the Swift probe:
+Add this explicit test target before `[profile.release]`:
 
-```bash
-ssh -o BatchMode=yes -o IdentitiesOnly=yes -i ~/.ssh/dell_hermes \
-  lanaraimbault@192.168.20.232 \
-  'SILVERVINE_PID=$(/usr/bin/pgrep -x silvervine); \
-   export SILVERVINE_PID; \
-   /Users/lanaraimbault/.cargo/bin/silvervine --version; \
-   /usr/bin/xcrun swift -e '\''import AppKit; import CoreGraphics; import Foundation; \
-   let pid = pid_t(Int(ProcessInfo.processInfo.environment["SILVERVINE_PID"]!)!); \
-   let app = NSRunningApplication(processIdentifier: pid); \
-   let surfaces = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []).filter { ($0[kCGWindowOwnerPID as String] as? Int32) == pid }.count; \
-   print("pid=\(pid) policy=\(app?.activationPolicy.rawValue ?? -1) surfaces=\(surfaces)")'\'''
+```toml
+[[test]]
+name = "macos_tray_runtime"
+path = "tests/macos_tray_runtime.rs"
+harness = false
 ```
 
-Expected failing baseline: `silvervine 2.1.2`, activation policy `2` (`Prohibited`), and `surfaces=0`.
+Enable `NSRunningApplication` alongside the existing `NSWorkspace` feature so the test can inspect the child process without changing daemon behavior:
 
-- [ ] **Step 2: Enable only the required Objective-C bindings**
+```toml
+objc2-app-kit = { version = "0.3", features = [
+    "NSRunningApplication",
+    "NSWorkspace",
+] }
+```
 
-Update the macOS dependency features:
+Create `tests/macos_tray_runtime.rs`:
+
+```rust
+#[cfg(not(target_os = "macos"))]
+fn main() {}
+
+#[cfg(target_os = "macos")]
+fn main() {
+    use std::process::{Child, Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use objc2_app_kit::{
+        NSApplicationActivationPolicy, NSRunningApplication,
+    };
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let home = tempfile::TempDir::new().expect("temporary daemon home");
+    let mut daemon = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_silvervine"))
+            .env("HOME", home.path())
+            .env("SILVERVINE_TEST_DATA_MIGRATION_NOOP", "1")
+            .env("SILVERVINE_TEST_LIFECYCLE_NOOP", "1")
+            .env("SILVERVINE_TEST_POWER_NOOP", "1")
+            .env("SILVERVINE_TEST_NOTIFY_NOOP", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn Silvervine daemon"),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed = None;
+    while Instant::now() < deadline {
+        if let Some(status) = daemon.0.try_wait().expect("query daemon status") {
+            panic!("Silvervine daemon exited before AppKit initialization: {status}");
+        }
+        if let Some(application) =
+            NSRunningApplication::runningApplicationWithProcessIdentifier(
+                daemon.0.id() as libc::pid_t,
+            )
+        {
+            observed = Some(application.activationPolicy());
+            if observed == Some(NSApplicationActivationPolicy::Accessory) {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert_eq!(
+        observed,
+        Some(NSApplicationActivationPolicy::Accessory),
+        "tray daemon must register as an accessory AppKit application"
+    );
+}
+```
+
+- [ ] **Step 2: Verify RED on a GitHub-hosted Mac**
+
+The non-macOS target is intentionally a no-op, so first confirm the test target builds locally:
+
+```bash
+cargo test --locked --test macos_tray_runtime
+git add Cargo.toml Cargo.lock tests/macos_tray_runtime.rs
+git commit -m "test: cover macOS tray activation policy"
+git push -u origin fix/macos-tray-event-loop
+```
+
+Open or update a draft PR and wait for `test (macos-latest)`. Expected RED: `macos_tray_runtime` exits nonzero because the observed policy is `Prohibited` rather than `Accessory`. Preserve the failing job URL in the Task 2 report before writing production behavior.
+
+- [ ] **Step 3: Enable the complete Objective-C API surface**
+
+Expand the macOS dependency features:
 
 ```toml
 objc2-foundation = { version = "0.3", features = [
@@ -222,7 +303,7 @@ objc2-app-kit = { version = "0.3", features = [
 
 Run `cargo check --locked --all-targets --all-features` once so `Cargo.lock` records any feature-driven dependency edges.
 
-- [ ] **Step 3: Add AppKit ownership and initialization**
+- [ ] **Step 4: Add AppKit ownership and initialization**
 
 Change the macOS inner type and builder around these exact responsibilities:
 
@@ -315,7 +396,7 @@ Ok(TrayInner {
 })
 ```
 
-- [ ] **Step 4: Install one shared route handler and live menu replacement**
+- [ ] **Step 5: Install one shared route handler and live menu replacement**
 
 Extract native menu construction so initial render and refresh use identical IDs:
 
@@ -380,7 +461,7 @@ if let Some(inner) = &self.inner {
 
 Keep the existing Linux `ksni` update after the stored-state assignment. Delete the obsolete comment claiming the daemon reconstructs `Tray`, and delete the compile-only `tray_inner_routes_field_present` test that does not inspect `TrayInner`.
 
-- [ ] **Step 5: Add the bounded AppKit event pump**
+- [ ] **Step 6: Add the bounded AppKit event pump**
 
 Add this macOS-only method to `TrayInner`:
 
@@ -443,12 +524,13 @@ tray.wait_for_platform_event(Duration::from_millis(100));
 
 Do not invoke `NSApplication::run()` anywhere.
 
-- [ ] **Step 6: Run focused tests and Linux regression gates**
+- [ ] **Step 7: Run focused tests and Linux regression gates**
 
 Run:
 
 ```bash
 cargo fmt --all -- --check
+cargo test --locked --test macos_tray_runtime
 cargo test --locked daemon::tray::tests
 cargo test --locked daemon::tests::run_event_loop_returns_on_quit -- --exact
 cargo test --locked daemon::tests::run_event_loop_single_iteration_returns_immediately -- --exact
@@ -456,14 +538,24 @@ cargo test --locked daemon::tests::run_event_loop_observes_stop_flag -- --exact
 cargo check --locked --all-targets --all-features
 ```
 
-Expected: formatting is clean and every command exits 0. Linux compiles only the sleep/`ksni` branch; native macOS compilation remains a required Task 3 gate.
+Expected: formatting is clean and every command exits 0. Linux compiles only the sleep/`ksni` branch; the no-harness runtime target is a no-op off macOS.
 
-- [ ] **Step 7: Commit the AppKit lifecycle fix**
+- [ ] **Step 8: Commit the AppKit lifecycle fix**
 
 ```bash
-git add Cargo.toml Cargo.lock src/daemon/tray.rs src/daemon/mod.rs
+git add Cargo.toml Cargo.lock tests/macos_tray_runtime.rs \
+  src/daemon/tray.rs src/daemon/mod.rs
 git commit -m "fix: service the macOS tray event loop"
 ```
+
+- [ ] **Step 9: Verify GREEN on the GitHub-hosted Mac**
+
+```bash
+git push origin fix/macos-tray-event-loop
+gh pr checks --watch --interval 10
+```
+
+Required GREEN evidence: `test (macos-latest)` runs `macos_tray_runtime` successfully, and macOS Clippy and release-build jobs pass on the same head commit. Append the passing job URLs and head commit to the Task 2 report.
 
 ---
 
