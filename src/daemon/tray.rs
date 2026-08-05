@@ -556,7 +556,7 @@ impl Tray {
 
         #[cfg(target_os = "macos")]
         let inner = {
-            let routes = build_routes(&initial_state);
+            let routes = build_routes(&initial_state, 0);
             build_tray_icon(&initial_state, &routes, tx.clone()).map_err(|e| {
                 Error::unsupported_platform(format!("tray-icon initialization failed: {e}"))
             })?
@@ -653,8 +653,10 @@ impl Tray {
 /// Build a map of `MenuId` strings to [`TrayCommand`] used by the
 /// macOS `tray-icon` event handler to route click events back to us.
 ///
-/// Each entry in the menu layout gets a unique stable id derived from
-/// its position + content; we re-build the map every time we re-render.
+/// Each entry in the menu layout gets a unique id derived from the
+/// menu generation, position, and content. Generations keep route IDs
+/// disjoint across menu rebuilds so stale click events cannot hit a
+/// newer route table.
 ///
 /// On Linux the tray uses `ksni`, where each menu item carries its own
 /// `activate` callback — no central routing table is needed. The
@@ -662,11 +664,13 @@ impl Tray {
 /// the routing logic itself is platform-agnostic and the tests verify
 /// it stays correct.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn build_routes(state: &MenuState) -> std::collections::HashMap<String, TrayCommand> {
+fn build_routes(
+    state: &MenuState,
+    generation: u64,
+) -> std::collections::HashMap<String, TrayCommand> {
     let mut routes = std::collections::HashMap::new();
-    let layout = menu_layout(state);
-    for (idx, item) in layout.iter().enumerate() {
-        route_item_into(&mut routes, idx, item, None);
+    for (idx, item) in menu_layout(state).iter().enumerate() {
+        route_item_into(&mut routes, generation, idx, item);
     }
     routes
 }
@@ -675,11 +679,11 @@ fn build_routes(state: &MenuState) -> std::collections::HashMap<String, TrayComm
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn route_item_into(
     routes: &mut std::collections::HashMap<String, TrayCommand>,
+    generation: u64,
     idx: usize,
     item: &MenuItemSpec,
-    _parent_id: Option<&str>,
 ) {
-    let id = menu_item_id(idx, item);
+    let id = menu_item_id(generation, idx, item);
     match item {
         MenuItemSpec::Action { command, .. } => {
             routes.insert(id, command.clone());
@@ -697,19 +701,20 @@ fn route_item_into(
     }
 }
 
-/// Build a stable id for a menu item at a given position. Position +
-/// label is enough to identify any of our menu items uniquely (we never
-/// have two browsers with the same name).
+/// Build a deterministic id for a menu item at a given generation and
+/// position. Generation + position + label uniquely identifies any of
+/// our menu items (we never have two browsers with the same name).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn menu_item_id(index: usize, item: &MenuItemSpec) -> String {
-    match item {
+fn menu_item_id(generation: u64, index: usize, item: &MenuItemSpec) -> String {
+    let kind_and_label = match item {
         MenuItemSpec::BrowserStatus { browser_name, .. } => {
-            format!("silvervine-browser-{index}-{browser_name}")
+            format!("browser-{index}-{browser_name}")
         }
-        MenuItemSpec::Action { label, .. } => format!("silvervine-action-{index}-{label}"),
-        MenuItemSpec::Toggle { label, .. } => format!("silvervine-toggle-{index}-{label}"),
-        MenuItemSpec::Separator => format!("silvervine-sep-{index}"),
-    }
+        MenuItemSpec::Action { label, .. } => format!("action-{index}-{label}"),
+        MenuItemSpec::Toggle { label, .. } => format!("toggle-{index}-{label}"),
+        MenuItemSpec::Separator => format!("sep-{index}"),
+    };
+    format!("silvervine-{generation}-{kind_and_label}")
 }
 
 /// Construct the live tray icon (macOS only — Linux uses `ksni`
@@ -732,7 +737,7 @@ fn build_tray_icon(
 
     let menu = Menu::new();
     for (idx, spec) in menu_layout(state).iter().enumerate() {
-        let id = MenuId::new(menu_item_id(idx, spec));
+        let id = MenuId::new(menu_item_id(0, idx, spec));
         match spec {
             MenuItemSpec::BrowserStatus { .. } | MenuItemSpec::Action { .. } => {
                 let item = MenuItem::with_id(id, spec.label(), true, None);
@@ -1090,7 +1095,7 @@ mod tests {
             )],
             launch_at_login: false,
         };
-        let routes = build_routes(&state);
+        let routes = build_routes(&state, 0);
         // Expect: 1 browser + 2 actions + 1 toggle + 1 quit = 5 actionables.
         assert_eq!(routes.len(), 5);
         // Browser should map to a PatchOne with that name.
@@ -1103,16 +1108,44 @@ mod tests {
         }
     }
 
-    /// `menu_item_id` is stable: two calls with identical inputs produce
-    /// identical ids.
+    /// `menu_item_id` is stable within a generation and changes across
+    /// generations / indices.
     #[test]
-    fn menu_item_id_is_stable() {
+    fn menu_item_id_is_stable_within_generation_and_changes_between_generations() {
         let item = MenuItemSpec::Action {
             label: "Patch Now".into(),
             command: TrayCommand::PatchAll,
         };
-        assert_eq!(menu_item_id(2, &item), menu_item_id(2, &item));
-        assert_ne!(menu_item_id(1, &item), menu_item_id(2, &item));
+        assert_eq!(
+            menu_item_id(7, 2, &item),
+            menu_item_id(7, 2, &item)
+        );
+        assert_ne!(menu_item_id(7, 1, &item), menu_item_id(7, 2, &item));
+        assert_ne!(menu_item_id(7, 2, &item), menu_item_id(8, 2, &item));
+    }
+
+    /// Route map keys from different menu generations never collide.
+    #[test]
+    fn route_ids_are_disjoint_between_menu_generations() {
+        let state = MenuState {
+            browsers: vec![BrowserMenuEntry::from_browser(
+                &fake_browser("Helium"),
+                true,
+            )],
+            launch_at_login: false,
+        };
+        let first = build_routes(&state, 4);
+        let second = build_routes(&state, 5);
+        assert!(first.keys().all(|id| !second.contains_key(id)));
+        assert_eq!(first.len(), second.len());
+        for command in first.values() {
+            let first_count = first.values().filter(|candidate| *candidate == command).count();
+            let second_count = second
+                .values()
+                .filter(|candidate| *candidate == command)
+                .count();
+            assert_eq!(first_count, second_count);
+        }
     }
 
     /// `BrowserMenuEntry::from_browser` carries the name + patched flag.
