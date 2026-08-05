@@ -472,14 +472,15 @@ git commit -m "fix: service the macOS tray event loop"
 **Files:**
 - Modify: `Cargo.toml:3`
 - Modify: `Cargo.lock` root `silvervine` package version
-- Runtime target: `/Users/lanaraimbault/.cargo/bin/silvervine`
-- Rollback target: `/Users/lanaraimbault/.cargo/bin/silvervine-2.1.2.rollback`
+- GitHub pull request from `fix/macos-tray-event-loop` to `master`
+- User-operated candidate binary: `~/.cargo/bin/silvervine`
+- User-operated rollback binary: `~/.cargo/bin/silvervine-2.1.2.rollback`
 
 **Interfaces:**
-- Consumes: completed code from Tasks 1-2.
-- Produces: a natively built 2.1.3 candidate with runtime evidence satisfying the approved design gate.
+- Consumes: completed and reviewed code from Tasks 1-2.
+- Produces: a 2.1.3 candidate that passes native GitHub macOS compilation/tests and a separate physical-Mac visual/menu confirmation.
 
-- [ ] **Step 1: Set the candidate version**
+- [ ] **Step 1: Set and commit the candidate version**
 
 Change the package version in `Cargo.toml` and root package version in `Cargo.lock` from `2.1.2` to `2.1.3`:
 
@@ -489,49 +490,59 @@ name = "silvervine"
 version = "2.1.3"
 ```
 
-Run:
+Run and commit:
 
 ```bash
 cargo check --locked --all-targets --all-features
 cargo run --locked -- --version
+git add Cargo.toml Cargo.lock
+git commit -m "chore: prepare version 2.1.3"
 ```
 
 Expected version output: `silvervine 2.1.3`.
 
-- [ ] **Step 2: Package source and compile natively on the Mac**
-
-Create a source archive excluding `.git`, `.worktrees`, and `target`; upload it using the existing SSH identity. On the Mac, unpack into `/tmp/silvervine-macos-tray-2.1.3-src`, then run:
+- [ ] **Step 2: Run the complete local source gate**
 
 ```bash
 cargo fmt --all -- --check
-cargo test --locked --all-features --no-fail-fast
 cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features --no-fail-fast
 cargo build --release --locked
-./target/release/silvervine --version
+cargo deny check advisories bans licenses sources
+git diff --check
 ```
 
-Expected: all commands exit 0 and the binary reports `silvervine 2.1.3`.
+Expected: every command exits 0. Record the total test count and intentional ignored-test count.
 
-- [ ] **Step 3: Install candidate atomically with rollback**
+- [ ] **Step 3: Push a draft PR and require native macOS CI**
 
-On the Mac:
+Push `fix/macos-tray-event-loop`, open a draft pull request, and wait for every CI job. The existing `ci.yml` matrix must report success for:
+
+```text
+clippy (macos-latest)
+test (macos-latest)
+cargo build --release (macos-latest)
+```
+
+Linux, formatting, MSRV, and cargo-deny jobs must also pass. Native CI proves the AppKit code compiles and the repository tests pass on macOS; it does not count as proof that a physical menu-bar icon is visible.
+
+- [ ] **Step 4: Give the physical Mac an exact candidate install**
+
+Because controller SSH access is unavailable, the user runs these commands in Terminal on the physical Mac:
 
 ```bash
-cp /Users/lanaraimbault/.cargo/bin/silvervine \
-   /Users/lanaraimbault/.cargo/bin/silvervine-2.1.2.rollback
-cp /tmp/silvervine-macos-tray-2.1.3-src/target/release/silvervine \
-   /Users/lanaraimbault/.cargo/bin/silvervine.candidate
-chmod 755 /Users/lanaraimbault/.cargo/bin/silvervine.candidate
-mv /Users/lanaraimbault/.cargo/bin/silvervine.candidate \
-   /Users/lanaraimbault/.cargo/bin/silvervine
-launchctl kickstart -k gui/501/com.nicholasraimbault.silvervine.tray
+cp "$HOME/.cargo/bin/silvervine" \
+   "$HOME/.cargo/bin/silvervine-2.1.2.rollback"
+cargo install --git https://github.com/nicholasraimbault/silvervine.git \
+  --branch fix/macos-tray-event-loop --locked --force
+launchctl kickstart -k \
+  "gui/$(id -u)/com.nicholasraimbault.silvervine.tray"
+silvervine --version
 ```
 
-Confirm `launchctl print gui/501/com.nicholasraimbault.silvervine.tray` reports `state = running`, a live PID, and no exit loop.
+Required version output: `silvervine 2.1.3`.
 
-- [ ] **Step 4: Prove the real AppKit runtime contract**
-
-Resolve the live PID and run the probe in the Mac shell:
+The user then runs this local policy probe:
 
 ```bash
 SILVERVINE_PID=$(/usr/bin/pgrep -x silvervine)
@@ -550,42 +561,34 @@ let surfaces = (CGWindowListCopyWindowInfo(
     ($0[kCGWindowOwnerPID as String] as? Int32) == pid
 }
 print("policy=\(app.activationPolicy.rawValue) surfaces=\(surfaces.count)")
-for surface in surfaces {
-    print(surface[kCGWindowBounds as String] ?? "")
-}
 '
 ```
 
-Required result: `policy=1` and at least one status-item surface, or direct visual confirmation if WindowServer attributes the surface to another owner on this macOS version. Run `silvervine doctor --json` and require a non-stale heartbeat, but do not use its hard-coded tray capability as proof.
+Required policy output: `policy=1`. A positive surface count is supporting evidence; direct visual confirmation remains authoritative if WindowServer attributes the status-item surface to another process.
 
-Sample the process for one second. Required: the main thread appears in AppKit event retrieval/dispatch during the sample and is not exclusively parked in `nanosleep`.
+- [ ] **Step 5: Obtain the physical icon and menu confirmation**
 
-- [ ] **Step 5: Verify a real menu command and clean shutdown**
+The user must confirm all of these observations before the stable tag is created:
 
-Open the visible Silvervine status item in the logged-in GUI session and choose **Quit Silvervine**. Required observations:
+- the Silvervine icon is visible in the macOS menu bar;
+- Silvervine has no Dock icon;
+- clicking the icon opens the expected Silvervine menu;
+- choosing **Quit Silvervine** removes the icon and exits cleanly;
+- `launchctl kickstart -k "gui/$(id -u)/com.nicholasraimbault.silvervine.tray"` restores the icon.
 
-- the status item disappears;
-- the LaunchAgent process exits cleanly;
-- launchd does not report a crash exit;
-- restarting with `launchctl kickstart -k gui/501/com.nicholasraimbault.silvervine.tray` restores the icon and a fresh heartbeat.
-
-If any Task 3 runtime requirement fails, restore atomically:
-
-```bash
-cp /Users/lanaraimbault/.cargo/bin/silvervine-2.1.2.rollback \
-   /Users/lanaraimbault/.cargo/bin/silvervine.restore
-chmod 755 /Users/lanaraimbault/.cargo/bin/silvervine.restore
-mv /Users/lanaraimbault/.cargo/bin/silvervine.restore \
-   /Users/lanaraimbault/.cargo/bin/silvervine
-launchctl kickstart -k gui/501/com.nicholasraimbault.silvervine.tray
-```
-
-- [ ] **Step 6: Commit the verified candidate version**
+If any physical-Mac requirement fails, the user restores 2.1.2:
 
 ```bash
-git add Cargo.toml Cargo.lock
-git commit -m "chore: prepare version 2.1.3"
+cp "$HOME/.cargo/bin/silvervine-2.1.2.rollback" \
+   "$HOME/.cargo/bin/silvervine.restore"
+chmod 755 "$HOME/.cargo/bin/silvervine.restore"
+mv "$HOME/.cargo/bin/silvervine.restore" \
+   "$HOME/.cargo/bin/silvervine"
+launchctl kickstart -k \
+  "gui/$(id -u)/com.nicholasraimbault.silvervine.tray"
 ```
+
+Do not merge or create `v2.1.3` until the physical confirmation passes.
 
 ---
 
@@ -595,39 +598,17 @@ git commit -m "chore: prepare version 2.1.3"
 - GitHub pull request from `fix/macos-tray-event-loop` to `master`
 - Git tag: `v2.1.3`
 - Published release assets generated by `.github/workflows/release.yml`
-- Final Mac binary: `/Users/lanaraimbault/.cargo/bin/silvervine`
+- User-operated final Mac binary: `~/.cargo/bin/silvervine`
 
 **Interfaces:**
-- Consumes: candidate commit proven by Task 3.
-- Produces: merged source, official cargo-dist release, and Mac installation traceable to the official artifact.
+- Consumes: green CI and the physical candidate confirmation from Task 3.
+- Produces: merged source, official cargo-dist release, and a physical Mac running the official 2.1.3 artifact.
 
-- [ ] **Step 1: Run the complete pre-PR source gate**
+- [ ] **Step 1: Review and merge the pull request**
 
-Run from a clean checkout of the candidate commit:
+Record the failing 2.1.2 baseline, passing source gates, native macOS CI, and physical candidate observations in the PR body. Review the final diff for the approved invariants, mark the PR ready, and squash-merge only when every required check passes and no review finding remains.
 
-```bash
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-features --no-fail-fast
-cargo build --release --locked
-cargo deny check advisories bans licenses sources
-git diff --check
-```
-
-Expected: every command exits 0. Record the total test count and any intentional ignored-test count from the full test output.
-
-- [ ] **Step 2: Push, review, and merge the pull request**
-
-Push `fix/macos-tray-event-loop`, open a PR whose body records the failing 2.1.2 baseline and passing Task 3 evidence, and wait for every required Linux and macOS CI check. Review the final diff for the approved invariants, then squash-merge only when all required checks pass.
-
-Required PR evidence:
-
-- activation policy changed from `2` to `1` on the Mac;
-- a real status item appeared;
-- Quit dispatched and the LaunchAgent restarted cleanly;
-- Linux gates remained green.
-
-- [ ] **Step 3: Tag the exact merged commit and monitor publication**
+- [ ] **Step 2: Tag the exact merged commit and monitor publication**
 
 Fast-forward local `master` to the merged commit. Confirm `Cargo.toml` reports `2.1.3`, create annotated tag `v2.1.3` on that exact commit, and push the tag. Watch `.github/workflows/release.yml` to successful completion.
 
@@ -638,19 +619,23 @@ Required release state:
 - all expected macOS and Linux archives, installers, and checksum files are uploaded;
 - unified and per-archive checksums validate.
 
-- [ ] **Step 4: Install only the official latest release on the Mac**
+- [ ] **Step 3: Install the official latest release on the physical Mac**
 
-Download the official 2.1.3 Apple Silicon archive and checksum, verify it, and compare its binary digest with the final installed binary. Use the official latest-release installer to install 2.1.3, then restart the LaunchAgent.
+The user replaces the branch-built candidate through the official installer:
 
-Required state:
-
-```text
-silvervine 2.1.3
-activationPolicy = 1 (Accessory)
-heartbeat_stale = false
-published asset digest = installed binary digest
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/nicholasraimbault/silvervine/releases/latest/download/silvervine-installer.sh \
+  | sh
+launchctl kickstart -k \
+  "gui/$(id -u)/com.nicholasraimbault.silvervine.tray"
+silvervine --version
 ```
 
-- [ ] **Step 5: Repeat the complete live tray gate on the official binary**
+Required output: `silvervine 2.1.3`.
 
-Repeat Task 3 Steps 4-5 against the official installed binary: require a visible status item/surface, AppKit event servicing, working Quit, clean process exit, successful LaunchAgent restart, and a fresh heartbeat. Remove the rollback binary only after these checks pass.
+- [ ] **Step 4: Repeat the physical tray gate on the official binary**
+
+Repeat Task 3 Steps 4-5 against the official installed binary: require policy `1`, a visible icon without a Dock icon, a working menu, clean Quit, successful LaunchAgent restart, and a fresh heartbeat. Independently download the published Apple Silicon archive and checksum, validate the archive, and confirm the published binary reports `silvervine 2.1.3`.
+
+Remove `~/.cargo/bin/silvervine-2.1.2.rollback` only after the official-binary checks pass.
