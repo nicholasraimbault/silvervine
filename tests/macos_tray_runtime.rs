@@ -7,9 +7,7 @@ fn main() {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use objc2_app_kit::{
-        NSApplicationActivationPolicy, NSRunningApplication,
-    };
+    use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication};
 
     struct ChildGuard(Child);
 
@@ -40,11 +38,9 @@ fn main() {
         if let Some(status) = daemon.0.try_wait().expect("query daemon status") {
             panic!("Silvervine daemon exited before AppKit initialization: {status}");
         }
-        if let Some(application) =
-            NSRunningApplication::runningApplicationWithProcessIdentifier(
-                daemon.0.id() as libc::pid_t,
-            )
-        {
+        if let Some(application) = NSRunningApplication::runningApplicationWithProcessIdentifier(
+            daemon.0.id() as libc::pid_t,
+        ) {
             observed = Some(application.activationPolicy());
             if observed == Some(NSApplicationActivationPolicy::Accessory) {
                 break;

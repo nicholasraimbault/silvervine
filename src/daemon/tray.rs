@@ -308,14 +308,10 @@ struct TrayInner {
 }
 #[cfg(target_os = "macos")]
 struct TrayInner {
-    _tray: tray_icon::TrayIcon,
-    /// Map of `MenuId` strings → command, for click-event routing.
-    /// We use `String` keys because `MenuId` is a thin wrapper around it.
-    /// The map is kept alive as part of `TrayInner` so the click-event
-    /// handler closure (which got a clone of this map at construction
-    /// time) doesn't see a moving target — even though no one reads
-    /// this field directly after construction.
-    _routes: std::collections::HashMap<String, TrayCommand>,
+    application: objc2::rc::Retained<objc2_app_kit::NSApplication>,
+    tray: std::cell::RefCell<tray_icon::TrayIcon>,
+    routes: std::sync::Arc<Mutex<std::collections::HashMap<String, TrayCommand>>>,
+    generation: std::cell::Cell<u64>,
 }
 
 /// `ksni::Tray` implementation. Holds a snapshot of `MenuState` and a
@@ -555,12 +551,7 @@ impl Tray {
         };
 
         #[cfg(target_os = "macos")]
-        let inner = {
-            let routes = build_routes(&initial_state, 0);
-            build_tray_icon(&initial_state, &routes, tx.clone()).map_err(|e| {
-                Error::unsupported_platform(format!("tray-icon initialization failed: {e}"))
-            })?
-        };
+        let inner = build_tray_icon(&initial_state, tx.clone())?;
 
         Ok(Self {
             rx: Mutex::new(rx),
@@ -592,14 +583,18 @@ impl Tray {
 
     /// Update the menu state. On Linux the live `ksni` service is
     /// pushed the new state immediately, so the rendered menu reflects
-    /// the change without a tray-icon rebuild. On macOS the daemon's
-    /// main loop drops + reconstructs `Tray` when state changes
-    /// non-trivially (a follow-up can wire `tray-icon`'s `set_menu`).
+    /// the change without a tray-icon rebuild. On macOS the live
+    /// `TrayIcon` menu and shared route table are replaced in place
+    /// under a new generation so stale click IDs cannot hit fresh routes.
     #[allow(
         clippy::needless_pass_by_value,
         reason = "Linux branch moves `state` into the ksni update closure; macOS branch only stores a clone. Borrow-only signature would require caller-side cloning on every call."
     )]
     pub fn set_state(&self, state: MenuState) {
+        #[cfg(target_os = "macos")]
+        if let Some(inner) = &self.inner {
+            inner.replace_menu(&state);
+        }
         *self.state.lock().unwrap() = state.clone();
         #[cfg(target_os = "linux")]
         if let Some(inner) = &self.inner {
@@ -611,7 +606,7 @@ impl Tray {
                 tray.state = state;
             });
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         drop(state);
     }
 
@@ -647,6 +642,21 @@ impl Tray {
     #[must_use]
     pub fn has_ui(&self) -> bool {
         self.inner.is_some()
+    }
+
+    /// Wait briefly for platform UI events, or sleep when no live UI is attached.
+    ///
+    /// On macOS this pumps AppKit with a bounded `nextEvent` wait so menu
+    /// clicks and status-item updates are delivered on the daemon main
+    /// thread without calling `NSApplication::run`. Elsewhere (and for
+    /// headless trays) this is a plain sleep of the same duration.
+    pub(crate) fn wait_for_platform_event(&self, timeout: std::time::Duration) {
+        #[cfg(target_os = "macos")]
+        if let Some(inner) = &self.inner {
+            inner.pump_events(timeout);
+            return;
+        }
+        std::thread::sleep(timeout);
     }
 }
 
@@ -720,53 +730,49 @@ fn menu_item_id(generation: u64, index: usize, item: &MenuItemSpec) -> String {
 /// Construct the live tray icon (macOS only — Linux uses `ksni`
 /// directly via [`SilvervineKsniTray`]).
 ///
-/// This is the only function in this module that touches the macOS
-/// `tray-icon` GUI handle — guarded by a `Result` so callers can
-/// fall back to headless mode if it fails.
+/// Initializes `NSApplication` as an Accessory process and finishes
+/// launching on the main thread before any `Menu` / `TrayIcon` is built,
+/// then installs one shared generation-scoped route handler.
 ///
 /// Tests do **not** call this; they use [`Tray::headless`].
 #[cfg(target_os = "macos")]
 #[allow(clippy::needless_pass_by_value)] // `tx` is moved into the click handler closure
-fn build_tray_icon(
-    state: &MenuState,
-    routes: &std::collections::HashMap<String, TrayCommand>,
-    tx: Sender<TrayCommand>,
-) -> std::result::Result<TrayInner, tray_icon::Error> {
-    use tray_icon::menu::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem};
+fn build_tray_icon(state: &MenuState, tx: Sender<TrayCommand>) -> Result<TrayInner> {
+    use objc2::rc::autoreleasepool;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
     use tray_icon::TrayIconBuilder;
 
-    let menu = Menu::new();
-    for (idx, spec) in menu_layout(state).iter().enumerate() {
-        let id = MenuId::new(menu_item_id(0, idx, spec));
-        match spec {
-            MenuItemSpec::BrowserStatus { .. } | MenuItemSpec::Action { .. } => {
-                let item = MenuItem::with_id(id, spec.label(), true, None);
-                let _ = menu.append(&item);
-            }
-            MenuItemSpec::Toggle { checked, .. } => {
-                let item = CheckMenuItem::with_id(id, spec.label(), true, *checked, None);
-                let _ = menu.append(&item);
-            }
-            MenuItemSpec::Separator => {
-                let item = PredefinedMenuItem::separator();
-                let _ = menu.append(&item);
-            }
+    let mtm = MainThreadMarker::new().ok_or_else(|| {
+        Error::unsupported_platform("macOS tray initialization requires the process main thread")
+    })?;
+    let application = autoreleasepool(|_| {
+        let application = NSApplication::sharedApplication(mtm);
+        if !application.setActivationPolicy(NSApplicationActivationPolicy::Accessory) {
+            return Err(Error::unsupported_platform(
+                "macOS refused accessory activation policy for the tray daemon",
+            ));
         }
-    }
+        application.finishLaunching();
+        Ok(application)
+    })?;
 
-    let routes_for_handler = routes.clone();
+    let generation = 0;
+    let routes = std::sync::Arc::new(Mutex::new(build_routes(state, generation)));
+    let routes_for_handler = std::sync::Arc::clone(&routes);
     let tx_for_handler = tx.clone();
-    tray_icon::menu::MenuEvent::set_event_handler(Some(
-        move |event: tray_icon::menu::MenuEvent| {
-            let id_str = event.id().0.clone();
-            if let Some(cmd) = routes_for_handler.get(&id_str) {
-                let _ = tx_for_handler.send(cmd.clone());
-            }
-        },
-    ));
+    tray_icon::menu::MenuEvent::set_event_handler(Some(move |event| {
+        let command = routes_for_handler
+            .lock()
+            .unwrap()
+            .get(&event.id().0)
+            .cloned();
+        if let Some(command) = command {
+            let _ = tx_for_handler.send(command);
+        }
+    }));
 
-    let _ = tx; // reserved for future tray click handlers
-
+    let menu = build_macos_menu(state, generation);
     let mut builder = TrayIconBuilder::new()
         .with_tooltip("Silvervine — Widevine helper")
         .with_menu(Box::new(menu));
@@ -787,11 +793,95 @@ fn build_tray_icon(
             "could not decode embedded tray icon; continuing without an icon"
         );
     }
-    let tray = builder.build()?;
+    let tray = builder.build().map_err(|error| {
+        Error::unsupported_platform(format!("tray-icon initialization failed: {error}"))
+    })?;
+
     Ok(TrayInner {
-        _tray: tray,
-        _routes: routes.clone(),
+        application,
+        tray: std::cell::RefCell::new(tray),
+        routes,
+        generation: std::cell::Cell::new(generation),
     })
+}
+
+/// Build the Cocoa menu for a given generation so initial render and
+/// live replacement share identical `MenuId`s with [`build_routes`].
+#[cfg(target_os = "macos")]
+fn build_macos_menu(state: &MenuState, generation: u64) -> tray_icon::menu::Menu {
+    use tray_icon::menu::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem};
+
+    let menu = Menu::new();
+    for (idx, spec) in menu_layout(state).iter().enumerate() {
+        let id = MenuId::new(menu_item_id(generation, idx, spec));
+        match spec {
+            MenuItemSpec::BrowserStatus { .. } | MenuItemSpec::Action { .. } => {
+                let item = MenuItem::with_id(id, spec.label(), true, None);
+                let _ = menu.append(&item);
+            }
+            MenuItemSpec::Toggle { checked, .. } => {
+                let item = CheckMenuItem::with_id(id, spec.label(), true, *checked, None);
+                let _ = menu.append(&item);
+            }
+            MenuItemSpec::Separator => {
+                let item = PredefinedMenuItem::separator();
+                let _ = menu.append(&item);
+            }
+        }
+    }
+    menu
+}
+
+#[cfg(target_os = "macos")]
+impl TrayInner {
+    fn replace_menu(&self, state: &MenuState) {
+        let next_generation = self
+            .generation
+            .get()
+            .checked_add(1)
+            .expect("macOS tray menu generation overflow");
+        let menu = build_macos_menu(state, next_generation);
+        let routes = build_routes(state, next_generation);
+
+        *self.routes.lock().unwrap() = routes;
+        self.tray.borrow_mut().set_menu(Some(Box::new(menu)));
+        self.generation.set(next_generation);
+    }
+
+    fn pump_events(&self, timeout: std::time::Duration) {
+        use objc2::rc::autoreleasepool;
+        use objc2_app_kit::NSEventMask;
+        use objc2_foundation::{NSDate, NSDefaultRunLoopMode};
+
+        autoreleasepool(|_| {
+            let deadline = NSDate::dateWithTimeIntervalSinceNow(timeout.as_secs_f64());
+            if let Some(event) = self
+                .application
+                .nextEventMatchingMask_untilDate_inMode_dequeue(
+                    NSEventMask::Any,
+                    Some(&deadline),
+                    NSDefaultRunLoopMode,
+                    true,
+                )
+            {
+                self.application.sendEvent(&event);
+            }
+
+            let drain_deadline = NSDate::distantPast();
+            while let Some(event) = self
+                .application
+                .nextEventMatchingMask_untilDate_inMode_dequeue(
+                    NSEventMask::Any,
+                    Some(&drain_deadline),
+                    NSDefaultRunLoopMode,
+                    true,
+                )
+            {
+                self.application.sendEvent(&event);
+            }
+            self.application.updateWindows();
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1116,10 +1206,7 @@ mod tests {
             label: "Patch Now".into(),
             command: TrayCommand::PatchAll,
         };
-        assert_eq!(
-            menu_item_id(7, 2, &item),
-            menu_item_id(7, 2, &item)
-        );
+        assert_eq!(menu_item_id(7, 2, &item), menu_item_id(7, 2, &item));
         assert_ne!(menu_item_id(7, 1, &item), menu_item_id(7, 2, &item));
         assert_ne!(menu_item_id(7, 2, &item), menu_item_id(8, 2, &item));
     }
@@ -1139,7 +1226,10 @@ mod tests {
         assert!(first.keys().all(|id| !second.contains_key(id)));
         assert_eq!(first.len(), second.len());
         for command in first.values() {
-            let first_count = first.values().filter(|candidate| *candidate == command).count();
+            let first_count = first
+                .values()
+                .filter(|candidate| *candidate == command)
+                .count();
             let second_count = second
                 .values()
                 .filter(|candidate| *candidate == command)
@@ -1189,17 +1279,5 @@ mod tests {
             launch_at_login: false,
         });
         assert!(t.try_recv().is_none());
-    }
-
-    /// `TrayInner::routes` is shaped as expected (smoke check) — we
-    /// can't construct a `TrayIcon` in a headless test, so we just
-    /// assert the field's existence/type at compile time via a function
-    /// that takes `&TrayInner::routes`.
-    #[test]
-    fn tray_inner_routes_field_present() {
-        // Synthesize a minimal Routes map and verify the type matches.
-        let m: std::collections::HashMap<String, TrayCommand> = std::collections::HashMap::new();
-        // Drop ensures the type-checker actually verifies the type.
-        drop(m);
     }
 }

@@ -124,10 +124,16 @@ objc2-foundation = { version = "0.3", features = [
     "NSString",
     "NSNotification",
     "NSOperation",
+    "NSDate",
+    "NSRunLoop",
+    "NSObjCRuntime",
     "block2",
 ] }
 objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSResponder",
     "NSRunningApplication",
+    "NSEvent",
     "NSWorkspace",
 ] }
 block2 = "0.6"
