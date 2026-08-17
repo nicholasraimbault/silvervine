@@ -111,7 +111,7 @@ jobs:
         with:
           key: tarpaulin
       - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
           tool: cargo-tarpaulin
       - run: cargo tarpaulin --out Xml --workspace --skip-clean --timeout 300
