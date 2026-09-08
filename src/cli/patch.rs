@@ -76,6 +76,15 @@ where
     F: FnOnce() -> Result<CachedCdm>,
 {
     let candidates = patch::select_browsers(browsers, name_filter);
+    if should_emit_hooks(options) && !candidates.is_empty() {
+        let names: Vec<&str> = candidates.iter().map(|browser| browser.name()).collect();
+        if let Err(error) = crate::hooks::run_pre_patch(&names) {
+            return candidates
+                .iter()
+                .map(|browser| PatchReport::failure(browser.name(), options.dry_run, &error))
+                .collect();
+        }
+    }
     let reports = patch::PatchBatch::new(patcher, options).execute(&candidates, cdm_resolver);
     if should_emit_hooks(options) {
         for report in &reports {
@@ -279,10 +288,52 @@ mod tests {
     use super::*;
     use crate::browsers::BrowserKind;
     use std::cell::RefCell;
+    use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    struct ScopedEnv {
+        key: &'static str,
+        prev: Option<OsString>,
+    }
+    impl ScopedEnv {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_executable_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).unwrap();
+    }
+
+    fn isolate_user_config(
+        tmp: &TempDir,
+    ) -> (std::sync::MutexGuard<'static, ()>, ScopedEnv, ScopedEnv) {
+        (
+            crate::test_support::env_lock(),
+            ScopedEnv::set("XDG_CONFIG_HOME", tmp.path()),
+            ScopedEnv::set("HOME", tmp.path()),
+        )
+    }
+
     fn test_managed_marker() -> crate::widevine::ownership::ManagedMarker {
         let manifest = br#"{"version":"1.0"}"#;
         crate::widevine::ownership::ManagedMarker {
@@ -418,8 +469,80 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn run_patch_flow_pre_patch_failure_skips_execute() {
+        let tmp = TempDir::new().unwrap();
+        let _iso = isolate_user_config(&tmp);
+        write_executable_script(
+            &tmp.path().join("silvervine/hooks/pre-patch"),
+            "#!/bin/sh\nexit 7\n",
+        );
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let h = tmp.path().join("h");
+        fs::create_dir_all(&h).unwrap();
+        let browsers_list = vec![make_browser(h, "Helium")];
+        let patcher = MockPatcher::with_version("v");
+        let opts = PatchOptions {
+            force_while_running: true,
+            lock_path: Some(tmp.path().join("patch.lock")),
+            backups_dir: Some(tmp.path().join("backups")),
+            ..Default::default()
+        };
+        let reports = run_patch_flow(
+            &browsers_list,
+            None,
+            || panic!("pre-patch abort must not resolve a CDM"),
+            &patcher,
+            &opts,
+        );
+        assert_eq!(reports.len(), 1);
+        assert!(!reports[0].success);
+        assert!(reports[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("pre-patch")));
+        assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_patch_flow_privileged_skips_pre_patch() {
+        let tmp = TempDir::new().unwrap();
+        let _iso = isolate_user_config(&tmp);
+        write_executable_script(
+            &tmp.path().join("silvervine/hooks/pre-patch"),
+            "#!/bin/sh\nexit 7\n",
+        );
+        let cache = tmp.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let h = tmp.path().join("h");
+        fs::create_dir_all(&h).unwrap();
+        let browsers_list = vec![make_browser(h, "Helium")];
+        let patcher = MockPatcher::with_version("v");
+        let opts = PatchOptions {
+            force_while_running: true,
+            lock_path: Some(tmp.path().join("patch.lock")),
+            backups_dir: Some(tmp.path().join("backups")),
+            as_root: true,
+            ..Default::default()
+        };
+        let reports = run_patch_flow(
+            &browsers_list,
+            None,
+            || Ok(make_cdm(&cache, "1.0")),
+            &patcher,
+            &opts,
+        );
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].success);
+        assert_eq!(patcher.write_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn run_patch_flow_empty_browsers_returns_empty_reports() {
         let tmp = TempDir::new().unwrap();
+        let _iso = isolate_user_config(&tmp);
         let cache = tmp.path().join("cache");
         fs::create_dir_all(&cache).unwrap();
         let reports = run_patch_flow(
@@ -435,6 +558,7 @@ mod tests {
     #[test]
     fn run_patch_flow_filter_by_name_only_patches_match() {
         let tmp = TempDir::new().unwrap();
+        let _iso = isolate_user_config(&tmp);
         let cache = tmp.path().join("cache");
         fs::create_dir_all(&cache).unwrap();
         let h = tmp.path().join("h");
@@ -462,6 +586,7 @@ mod tests {
     #[test]
     fn external_replacement_requires_one_unique_installation() {
         let tmp = TempDir::new().unwrap();
+        let _iso = isolate_user_config(&tmp);
         let first = tmp.path().join("first");
         let second = tmp.path().join("second");
         fs::create_dir_all(&first).unwrap();
@@ -499,6 +624,7 @@ mod tests {
     #[test]
     fn run_patch_flow_case_insensitive_filter() {
         let tmp = TempDir::new().unwrap();
+        let _iso = isolate_user_config(&tmp);
         let cache = tmp.path().join("cache");
         fs::create_dir_all(&cache).unwrap();
         let h = tmp.path().join("h");
@@ -524,6 +650,7 @@ mod tests {
     #[test]
     fn run_patch_flow_dry_run_does_not_write() {
         let tmp = TempDir::new().unwrap();
+        let _iso = isolate_user_config(&tmp);
         let cache = tmp.path().join("cache");
         fs::create_dir_all(&cache).unwrap();
         let h = tmp.path().join("h");
@@ -555,6 +682,7 @@ mod tests {
     #[test]
     fn run_patch_flow_cdm_failure_yields_per_browser_failure_reports() {
         let tmp = TempDir::new().unwrap();
+        let _iso = isolate_user_config(&tmp);
         let h = tmp.path().join("h");
         fs::create_dir_all(&h).unwrap();
         let browsers_list = vec![make_browser(h, "Helium")];
@@ -579,6 +707,7 @@ mod tests {
     #[test]
     fn run_patch_flow_records_per_browser_write_failure() {
         let tmp = TempDir::new().unwrap();
+        let _iso = isolate_user_config(&tmp);
         let cache = tmp.path().join("cache");
         fs::create_dir_all(&cache).unwrap();
         let h = tmp.path().join("h");

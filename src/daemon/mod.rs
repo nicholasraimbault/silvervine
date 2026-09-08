@@ -683,6 +683,20 @@ fn drive_patch_flow_with_cdm(
         return results;
     }
 
+    let names: Vec<&str> = needs.iter().map(|browser| browser.name()).collect();
+    if let Err(error) = crate::hooks::run_pre_patch(&names) {
+        tracing::warn!(
+            error = %error,
+            "pre-patch hook failed; skipping patch"
+        );
+        results.extend(
+            needs
+                .into_iter()
+                .map(|browser| (browser.name().to_string(), false)),
+        );
+        return results;
+    }
+
     let options = crate::patch::PatchOptions {
         force_while_running: force,
         dry_run: false,
@@ -986,6 +1000,16 @@ mod tests {
             install_path: install,
             kind: BrowserKind::Detected,
         }
+    }
+
+    #[cfg(unix)]
+    fn write_executable_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
     }
 
     /// Build a minimal `RunOptions` that uses the supplied tempdir for all
@@ -1714,6 +1738,28 @@ mod tests {
         let results = drive_patch_flow(&browsers, Some("Helium"), false);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "Helium");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn drive_patch_flow_pre_patch_failure_skips_execute() {
+        let _g = crate::test_support::env_lock();
+        let tmp = TempDir::new().unwrap();
+        let _xdg = ScopedEnv::set("XDG_CONFIG_HOME", tmp.path());
+        let _home = ScopedEnv::set("HOME", tmp.path());
+        let marker = tmp.path().join("pre-patch.ran");
+        write_executable_script(
+            &tmp.path().join("silvervine/hooks/pre-patch"),
+            &format!("#!/bin/sh\necho ran > {}\nexit 7\n", marker.display()),
+        );
+        let install = tmp.path().join("h");
+        std::fs::create_dir_all(&install).unwrap();
+        let browsers = vec![fake_browser("Helium", install.clone())];
+        let cdm = make_candidate(tmp.path(), "4.10.2934.0", b"candidate");
+        let results = drive_patch_flow_with_cdm(&browsers, None, false, Some(cdm));
+        assert!(marker.exists(), "pre-patch hook must run before execute");
+        assert_eq!(results, vec![("Helium".into(), false)]);
+        assert!(!install.join("WidevineCdm").exists());
     }
 
     /// `IpcSharedState::browsers` mutex round-trip.
