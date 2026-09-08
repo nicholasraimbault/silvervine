@@ -6,7 +6,7 @@ on:
 
 # Only Dependabot PRs are eligible. Human PRs always require manual review.
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
 
 jobs:
@@ -20,15 +20,29 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # NOTE: Dependabot auto-merge is DISABLED. See commit message
-      # for the 2026-05-14 incident details. Until `master` has branch
-      # protection requiring CI to pass before merge, auto-merge is
-      # too dangerous. Re-enable by restoring the approve + merge
-      # steps after configuring branch protection.
-      - name: Comment with update-type
+      # Patch + minor only. Major bumps still require human review.
+      # Re-enabled after master gained required status checks (strict),
+      # the documented precondition from the 2026-05-14 auto-merge incident.
+      - name: Approve patch + minor PRs
+        if: steps.metadata.outputs.update-type == 'version-update:semver-patch' || steps.metadata.outputs.update-type == 'version-update:semver-minor'
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+        run: gh pr review --approve "$PR_URL"
+
+      # Enable GitHub-native auto-merge (squash). Merge fires once
+      # required CI checks pass and the branch is up to date.
+      - name: Enable auto-merge for patch + minor
+        if: steps.metadata.outputs.update-type == 'version-update:semver-patch' || steps.metadata.outputs.update-type == 'version-update:semver-minor'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --auto --squash "$PR_URL"
+
+      - name: Comment on major bumps
+        if: steps.metadata.outputs.update-type == 'version-update:semver-major'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: >-
-          gh pr comment "$PR_URL" --body "Dependabot update-type: \`$UPDATE_TYPE\`. Auto-merge is currently disabled; merge manually after reviewing CI."
+          gh pr comment "$PR_URL" --body "Major version bump detected — auto-merge skipped. Please review breaking changes before merging."
