@@ -521,9 +521,23 @@ fn run_event_loop(
         if stop.load(Ordering::SeqCst) {
             return Ok(());
         }
-        // Try to receive a command without blocking forever — we want
-        // to observe the stop flag periodically.
-        let cmd = tray.try_recv();
+        // Bounded wait so the stop flag is observed at least every 100 ms.
+        let cmd = {
+            #[cfg(target_os = "macos")]
+            {
+                match tray.try_recv() {
+                    Some(cmd) => Some(cmd),
+                    None => {
+                        tray.wait_for_platform_event(Duration::from_millis(100));
+                        tray.try_recv()
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                tray.recv_timeout(Duration::from_millis(100))
+            }
+        };
         match cmd {
             Some(TrayCommand::Quit) => {
                 tracing::info!(target: "silvervine::daemon", "tray Quit; exiting");
@@ -558,9 +572,7 @@ fn run_event_loop(
                 );
                 handle_toggle_launch_at_login(target);
             }
-            None => {
-                tray.wait_for_platform_event(Duration::from_millis(100));
-            }
+            None => {}
         }
         if single_iteration {
             return Ok(());
