@@ -3,8 +3,10 @@
 //! This command never downloads a replacement in-process and never writes
 //! over `/proc/self/exe`. It locates the cargo-dist `silvervine-update`
 //! sidecar next to the running binary plus a matching install receipt,
-//! then runs that sidecar with inherited stdio. After a successful swap
-//! the user (or systemd/LaunchAgent) must restart the daemon.
+//! then runs that sidecar with captured stdout/stderr (never inherited).
+//! cargo-dist's axoupdater exits 0 when already current, so `updated` is
+//! true only when captured output shows an install. After a real swap the
+//! user (or systemd/LaunchAgent) must restart the daemon.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -68,7 +70,7 @@ fn run_with(
 ) -> Result<SelfUpdateOutcome> {
     if std::env::var_os(NOOP_ENV).is_some() {
         let outcome = noop_outcome();
-        render(args, &outcome, out)?;
+        render(args, &outcome, "", out)?;
         return Ok(outcome);
     }
 
@@ -95,19 +97,13 @@ fn run_with(
             updated: false,
             reason: "dry-run".into(),
         };
-        render(args, &outcome, out)?;
+        render(args, &outcome, "", out)?;
         return Ok(outcome);
     }
 
-    invoke_sidecar(&sidecar)?;
-
-    let outcome = SelfUpdateOutcome {
-        current_version: running_version(),
-        latest_version: running_version(),
-        updated: true,
-        reason: format!("sidecar; {RESTART_NOTE}"),
-    };
-    render(args, &outcome, out)?;
+    let captured = invoke_sidecar(&sidecar)?;
+    let outcome = outcome_from_sidecar(&captured);
+    render(args, &outcome, &captured, out)?;
     Ok(outcome)
 }
 
@@ -142,18 +138,99 @@ fn receipt_path() -> PathBuf {
     config_home.join("silvervine").join(RECEIPT_NAME)
 }
 
-fn invoke_sidecar(sidecar: &Path) -> Result<()> {
-    let status = Command::new(sidecar)
-        .status()
+fn invoke_sidecar(sidecar: &Path) -> Result<String> {
+    let output = Command::new(sidecar)
+        .output()
         .map_err(|e| Error::other(format!("failed to run {SIDECAR_NAME}: {e}")))?;
-    if status.success() {
-        Ok(())
+    let captured = combine_captured(&output.stdout, &output.stderr);
+    if output.status.success() {
+        Ok(captured)
+    } else if captured.trim().is_empty() {
+        Err(Error::other(format!(
+            "{SIDECAR_NAME} exited with {}",
+            output.status
+        )))
     } else {
-        Err(Error::other(format!("{SIDECAR_NAME} exited with {status}")))
+        Err(Error::other(format!(
+            "{SIDECAR_NAME} exited with {}: {}",
+            output.status,
+            captured.trim()
+        )))
     }
 }
 
-fn render(args: &SelfArgs, outcome: &SelfUpdateOutcome, out: &mut dyn Write) -> Result<()> {
+fn combine_captured(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    if stdout.is_empty() {
+        return stderr.into_owned();
+    }
+    if stderr.is_empty() {
+        return stdout.into_owned();
+    }
+    let mut combined = String::with_capacity(stdout.len() + stderr.len() + 1);
+    combined.push_str(&stdout);
+    if !stdout.ends_with('\n') {
+        combined.push('\n');
+    }
+    combined.push_str(&stderr);
+    combined
+}
+
+fn outcome_from_sidecar(captured: &str) -> SelfUpdateOutcome {
+    let current_version = running_version();
+    if sidecar_performed_install(captured) {
+        let latest_version =
+            parse_installed_version(captured).unwrap_or_else(|| current_version.clone());
+        SelfUpdateOutcome {
+            current_version,
+            latest_version,
+            updated: true,
+            reason: format!("sidecar; {RESTART_NOTE}"),
+        }
+    } else {
+        SelfUpdateOutcome {
+            current_version: current_version.clone(),
+            latest_version: current_version,
+            updated: false,
+            reason: "already up to date".into(),
+        }
+    }
+}
+
+/// axoupdater exits 0 when already current; only install phrasing counts.
+fn sidecar_performed_install(captured: &str) -> bool {
+    let lower = captured.to_ascii_lowercase();
+    (lower.contains("new release") && lower.contains("installed"))
+        || lower.contains("everything's installed")
+}
+
+fn parse_installed_version(captured: &str) -> Option<String> {
+    let lower = captured.to_ascii_lowercase();
+    let prefix = "new release ";
+    let suffix = " installed";
+    let start = lower.find(prefix)?;
+    let version_start = start + prefix.len();
+    let rest_lower = &lower[version_start..];
+    let version_len = rest_lower.find(suffix)?;
+    let version = captured
+        .get(version_start..version_start + version_len)?
+        .trim()
+        .trim_end_matches('!')
+        .trim();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version.to_string())
+    }
+}
+
+fn render(
+    args: &SelfArgs,
+    outcome: &SelfUpdateOutcome,
+    sidecar_output: &str,
+    out: &mut dyn Write,
+) -> Result<()> {
     if args.output.json {
         return super::write_json(out, outcome);
     }
@@ -168,12 +245,25 @@ fn render(args: &SelfArgs, outcome: &SelfUpdateOutcome, out: &mut dyn Write) -> 
         )
         .map_err(Error::from),
         _ => {
+            write_captured(out, sidecar_output)?;
             if outcome.updated {
-                writeln!(out, "Updated via {SIDECAR_NAME}.").map_err(Error::from)?;
+                writeln!(out, "{RESTART_NOTE}").map_err(Error::from)
+            } else {
+                Ok(())
             }
-            writeln!(out, "{RESTART_NOTE}").map_err(Error::from)
         }
     }
+}
+
+fn write_captured(out: &mut dyn Write, captured: &str) -> Result<()> {
+    if captured.is_empty() {
+        return Ok(());
+    }
+    write!(out, "{captured}").map_err(Error::from)?;
+    if !captured.ends_with('\n') {
+        writeln!(out).map_err(Error::from)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -291,8 +381,9 @@ mod tests {
         let receipt = tmp.path().join(RECEIPT_NAME);
         fs::write(&receipt, "{}").unwrap();
         let outcome = run_with(&args(), Some(&sidecar), Some(&receipt), &mut Vec::new()).unwrap();
-        assert!(outcome.updated);
-        assert!(outcome.reason.contains("Restart the user daemon"));
+        assert!(!outcome.updated);
+        assert_eq!(outcome.latest_version, outcome.current_version);
+        assert!(!outcome.reason.contains("Restart the user daemon"));
         assert_eq!(fs::read(&running).unwrap(), b"running-daemon-bytes");
         let logged = fs::read_to_string(&args_log).unwrap();
         assert_eq!(
@@ -344,9 +435,145 @@ mod tests {
             },
             ..SelfArgs::default()
         };
-        render(&args, &outcome, &mut output).unwrap();
+        render(&args, &outcome, "", &mut output).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(parsed["updated"], false);
         assert_eq!(parsed["reason"], "dry-run");
+    }
+
+    fn json_args() -> SelfArgs {
+        SelfArgs {
+            output: OutputOptions {
+                json: true,
+                ..OutputOptions::default()
+            },
+            ..SelfArgs::default()
+        }
+    }
+
+    fn human_args() -> SelfArgs {
+        SelfArgs::default()
+    }
+
+    fn seeded(tmp: &TempDir, script: &str) -> (PathBuf, PathBuf) {
+        let sidecar = tmp.path().join(SIDECAR_NAME);
+        write_executable(&sidecar, script);
+        let receipt = tmp.path().join(RECEIPT_NAME);
+        fs::write(&receipt, "{}").unwrap();
+        (sidecar, receipt)
+    }
+
+    #[test]
+    fn sidecar_already_up_to_date_is_not_updated() {
+        let tmp = TempDir::new().unwrap();
+        let (sidecar, receipt) = seeded(
+            &tmp,
+            "#!/bin/sh\necho 'Already up to date; not upgrading' >&2\nexit 0\n",
+        );
+        let outcome = run_with(&args(), Some(&sidecar), Some(&receipt), &mut Vec::new()).unwrap();
+        assert!(!outcome.updated);
+        assert_eq!(outcome.latest_version, outcome.current_version);
+        assert_eq!(outcome.reason, "already up to date");
+    }
+
+    #[test]
+    fn sidecar_empty_success_is_not_updated() {
+        let tmp = TempDir::new().unwrap();
+        let (sidecar, receipt) = seeded(&tmp, "#!/bin/sh\nexit 0\n");
+        let outcome = run_with(&args(), Some(&sidecar), Some(&receipt), &mut Vec::new()).unwrap();
+        assert!(!outcome.updated);
+        assert_eq!(outcome.latest_version, outcome.current_version);
+        assert_eq!(outcome.reason, "already up to date");
+    }
+
+    #[test]
+    fn sidecar_install_phrasing_is_updated() {
+        let tmp = TempDir::new().unwrap();
+        let (sidecar, receipt) = seeded(
+            &tmp,
+            "#!/bin/sh\necho 'New release 3.1.4 installed!' >&2\nexit 0\n",
+        );
+        let outcome = run_with(&args(), Some(&sidecar), Some(&receipt), &mut Vec::new()).unwrap();
+        assert!(outcome.updated);
+        assert_eq!(outcome.latest_version, "3.1.4");
+        assert!(outcome.reason.contains("Restart the user daemon"));
+    }
+
+    #[test]
+    fn json_path_does_not_include_sidecar_stdout() {
+        let tmp = TempDir::new().unwrap();
+        let (sidecar, receipt) = seeded(
+            &tmp,
+            "#!/bin/sh\necho 'SIDECAR_STDOUT_MARKER'\necho 'New release 9.9.9 installed!' >&2\nexit 0\n",
+        );
+        let mut output = Vec::new();
+        let outcome = run_with(&json_args(), Some(&sidecar), Some(&receipt), &mut output).unwrap();
+        assert!(outcome.updated);
+        assert_eq!(outcome.latest_version, "9.9.9");
+        let text = String::from_utf8(output).unwrap();
+        assert!(
+            !text.contains("SIDECAR_STDOUT_MARKER"),
+            "json mixed with sidecar stdout: {text}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(text.trim()).expect("json path must be one parseable document");
+        assert_eq!(parsed["updated"], true);
+        assert_eq!(parsed["latest_version"], "9.9.9");
+        assert_eq!(parsed["current_version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn human_path_prints_sidecar_then_restart_only_when_updated() {
+        let tmp = TempDir::new().unwrap();
+        let (sidecar, receipt) = seeded(
+            &tmp,
+            "#!/bin/sh\necho 'Already up to date; not upgrading' >&2\nexit 0\n",
+        );
+        let mut current = Vec::new();
+        let outcome =
+            run_with(&human_args(), Some(&sidecar), Some(&receipt), &mut current).unwrap();
+        assert!(!outcome.updated);
+        let current_text = String::from_utf8(current).unwrap();
+        assert!(current_text.contains("Already up to date; not upgrading"));
+        assert!(!current_text.contains(RESTART_NOTE));
+
+        let tmp = TempDir::new().unwrap();
+        let (sidecar, receipt) = seeded(
+            &tmp,
+            "#!/bin/sh\necho 'New release 4.0.0 installed!' >&2\nexit 0\n",
+        );
+        let mut swapped = Vec::new();
+        let outcome =
+            run_with(&human_args(), Some(&sidecar), Some(&receipt), &mut swapped).unwrap();
+        assert!(outcome.updated);
+        let swapped_text = String::from_utf8(swapped).unwrap();
+        assert!(swapped_text.contains("New release 4.0.0 installed!"));
+        assert!(swapped_text.contains(RESTART_NOTE));
+    }
+
+    #[test]
+    fn install_phrasing_detects_axoupdater_success() {
+        assert!(sidecar_performed_install(
+            "Checking for updates...\nNew release 2.2.0 installed!\n"
+        ));
+        assert!(sidecar_performed_install("everything's installed!"));
+        assert!(!sidecar_performed_install(
+            "Checking for updates...\nAlready up to date; not upgrading\n"
+        ));
+        assert!(!sidecar_performed_install(""));
+        assert!(!sidecar_performed_install("Checking for updates...\n"));
+    }
+
+    #[test]
+    fn parse_installed_version_from_axoupdater_line() {
+        assert_eq!(
+            parse_installed_version("New release 2.2.0 installed!"),
+            Some("2.2.0".into())
+        );
+        assert_eq!(
+            parse_installed_version("Already up to date; not upgrading"),
+            None
+        );
+        assert_eq!(parse_installed_version("New release installed"), None);
     }
 }
