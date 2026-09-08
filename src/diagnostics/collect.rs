@@ -299,7 +299,18 @@ fn collect_cdm(
     };
 
     let ownership = classify_passive(browser, &target, candidate);
-    let identity = inspect_cdm_identity(&target);
+    let known = ownership
+        .details
+        .get("library_sha512")
+        .map(String::as_str)
+        .filter(|digest| !digest.is_empty())
+        .or_else(|| match ownership.kind {
+            OwnershipKind::Managed | OwnershipKind::LegacyManaged => {
+                candidate.and_then(CachedCdm::verified_library_sha512)
+            }
+            _ => None,
+        });
+    let identity = inspect_cdm_identity(&target, known);
     let mut checks = vec![ownership_check(&ownership, &target)];
 
     if let Some(library) = identity.library.as_ref() {
@@ -469,10 +480,12 @@ struct CdmIdentity {
     library_sha512: Option<String>,
 }
 
-fn inspect_cdm_identity(target: &Path) -> CdmIdentity {
+fn inspect_cdm_identity(target: &Path, known: Option<&str>) -> CdmIdentity {
     let version = read_manifest_version(&target.join("manifest.json"));
     let library = find_contained_library(target);
-    let library_sha512 = library.as_ref().and_then(|path| safe_library_digest(path));
+    let library_sha512 = library
+        .as_ref()
+        .and_then(|path| library_digest(path, known));
     CdmIdentity {
         version,
         library,
@@ -534,6 +547,15 @@ fn find_contained_library(root: &Path) -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+fn library_digest(path: &Path, known: Option<&str>) -> Option<String> {
+    if let Some(digest) = known {
+        if !digest.is_empty() {
+            return Some(digest.to_owned());
+        }
+    }
+    safe_library_digest(path)
 }
 
 fn safe_library_digest(path: &Path) -> Option<String> {
@@ -1268,7 +1290,7 @@ fn inspect_external_hint(
         }
     }
     if metadata.is_dir() {
-        let identity = inspect_cdm_identity(candidate);
+        let identity = inspect_cdm_identity(candidate, None);
         return Some(ExternalCdmHint {
             path: canonicalize_path(candidate).unwrap_or_else(|_| candidate.to_path_buf()),
             version: identity.version,
@@ -1649,12 +1671,13 @@ pub(crate) fn collect_browser_for_test(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use tempfile::TempDir;
 
     use super::{
-        collect_browser_at, collect_browser_for_test, ownership_kind_name, ExternalCdmOrigin,
+        collect_browser_at, collect_browser_for_test, library_digest, ownership_kind_name,
+        ExternalCdmOrigin,
     };
     use crate::browsers::{Browser, BrowserKind};
     use crate::diagnostics::DiagnosticStatus;
@@ -2372,5 +2395,15 @@ mod tests {
             OwnershipKind::External,
             "unverified cache handle must fall back to candidate-free classification"
         );
+    }
+
+    #[test]
+    fn library_digest_prefers_known_hex_without_reading_path() {
+        let missing = Path::new("/tmp/silvervine-definitely-missing-cdm.so");
+        assert_eq!(
+            library_digest(missing, Some("abc123")),
+            Some("abc123".into())
+        );
+        assert_eq!(library_digest(missing, None), None);
     }
 }
