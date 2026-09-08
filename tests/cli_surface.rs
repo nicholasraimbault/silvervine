@@ -110,23 +110,30 @@ fn parser_rejects_experimental_doctor_bridge_option() {
 }
 
 #[test]
-fn update_help_excludes_unsigned_self_update() {
+fn update_help_exposes_self_subcommand() {
     let help = run_help(&["update", "--help"]);
     assert!(
-        !help
-            .lines()
-            .any(|line| line.trim_start().starts_with("self ")),
-        "release CLI unexpectedly exposes `update self`: {help}"
+        help.lines()
+            .any(|line| line.trim_start().starts_with("self")),
+        "expected `self` subcommand in update help: {help}"
     );
 }
 
 #[test]
-fn parser_rejects_unsigned_self_update() {
-    let output = run(&["update", "self"]);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "unexpected result: {output:?}"
+fn update_self_without_install_receipt_is_an_error() {
+    let dir = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_silvervine"))
+        .env("HOME", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("SILVERVINE_TEST_DATA_MIGRATION_NOOP", "1")
+        .args(["update", "self"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("install receipt") || stderr.contains("silvervine-update"),
+        "unexpected stderr: {stderr}"
     );
 }
 
