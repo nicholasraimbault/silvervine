@@ -10,12 +10,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::eme::probe::{CapabilityAssessment, RawProbeResult};
 use crate::error::{Error, Result};
+use crate::platform;
 use crate::widevine::download::sha512_reader;
 use crate::widevine::sha512_hex;
 
 /// Current on-disk capability-report schema.
 pub const STORE_SCHEMA_VERSION: u8 = 3;
 const MAX_REPORT_BYTES: u64 = 1024 * 1024;
+const MAX_DIGEST_CACHE_BYTES: u64 = 8 * 1024;
 
 /// One CDM library identity included in a probe fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -108,7 +110,11 @@ impl ProbeFingerprint {
         }
     }
 
-    /// Build a fingerprint by canonicalizing `executable` and reading len/mtime.
+    /// Build a fingerprint by canonicalizing `executable` and reading len/mtime/SHA-512.
+    ///
+    /// The executable digest is memoized under [`platform::cache_dir`] by
+    /// canonical path, length, and mtime so a later identical binary is not
+    /// hashed again. The live file is still opened with `O_NOFOLLOW`.
     ///
     /// # Errors
     ///
@@ -152,11 +158,26 @@ impl ProbeFingerprint {
                 Error::other("executable mtime predates the Unix epoch").with_source(error)
             })?
             .as_secs();
-        let executable_sha512 = sha512_reader(&mut file)?;
+        let canonical_string = canonical.to_string_lossy().into_owned();
+        let executable_len = metadata.len();
+        let executable_sha512 =
+            match load_cached_executable_digest(&canonical_string, executable_len, modified) {
+                Some(digest) => digest,
+                None => {
+                    let digest = sha512_reader(&mut file)?;
+                    store_cached_executable_digest(&CachedExecutableDigest {
+                        canonical_executable: canonical_string.clone(),
+                        executable_len,
+                        executable_modified: modified,
+                        executable_sha512: digest.clone(),
+                    });
+                    digest
+                }
+            };
         Ok(Self::new(
-            canonical.to_string_lossy().into_owned(),
+            canonical_string,
             browser_version,
-            metadata.len(),
+            executable_len,
             modified,
             executable_sha512,
             cdm_entries,
@@ -395,6 +416,81 @@ pub(crate) fn canonicalize_path(path: &Path) -> Result<PathBuf> {
         ))
         .with_source(error)
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CachedExecutableDigest {
+    canonical_executable: String,
+    executable_len: u64,
+    executable_modified: u64,
+    executable_sha512: String,
+}
+
+fn executable_digest_cache_root() -> PathBuf {
+    platform::cache_dir()
+        .join("diagnostics")
+        .join("exe-digests")
+}
+
+fn executable_digest_cache_path(canonical: &str) -> PathBuf {
+    let digest = sha512_hex(canonical.as_bytes());
+    executable_digest_cache_root().join(format!("exe-{}.json", &digest[..24]))
+}
+
+fn is_lowercase_sha512(value: &str) -> bool {
+    value.len() == 128
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn load_cached_executable_digest(
+    canonical: &str,
+    executable_len: u64,
+    executable_modified: u64,
+) -> Option<String> {
+    let path = executable_digest_cache_path(canonical);
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    if metadata.len() > MAX_DIGEST_CACHE_BYTES {
+        return None;
+    }
+    let mut file = open_report(&path).ok()?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(MAX_DIGEST_CACHE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_DIGEST_CACHE_BYTES {
+        return None;
+    }
+    let cached: CachedExecutableDigest = serde_json::from_slice(&bytes).ok()?;
+    if cached.canonical_executable != canonical
+        || cached.executable_len != executable_len
+        || cached.executable_modified != executable_modified
+        || !is_lowercase_sha512(&cached.executable_sha512)
+    {
+        return None;
+    }
+    Some(cached.executable_sha512)
+}
+
+fn store_cached_executable_digest(cached: &CachedExecutableDigest) {
+    let root = executable_digest_cache_root();
+    if ensure_store_root(&root).is_err() {
+        return;
+    }
+    let path = executable_digest_cache_path(&cached.canonical_executable);
+    if reject_unsafe_target(&path).is_err() {
+        return;
+    }
+    let Ok(bytes) = serde_json::to_vec(cached) else {
+        return;
+    };
+    let _ = atomic_write_report(&path, &bytes);
 }
 
 fn ensure_store_root(root: &Path) -> Result<()> {
@@ -770,6 +866,8 @@ mod tests {
 
     #[test]
     fn from_executable_captures_len_and_mtime() {
+        let _env = crate::test_support::env_lock();
+        let _cache = isolated_cache_home();
         let tmp = TempDir::new().expect("tempdir");
         let exe = tmp.path().join("chromium");
         fs::write(&exe, b"browser-bytes").expect("write");
@@ -797,6 +895,79 @@ mod tests {
         assert!(fingerprint.executable_modified > 0);
         assert_eq!(fingerprint.executable_sha512, sha512_hex(b"browser-bytes"));
         assert_eq!(fingerprint.cdm_entries.len(), 1);
+    }
+
+    #[test]
+    fn from_executable_reuses_digest_when_path_len_and_mtime_match() {
+        let _env = crate::test_support::env_lock();
+        let _cache = isolated_cache_home();
+        let tmp = TempDir::new().expect("tempdir");
+        let exe = tmp.path().join("chromium");
+        fs::write(&exe, b"AAAAAAAAAAAA").expect("write");
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        set_mtime(&exe, mtime);
+
+        let first = fingerprint_from(&exe);
+        assert_eq!(first.executable_sha512, sha512_hex(b"AAAAAAAAAAAA"));
+
+        fs::write(&exe, b"BBBBBBBBBBBB").expect("rewrite same length");
+        set_mtime(&exe, mtime);
+
+        let second = fingerprint_from(&exe);
+        assert_eq!(second.executable_len, first.executable_len);
+        assert_eq!(second.executable_modified, first.executable_modified);
+        assert_eq!(second.executable_sha512, sha512_hex(b"AAAAAAAAAAAA"));
+        assert_ne!(second.executable_sha512, sha512_hex(b"BBBBBBBBBBBB"));
+    }
+
+    #[test]
+    fn from_executable_rehashes_when_mtime_changes() {
+        let _env = crate::test_support::env_lock();
+        let _cache = isolated_cache_home();
+        let tmp = TempDir::new().expect("tempdir");
+        let exe = tmp.path().join("chromium");
+        fs::write(&exe, b"AAAAAAAAAAAA").expect("write");
+        set_mtime(
+            &exe,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        );
+        let first = fingerprint_from(&exe);
+
+        fs::write(&exe, b"BBBBBBBBBBBB").expect("rewrite");
+        set_mtime(
+            &exe,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_001),
+        );
+        let second = fingerprint_from(&exe);
+
+        assert_eq!(first.executable_sha512, sha512_hex(b"AAAAAAAAAAAA"));
+        assert_eq!(second.executable_sha512, sha512_hex(b"BBBBBBBBBBBB"));
+        assert_ne!(second.executable_modified, first.executable_modified);
+    }
+
+    #[test]
+    fn from_executable_rehashes_when_len_changes() {
+        let _env = crate::test_support::env_lock();
+        let _cache = isolated_cache_home();
+        let tmp = TempDir::new().expect("tempdir");
+        let exe = tmp.path().join("chromium");
+        fs::write(&exe, b"AAAA").expect("write");
+        set_mtime(
+            &exe,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        );
+        let first = fingerprint_from(&exe);
+
+        fs::write(&exe, b"AAAAAAAA").expect("grow");
+        set_mtime(
+            &exe,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        );
+        let second = fingerprint_from(&exe);
+
+        assert_eq!(first.executable_sha512, sha512_hex(b"AAAA"));
+        assert_eq!(second.executable_sha512, sha512_hex(b"AAAAAAAA"));
+        assert_ne!(second.executable_len, first.executable_len);
     }
 
     #[test]
@@ -833,5 +1004,38 @@ mod tests {
         // The test primarily asserts from_executable reads metadata fields.
         let _ = (path, modified);
         let _ = fs::File::open(path).and_then(|file| file.sync_all());
+    }
+
+    fn fingerprint_from(exe: &Path) -> ProbeFingerprint {
+        ProbeFingerprint::from_executable(
+            exe,
+            Some("150.0".into()),
+            vec![cdm_entry("/opt/cdm/lib.so", "digest")],
+        )
+        .expect("fingerprint")
+    }
+
+    fn set_mtime(path: &Path, modified: SystemTime) {
+        fs::File::open(path)
+            .expect("open for mtime")
+            .set_modified(modified)
+            .expect("set mtime");
+    }
+
+    fn isolated_cache_home() -> (TempDir, RestoreXdgCache) {
+        let cache_home = TempDir::new().expect("cache home");
+        let prev = std::env::var_os("XDG_CACHE_HOME");
+        unsafe { std::env::set_var("XDG_CACHE_HOME", cache_home.path()) };
+        (cache_home, RestoreXdgCache(prev))
+    }
+
+    struct RestoreXdgCache(Option<std::ffi::OsString>);
+    impl Drop for RestoreXdgCache {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => unsafe { std::env::set_var("XDG_CACHE_HOME", value) },
+                None => unsafe { std::env::remove_var("XDG_CACHE_HOME") },
+            }
+        }
     }
 }
