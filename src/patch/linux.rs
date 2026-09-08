@@ -485,7 +485,8 @@ fn is_executable(p: &Path) -> bool {
 /// Best-effort spawn of `binary --version` with bounded output and a
 /// process-group timeout.
 fn run_with_timeout(binary: &Path, args: &[&str], timeout: Duration) -> Option<String> {
-    let output = run_output_with_timeout(binary, args, timeout).ok()?;
+    let output =
+        run_output_with_timeout(binary, args, timeout, &std::collections::HashMap::new()).ok()?;
     if output.timed_out || !output.status.success() {
         return None;
     }

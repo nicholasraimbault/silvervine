@@ -126,7 +126,13 @@ fn package_manager_version(browser: &Browser) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn run_version_command(name: &str, arguments: &[&str]) -> Option<String> {
     let executable = find_executable(name)?;
-    let output = run_output_with_timeout(&executable, arguments, Duration::from_secs(3)).ok()?;
+    let output = run_output_with_timeout(
+        &executable,
+        arguments,
+        Duration::from_secs(3),
+        &std::collections::HashMap::new(),
+    )
+    .ok()?;
     if output.timed_out || !output.status.success() {
         return None;
     }

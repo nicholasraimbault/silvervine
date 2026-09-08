@@ -39,7 +39,7 @@
 //! ## Public API
 //!
 //! ```ignore
-//! pub enum HookOutcome { NotConfigured, Ran { exit_status, stdout, stderr } }
+//! pub enum HookOutcome { NotConfigured, Ran { exit_status, stdout, stderr, timed_out } }
 //! pub fn run_hook(name: &str, env: &HashMap<String, String>) -> Result<HookOutcome>;
 //! pub fn run_hook_at(path: &Path, env: &HashMap<String, String>) -> Result<HookOutcome>;
 //! ```
@@ -50,11 +50,21 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::Duration;
 
 use crate::config::{load_config, Config};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::patch::PatchReport;
+
+/// Maximum wall-clock time a hook subprocess may run before it is killed.
+///
+/// Production builds use 15 seconds. `cargo test` compiles this to 1 second
+/// so hang tests finish well under 5s without leaving the production bound
+/// at 1s.
+pub const HOOK_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 15 });
+
+#[cfg(not(test))]
+const _: () = assert!(HOOK_TIMEOUT.as_secs() == 15);
 
 /// Outcome of a [`run_hook`] / [`run_hook_at`] call.
 #[derive(Debug)]
@@ -74,6 +84,8 @@ pub enum HookOutcome {
         stdout: String,
         /// Captured stderr from the hook process.
         stderr: String,
+        /// Whether Silvervine killed the hook after [`HOOK_TIMEOUT`].
+        timed_out: bool,
     },
 }
 
@@ -221,23 +233,23 @@ pub fn run_hook_at<S: std::hash::BuildHasher>(
         "running hook"
     );
 
-    let mut cmd = Command::new(path);
-    for (key, value) in hook_env {
-        cmd.env(key, value);
-    }
-    let output = cmd.output().map_err(|e| {
-        Error::other(format!("failed to spawn hook at {}: {e}", path.display())).with_source(e)
-    })?;
+    let output =
+        crate::platform::process::run_output_with_timeout(path, &[], HOOK_TIMEOUT, &hook_env)
+            .map_err(|error| {
+                error.with_context(format!("failed to spawn hook at {}", path.display()))
+            })?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let exit_status = output.status.code();
+    let timed_out = output.timed_out;
 
-    if !output.status.success() {
+    if timed_out || !output.status.success() {
         tracing::warn!(
             target: "silvervine::hooks",
             hook_path = %path.display(),
             exit_status = ?exit_status,
+            timed_out,
             stderr_len = stderr.len(),
             "hook exited non-zero"
         );
@@ -247,6 +259,7 @@ pub fn run_hook_at<S: std::hash::BuildHasher>(
         exit_status,
         stdout,
         stderr,
+        timed_out,
     })
 }
 
@@ -325,6 +338,7 @@ fn is_executable_file(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     /// RAII env-var setter that restores on drop.
@@ -461,11 +475,13 @@ exit 0
             exit_status,
             stdout,
             stderr,
+            timed_out,
         } = outcome
         else {
             unreachable!()
         };
         assert_eq!(exit_status, Some(0));
+        assert!(!timed_out);
         assert!(stdout.contains("ran"), "stdout was: {stdout:?}");
         assert!(stderr.is_empty());
 
@@ -655,6 +671,7 @@ exit 0
             exit_status: Some(0),
             stdout: String::new(),
             stderr: String::new(),
+            timed_out: false,
         };
         assert!(nc.is_not_configured() && !nc.is_ran());
         assert!(!r.is_not_configured() && r.is_ran());
@@ -673,5 +690,21 @@ exit 0
                 .join("hooks")
                 .join("custom-hook-name")
         ));
+    }
+
+    /// A hook that sleeps past the bound must be killed, not waited out.
+    #[test]
+    #[cfg(unix)]
+    fn run_hook_at_times_out_a_sleeping_script() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("hang");
+        write_executable_script(&path, "#!/bin/sh\nsleep 30\n");
+        let started = std::time::Instant::now();
+        let outcome = run_hook_at(&path, &HashMap::new()).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        match outcome {
+            HookOutcome::Ran { timed_out, .. } => assert!(timed_out),
+            HookOutcome::NotConfigured => panic!("expected Ran, got NotConfigured"),
+        }
     }
 }

@@ -1,5 +1,6 @@
 //! Bounded subprocess execution and executable lookup.
 
+use std::collections::HashMap;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -56,12 +57,16 @@ fn is_executable_file(path: &Path) -> bool {
 ///
 /// Returns a categorized error when spawning, waiting, reading output, or
 /// joining a reader thread fails.
-pub fn run_output_with_timeout(
+pub fn run_output_with_timeout<S: std::hash::BuildHasher>(
     program: &Path,
     args: &[&str],
     timeout: Duration,
+    extra_env: &HashMap<String, String, S>,
 ) -> Result<CommandOutput> {
     let mut command = Command::new(program);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
     command
         .args(args)
         .stdin(Stdio::null())
@@ -160,6 +165,7 @@ fn join_reader(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::ffi::OsString;
     use std::fs;
     use std::path::Path;
@@ -230,6 +236,7 @@ mod tests {
             Path::new("/bin/sh"),
             &["-c", "printf stdout; printf stderr >&2"],
             Duration::from_secs(1),
+            &HashMap::new(),
         )
         .expect("command");
 
@@ -241,9 +248,13 @@ mod tests {
 
     #[test]
     fn run_output_with_timeout_kills_slow_child() {
-        let output =
-            run_output_with_timeout(Path::new("/bin/sleep"), &["2"], Duration::from_millis(40))
-                .expect("command");
+        let output = run_output_with_timeout(
+            Path::new("/bin/sleep"),
+            &["2"],
+            Duration::from_millis(40),
+            &HashMap::new(),
+        )
+        .expect("command");
 
         assert!(output.timed_out);
         assert!(!output.status.success());
@@ -256,6 +267,7 @@ mod tests {
             Path::new("/bin/sh"),
             &["-c", "sleep 5 & wait"],
             Duration::from_millis(40),
+            &HashMap::new(),
         )
         .expect("command");
 
@@ -268,9 +280,13 @@ mod tests {
 
     #[test]
     fn run_output_with_timeout_caps_verbose_output() {
-        let output =
-            run_output_with_timeout(Path::new("/usr/bin/yes"), &[], Duration::from_millis(40))
-                .expect("command");
+        let output = run_output_with_timeout(
+            Path::new("/usr/bin/yes"),
+            &[],
+            Duration::from_millis(40),
+            &HashMap::new(),
+        )
+        .expect("command");
 
         assert!(output.timed_out);
         assert_eq!(output.stdout.len(), MAX_CAPTURE_BYTES);
