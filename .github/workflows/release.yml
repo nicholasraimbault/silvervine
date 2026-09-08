@@ -451,8 +451,8 @@ jobs:
           name: artifacts-dist-manifest
           path: dist-manifest.json
 
-  # Sole write-capable publication boundary. Keep this to one trusted shell
-  # step so no checkout, third-party action, or build tool receives the token.
+  # Sole write-capable publication boundary. No checkout or build tooling;
+  # only the trusted assemble/release shell and GitHub's attest action.
   publish:
     needs:
       - plan
@@ -461,17 +461,16 @@ jobs:
     permissions:
       actions: read
       contents: write
+      id-token: write
+      attestations: write
     runs-on: "ubuntu-22.04"
     steps:
-      - name: Publish exact tested commit
+      - name: Assemble release artifacts
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
           RELEASE_COMMIT: ${{ github.sha }}
-          PRERELEASE: ${{ fromJson(needs.host.outputs.val).announcement_is_prerelease }}
-          ANNOUNCEMENT_TITLE: ${{ fromJson(needs.host.outputs.val).announcement_title }}
-          ANNOUNCEMENT_BODY: ${{ fromJson(needs.host.outputs.val).announcement_github_body }}
         run: |
           set -euo pipefail
 
@@ -519,6 +518,31 @@ jobs:
             echo "release tag $RELEASE_TAG resolves to $remote_commit, expected $RELEASE_COMMIT" >&2
             exit 1
           fi
+
+          mapfile -d '' -t release_artifacts < <(
+            find artifacts -type f ! -name '*-dist-manifest.json' -print0 | sort -z
+          )
+          if (( ${#release_artifacts[@]} == 0 )); then
+            echo "no release artifacts were produced" >&2
+            exit 1
+          fi
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: artifacts/**
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          PRERELEASE: ${{ fromJson(needs.host.outputs.val).announcement_is_prerelease }}
+          ANNOUNCEMENT_TITLE: ${{ fromJson(needs.host.outputs.val).announcement_title }}
+          ANNOUNCEMENT_BODY: ${{ fromJson(needs.host.outputs.val).announcement_github_body }}
+        run: |
+          set -euo pipefail
 
           mapfile -d '' -t release_artifacts < <(
             find artifacts -type f ! -name '*-dist-manifest.json' -print0 | sort -z
