@@ -152,29 +152,9 @@ pub fn run(args: &Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
+    use crate::test_support::ScopedEnv;
     use std::fs;
     use tempfile::TempDir;
-
-    struct ScopedEnv {
-        key: &'static str,
-        prev: Option<OsString>,
-    }
-    impl ScopedEnv {
-        fn set(key: &'static str, value: &Path) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prev }
-        }
-    }
-    impl Drop for ScopedEnv {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
 
     #[test]
     fn unregister_failure_aborts_before_cache_or_config_deletion() {

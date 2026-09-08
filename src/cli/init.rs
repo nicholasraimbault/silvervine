@@ -407,6 +407,7 @@ fn production_cdm_resolver() -> Result<CachedCdm> {
 mod tests {
     use super::*;
     use crate::browsers::BrowserKind;
+    use crate::test_support::ScopedEnv;
     use std::cell::RefCell;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -472,33 +473,6 @@ mod tests {
         }
         fn read_browser_version(&self, _target: &Path) -> Option<String> {
             Some("128.0".into())
-        }
-    }
-
-    /// RAII env-var setter that restores on drop.
-    struct ScopedEnv {
-        key: &'static str,
-        prev: Option<std::ffi::OsString>,
-    }
-    impl ScopedEnv {
-        fn set(key: &'static str, value: &Path) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prev }
-        }
-        #[cfg(target_os = "linux")]
-        fn unset(key: &'static str) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::remove_var(key) };
-            Self { key, prev }
-        }
-    }
-    impl Drop for ScopedEnv {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
         }
     }
 

@@ -315,45 +315,20 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
     use std::fs;
-    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime};
 
     use tempfile::TempDir;
 
     use super::{sha512_memoized, text_memoized};
+    use crate::test_support::{isolated_xdg_cache, set_mtime};
     use crate::widevine::sha512_hex;
-
-    struct RestoreXdg(Option<OsString>);
-    impl Drop for RestoreXdg {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(value) => unsafe { std::env::set_var("XDG_CACHE_HOME", value) },
-                None => unsafe { std::env::remove_var("XDG_CACHE_HOME") },
-            }
-        }
-    }
-
-    fn isolated_cache() -> (TempDir, RestoreXdg) {
-        let home = TempDir::new().expect("cache home");
-        let prev = std::env::var_os("XDG_CACHE_HOME");
-        unsafe { std::env::set_var("XDG_CACHE_HOME", home.path()) };
-        (home, RestoreXdg(prev))
-    }
-
-    fn set_mtime(path: &Path, modified: SystemTime) {
-        fs::File::open(path)
-            .expect("open")
-            .set_modified(modified)
-            .expect("mtime");
-    }
 
     #[test]
     fn sha512_memo_reuses_digest_when_path_len_and_mtime_match() {
         let _env = crate::test_support::env_lock();
-        let _cache = isolated_cache();
+        let _cache = isolated_xdg_cache();
         let tmp = TempDir::new().expect("tmp");
         let path = tmp.path().join("lib.so");
         fs::write(&path, b"AAAAAAAAAAAA").expect("write");
@@ -373,7 +348,7 @@ mod tests {
     #[test]
     fn sha512_memo_rehashes_when_mtime_changes() {
         let _env = crate::test_support::env_lock();
-        let _cache = isolated_cache();
+        let _cache = isolated_xdg_cache();
         let tmp = TempDir::new().expect("tmp");
         let path = tmp.path().join("lib.so");
         fs::write(&path, b"AAAAAAAAAAAA").expect("write");
@@ -397,7 +372,7 @@ mod tests {
     #[test]
     fn text_memo_does_not_recompute_when_identity_matches() {
         let _env = crate::test_support::env_lock();
-        let _cache = isolated_cache();
+        let _cache = isolated_xdg_cache();
         let tmp = TempDir::new().expect("tmp");
         let path = tmp.path().join("chrome");
         fs::write(&path, b"AAAAAAAAAAAA").expect("write");

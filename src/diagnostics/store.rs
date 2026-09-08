@@ -751,12 +751,12 @@ mod tests {
     #[test]
     fn from_executable_captures_len_and_mtime() {
         let _env = crate::test_support::env_lock();
-        let _cache = isolated_cache_home();
+        let _cache = crate::test_support::isolated_xdg_cache();
         let tmp = TempDir::new().expect("tempdir");
         let exe = tmp.path().join("chromium");
         fs::write(&exe, b"browser-bytes").expect("write");
         let modified = SystemTime::now() - Duration::from_secs(30);
-        filetime_set(&exe, modified);
+        crate::test_support::set_mtime(&exe, modified);
 
         let fingerprint = ProbeFingerprint::from_executable(
             &exe,
@@ -784,18 +784,18 @@ mod tests {
     #[test]
     fn from_executable_reuses_digest_when_path_len_and_mtime_match() {
         let _env = crate::test_support::env_lock();
-        let _cache = isolated_cache_home();
+        let _cache = crate::test_support::isolated_xdg_cache();
         let tmp = TempDir::new().expect("tempdir");
         let exe = tmp.path().join("chromium");
         fs::write(&exe, b"AAAAAAAAAAAA").expect("write");
         let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        set_mtime(&exe, mtime);
+        crate::test_support::set_mtime(&exe, mtime);
 
         let first = fingerprint_from(&exe);
         assert_eq!(first.executable_sha512, sha512_hex(b"AAAAAAAAAAAA"));
 
         fs::write(&exe, b"BBBBBBBBBBBB").expect("rewrite same length");
-        set_mtime(&exe, mtime);
+        crate::test_support::set_mtime(&exe, mtime);
 
         let second = fingerprint_from(&exe);
         assert_eq!(second.executable_len, first.executable_len);
@@ -807,18 +807,18 @@ mod tests {
     #[test]
     fn from_executable_rehashes_when_mtime_changes() {
         let _env = crate::test_support::env_lock();
-        let _cache = isolated_cache_home();
+        let _cache = crate::test_support::isolated_xdg_cache();
         let tmp = TempDir::new().expect("tempdir");
         let exe = tmp.path().join("chromium");
         fs::write(&exe, b"AAAAAAAAAAAA").expect("write");
-        set_mtime(
+        crate::test_support::set_mtime(
             &exe,
             SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         );
         let first = fingerprint_from(&exe);
 
         fs::write(&exe, b"BBBBBBBBBBBB").expect("rewrite");
-        set_mtime(
+        crate::test_support::set_mtime(
             &exe,
             SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_001),
         );
@@ -832,18 +832,18 @@ mod tests {
     #[test]
     fn from_executable_rehashes_when_len_changes() {
         let _env = crate::test_support::env_lock();
-        let _cache = isolated_cache_home();
+        let _cache = crate::test_support::isolated_xdg_cache();
         let tmp = TempDir::new().expect("tempdir");
         let exe = tmp.path().join("chromium");
         fs::write(&exe, b"AAAA").expect("write");
-        set_mtime(
+        crate::test_support::set_mtime(
             &exe,
             SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         );
         let first = fingerprint_from(&exe);
 
         fs::write(&exe, b"AAAAAAAA").expect("grow");
-        set_mtime(
+        crate::test_support::set_mtime(
             &exe,
             SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         );
@@ -883,13 +883,6 @@ mod tests {
         assert_eq!(fs::read(outside).expect("outside preserved"), b"outside");
     }
 
-    fn filetime_set(path: &Path, modified: SystemTime) {
-        // Best-effort: touch via std only keeps current time on some hosts.
-        // The test primarily asserts from_executable reads metadata fields.
-        let _ = (path, modified);
-        let _ = fs::File::open(path).and_then(|file| file.sync_all());
-    }
-
     fn fingerprint_from(exe: &Path) -> ProbeFingerprint {
         ProbeFingerprint::from_executable(
             exe,
@@ -897,29 +890,5 @@ mod tests {
             vec![cdm_entry("/opt/cdm/lib.so", "digest")],
         )
         .expect("fingerprint")
-    }
-
-    fn set_mtime(path: &Path, modified: SystemTime) {
-        fs::File::open(path)
-            .expect("open for mtime")
-            .set_modified(modified)
-            .expect("set mtime");
-    }
-
-    fn isolated_cache_home() -> (TempDir, RestoreXdgCache) {
-        let cache_home = TempDir::new().expect("cache home");
-        let prev = std::env::var_os("XDG_CACHE_HOME");
-        unsafe { std::env::set_var("XDG_CACHE_HOME", cache_home.path()) };
-        (cache_home, RestoreXdgCache(prev))
-    }
-
-    struct RestoreXdgCache(Option<std::ffi::OsString>);
-    impl Drop for RestoreXdgCache {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(value) => unsafe { std::env::set_var("XDG_CACHE_HOME", value) },
-                None => unsafe { std::env::remove_var("XDG_CACHE_HOME") },
-            }
-        }
     }
 }

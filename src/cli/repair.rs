@@ -58,30 +58,10 @@ pub fn run(args: &Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
+    use crate::test_support::ScopedEnv;
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
-
-    struct ScopedEnv {
-        key: &'static str,
-        prev: Option<OsString>,
-    }
-    impl ScopedEnv {
-        fn set(key: &'static str, value: &Path) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prev }
-        }
-    }
-    impl Drop for ScopedEnv {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
 
     /// `repair` composes uninstall + setup. The pure-data composition
     /// is testable without driving the full repair flow:

@@ -968,31 +968,11 @@ fn install_tracing_subscriber() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
+    use crate::test_support::{write_executable_script, ScopedEnv};
     use std::sync::Mutex;
     use tempfile::TempDir;
 
     use crate::browsers::BrowserKind;
-
-    struct ScopedEnv {
-        key: &'static str,
-        prev: Option<OsString>,
-    }
-    impl ScopedEnv {
-        fn set(key: &'static str, value: &Path) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prev }
-        }
-    }
-    impl Drop for ScopedEnv {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
 
     fn fake_browser(name: &str, install: PathBuf) -> Browser {
         Browser {
@@ -1000,16 +980,6 @@ mod tests {
             install_path: install,
             kind: BrowserKind::Detected,
         }
-    }
-
-    #[cfg(unix)]
-    fn write_executable_script(path: &Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, body).unwrap();
-        let mut perms = std::fs::metadata(path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(path, perms).unwrap();
     }
 
     /// Build a minimal `RunOptions` that uses the supplied tempdir for all

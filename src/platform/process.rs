@@ -166,7 +166,6 @@ fn join_reader(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::ffi::OsString;
     use std::fs;
     use std::path::Path;
     use std::time::Duration;
@@ -174,30 +173,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{find_executable, run_output_with_timeout, MAX_CAPTURE_BYTES};
-    use crate::test_support::env_lock;
-
-    struct ScopedPath(Option<OsString>);
-
-    impl ScopedPath {
-        fn set(value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os("PATH");
-            // SAFETY: every environment-mutating test holds the crate-wide lock.
-            unsafe { std::env::set_var("PATH", value) };
-            Self(previous)
-        }
-    }
-
-    impl Drop for ScopedPath {
-        fn drop(&mut self) {
-            if let Some(previous) = self.0.take() {
-                // SAFETY: the crate-wide environment lock remains held until after this guard drops.
-                unsafe { std::env::set_var("PATH", previous) };
-            } else {
-                // SAFETY: see above.
-                unsafe { std::env::remove_var("PATH") };
-            }
-        }
-    }
+    use crate::test_support::{env_lock, ScopedEnv};
 
     #[test]
     fn find_executable_rejects_directories_and_non_executable_files() {
@@ -205,7 +181,7 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         fs::create_dir(tmp.path().join("directory-tool")).expect("directory");
         fs::write(tmp.path().join("plain-tool"), b"not executable").expect("plain file");
-        let _path = ScopedPath::set(tmp.path());
+        let _path = ScopedEnv::set("PATH", tmp.path());
 
         assert_eq!(find_executable("directory-tool"), None);
         assert_eq!(find_executable("plain-tool"), None);
@@ -225,7 +201,7 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&tool, permissions).expect("chmod");
         let joined = std::env::join_paths([first.path(), second.path()]).expect("PATH");
-        let _path = ScopedPath::set(&joined);
+        let _path = ScopedEnv::set("PATH", &joined);
 
         assert_eq!(find_executable("media-tool"), Some(tool));
     }

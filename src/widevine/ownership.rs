@@ -1267,9 +1267,7 @@ mod tests {
         use std::time::{Duration, SystemTime};
 
         let _env = crate::test_support::env_lock();
-        let cache_home = TempDir::new().expect("cache home");
-        let prev = std::env::var_os("XDG_CACHE_HOME");
-        unsafe { std::env::set_var("XDG_CACHE_HOME", cache_home.path()) };
+        let _cache = crate::test_support::isolated_xdg_cache();
 
         let tmp = TempDir::new().expect("tempdir");
         let browser = browser(tmp.path(), BrowserKind::Detected);
@@ -1280,23 +1278,12 @@ mod tests {
             .join(platform_dir())
             .join(library_name());
         let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        std::fs::File::open(&library)
-            .expect("open")
-            .set_modified(mtime)
-            .expect("mtime");
+        crate::test_support::set_mtime(&library, mtime);
 
         let first = classify_without_candidate(&browser, &target).expect("first");
         fs::write(&library, b"BBBBBBBBBBBB").expect("rewrite");
-        std::fs::File::open(&library)
-            .expect("open")
-            .set_modified(mtime)
-            .expect("mtime");
+        crate::test_support::set_mtime(&library, mtime);
         let second = classify_without_candidate(&browser, &target).expect("second");
-
-        match prev {
-            Some(value) => unsafe { std::env::set_var("XDG_CACHE_HOME", value) },
-            None => unsafe { std::env::remove_var("XDG_CACHE_HOME") },
-        }
 
         assert_eq!(
             first.details.get("library_sha512"),

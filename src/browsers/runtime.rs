@@ -273,28 +273,19 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let _env = crate::test_support::env_lock();
-        let cache_home = TempDir::new().expect("cache home");
-        let prev_cache = std::env::var_os("XDG_CACHE_HOME");
-        let prev_path = std::env::var_os("PATH");
-        unsafe { std::env::set_var("XDG_CACHE_HOME", cache_home.path()) };
-
+        let _cache = crate::test_support::isolated_xdg_cache();
         let tmp = TempDir::new().expect("tmp");
         let bin = tmp.path().join("bin");
         fs::create_dir(&bin).expect("bin");
         let counter = tmp.path().join("count");
-        let pacman = bin.join("pacman");
-        fs::write(
-            &pacman,
-            format!(
+        crate::test_support::write_executable_script(
+            &bin.join("pacman"),
+            &format!(
                 "#!/bin/sh\necho x >> '{}'\necho \"$2 is owned by fake-pkg 1.2.3-1\"\n",
                 counter.display()
             ),
-        )
-        .expect("pacman");
-        let mut permissions = fs::metadata(&pacman).expect("meta").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&pacman, permissions).expect("chmod");
-        unsafe { std::env::set_var("PATH", &bin) };
+        );
+        let _path = crate::test_support::ScopedEnv::set("PATH", &bin);
 
         let install = tmp.path().join("Helium");
         fs::create_dir(&install).expect("install");
@@ -302,15 +293,6 @@ mod tests {
 
         let first = passive_version(&browser("Helium", install.clone()));
         let second = passive_version(&browser("Helium", install));
-
-        match prev_cache {
-            Some(value) => unsafe { std::env::set_var("XDG_CACHE_HOME", value) },
-            None => unsafe { std::env::remove_var("XDG_CACHE_HOME") },
-        }
-        match prev_path {
-            Some(value) => unsafe { std::env::set_var("PATH", value) },
-            None => unsafe { std::env::remove_var("PATH") },
-        }
 
         assert_eq!(first.as_deref(), Some("1.2.3-1"));
         assert_eq!(second, first);

@@ -287,42 +287,12 @@ pub fn run_privileged(args: &PrivilegedArgs) -> Result<()> {
 mod tests {
     use super::*;
     use crate::browsers::BrowserKind;
+    use crate::test_support::{write_executable_script, ScopedEnv};
     use std::cell::RefCell;
-    use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
-
-    struct ScopedEnv {
-        key: &'static str,
-        prev: Option<OsString>,
-    }
-    impl ScopedEnv {
-        fn set(key: &'static str, value: &Path) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prev }
-        }
-    }
-    impl Drop for ScopedEnv {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    fn write_executable_script(path: &Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, body).unwrap();
-        let mut perms = fs::metadata(path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).unwrap();
-    }
 
     fn isolate_user_config(
         tmp: &TempDir,
