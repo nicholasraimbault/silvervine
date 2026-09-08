@@ -559,7 +559,7 @@ fn run_event_loop(
                 handle_toggle_launch_at_login(target);
             }
             None => {
-                std::thread::sleep(Duration::from_millis(100));
+                tray.wait_for_platform_event(Duration::from_millis(100));
             }
         }
         if single_iteration {
