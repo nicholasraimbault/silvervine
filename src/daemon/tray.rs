@@ -644,11 +644,6 @@ impl Tray {
         let _ = self.tx.send(cmd);
     }
 
-    #[cfg(test)]
-    pub(crate) fn send_for_test(&self, cmd: TrayCommand) {
-        let _ = self.tx.send(cmd);
-    }
-
     /// `true` if a real tray UI is attached (i.e. [`Tray::new`] succeeded).
     /// `false` for [`Tray::headless`].
     #[must_use]
@@ -1319,7 +1314,7 @@ mod tests {
         let start = std::time::Instant::now();
         assert!(t.recv_timeout(Duration::from_millis(20)).is_none());
         assert!(start.elapsed() >= Duration::from_millis(15));
-        t.send_for_test(TrayCommand::Quit);
+        t.synthesize(TrayCommand::Quit);
         assert_eq!(
             t.recv_timeout(Duration::from_millis(50)),
             Some(TrayCommand::Quit)
