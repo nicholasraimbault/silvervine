@@ -10,6 +10,16 @@ Future entries are generated from
 
 ## [Unreleased]
 
+## [2.1.3] - 2026-09-08
+
+### Fixed
+
+- Initialized the macOS tray as an accessory AppKit application and pumped
+  its event queue on the daemon main thread so the menu-bar status item can
+  appear instead of remaining `Prohibited` with no event loop.
+- Rebuilt live macOS tray menus together with generation-scoped click routes
+  so a replaced menu cannot dispatch a stale command.
+
 ## [2.1.2] - 2026-08-03
 
 ### Changed
@@ -382,7 +392,8 @@ rc.1 has a hard deadlock on the patch path.
   scripts. Both bugs are obsoleted by the rewrite, but the reports
   were on the money.
 
-[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.2...HEAD
+[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.3...HEAD
+[2.1.3]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.2...v2.1.3
 [2.1.2]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.1...v2.1.2
 [2.1.1]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/nicholasraimbault/silvervine/compare/v2.0.1...v2.1.0
