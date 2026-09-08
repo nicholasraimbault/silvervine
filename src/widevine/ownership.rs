@@ -15,7 +15,7 @@ use sha2::{Digest, Sha512};
 
 use crate::browsers::{Browser, BrowserKind};
 use crate::error::{Error, Result};
-use crate::widevine::download::{hex_lower, sha512_reader};
+use crate::widevine::download::hex_lower;
 use crate::widevine::{current_platform_key, CachedCdm};
 
 /// File stored beside an installed CDM to establish Silvervine provenance.
@@ -896,7 +896,7 @@ fn inspect_payload(root: &Path) -> Result<PayloadIdentity> {
         )));
     }
     let (platform_dir, library) = libraries.pop().expect("one library");
-    let library_file = open_bounded_regular_file(&library, "Widevine library", MAX_LIBRARY_BYTES)?;
+    let _library_file = open_bounded_regular_file(&library, "Widevine library", MAX_LIBRARY_BYTES)?;
     let platform = current_platform_key()?.as_str().to_owned();
     if platform_dir != expected_platform_dir() {
         return Err(Error::invalid_marker(format!(
@@ -904,10 +904,9 @@ fn inspect_payload(root: &Path) -> Result<PayloadIdentity> {
             expected_platform_dir()
         )));
     }
-    let library_sha512 =
-        sha512_reader(library_file.take(MAX_LIBRARY_BYTES + 1)).map_err(|error| {
-            Error::invalid_marker("could not hash Widevine library").with_source(error)
-        })?;
+    let library_sha512 = crate::file_memo::sha512_memoized(&library).map_err(|error| {
+        Error::invalid_marker("could not hash Widevine library").with_source(error)
+    })?;
     Ok(PayloadIdentity {
         version,
         platform,
@@ -1022,9 +1021,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        classify, marker_for_cached, marker_for_finalized_payload, stage_verified_payload,
-        validate_installed_cdm, validate_installed_marker, write_marker, OwnershipKind,
-        MANAGED_MARKER_FILENAME,
+        classify, classify_without_candidate, marker_for_cached, marker_for_finalized_payload,
+        stage_verified_payload, validate_installed_cdm, validate_installed_marker, write_marker,
+        OwnershipKind, MANAGED_MARKER_FILENAME,
     };
     use crate::browsers::{Browser, BrowserKind};
     use crate::widevine::CachedCdm;
@@ -1261,6 +1260,56 @@ mod tests {
         assert!(!installed.matches_candidate(&candidate_marker));
         let newer = cached(tmp.path(), "4.10.2", b"newer");
         assert!(!installed.matches_candidate(&marker_for_cached(&newer).unwrap()));
+    }
+
+    #[test]
+    fn classify_without_candidate_reuses_library_digest_when_identity_matches() {
+        use std::time::{Duration, SystemTime};
+
+        let _env = crate::test_support::env_lock();
+        let cache_home = TempDir::new().expect("cache home");
+        let prev = std::env::var_os("XDG_CACHE_HOME");
+        unsafe { std::env::set_var("XDG_CACHE_HOME", cache_home.path()) };
+
+        let tmp = TempDir::new().expect("tempdir");
+        let browser = browser(tmp.path(), BrowserKind::Detected);
+        let target = install_root(&browser);
+        write_payload(&target, "4.10.0", b"AAAAAAAAAAAA");
+        let library = target
+            .join("_platform_specific")
+            .join(platform_dir())
+            .join(library_name());
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        std::fs::File::open(&library)
+            .expect("open")
+            .set_modified(mtime)
+            .expect("mtime");
+
+        let first = classify_without_candidate(&browser, &target).expect("first");
+        fs::write(&library, b"BBBBBBBBBBBB").expect("rewrite");
+        std::fs::File::open(&library)
+            .expect("open")
+            .set_modified(mtime)
+            .expect("mtime");
+        let second = classify_without_candidate(&browser, &target).expect("second");
+
+        match prev {
+            Some(value) => unsafe { std::env::set_var("XDG_CACHE_HOME", value) },
+            None => unsafe { std::env::remove_var("XDG_CACHE_HOME") },
+        }
+
+        assert_eq!(
+            first.details.get("library_sha512"),
+            Some(&crate::widevine::sha512_hex(b"AAAAAAAAAAAA"))
+        );
+        assert_eq!(
+            second.details.get("library_sha512"),
+            first.details.get("library_sha512")
+        );
+        assert_ne!(
+            second.details.get("library_sha512"),
+            Some(&crate::widevine::sha512_hex(b"BBBBBBBBBBBB"))
+        );
     }
 
     #[test]

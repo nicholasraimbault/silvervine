@@ -919,7 +919,7 @@ fn verify_cached_integrity(cdm: &CachedCdm, platform: Platform) -> Result<String
             actual_size
         )));
     }
-    let actual_hash = download::sha512_file_hex(&library_path)?;
+    let actual_hash = crate::file_memo::sha512_memoized(&library_path)?;
     if !actual_hash.eq_ignore_ascii_case(&expected.library_sha512) {
         return Err(Error::hash_mismatch(format!(
             "{} SHA-512 does not match persisted cache metadata",

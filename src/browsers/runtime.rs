@@ -99,6 +99,10 @@ fn read_nonempty(path: &Path) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn package_manager_version(browser: &Browser) -> Option<String> {
     let executable = executable_path(browser).ok()?;
+    crate::file_memo::text_memoized(&executable, || query_package_version(&executable))
+}
+
+fn query_package_version(executable: &Path) -> Option<String> {
     let executable = executable.to_str()?;
 
     if let Some(output) = run_version_command("pacman", &["-Qo", executable]) {
@@ -261,6 +265,59 @@ mod tests {
             Some("150.0.7871.186")
         );
         assert!(!sentinel.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn package_manager_version_is_memoized_for_unchanged_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env = crate::test_support::env_lock();
+        let cache_home = TempDir::new().expect("cache home");
+        let prev_cache = std::env::var_os("XDG_CACHE_HOME");
+        let prev_path = std::env::var_os("PATH");
+        unsafe { std::env::set_var("XDG_CACHE_HOME", cache_home.path()) };
+
+        let tmp = TempDir::new().expect("tmp");
+        let bin = tmp.path().join("bin");
+        fs::create_dir(&bin).expect("bin");
+        let counter = tmp.path().join("count");
+        let pacman = bin.join("pacman");
+        fs::write(
+            &pacman,
+            format!(
+                "#!/bin/sh\necho x >> '{}'\necho \"$2 is owned by fake-pkg 1.2.3-1\"\n",
+                counter.display()
+            ),
+        )
+        .expect("pacman");
+        let mut permissions = fs::metadata(&pacman).expect("meta").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&pacman, permissions).expect("chmod");
+        unsafe { std::env::set_var("PATH", &bin) };
+
+        let install = tmp.path().join("Helium");
+        fs::create_dir(&install).expect("install");
+        executable(&install.join("helium"));
+
+        let first = passive_version(&browser("Helium", install.clone()));
+        let second = passive_version(&browser("Helium", install));
+
+        match prev_cache {
+            Some(value) => unsafe { std::env::set_var("XDG_CACHE_HOME", value) },
+            None => unsafe { std::env::remove_var("XDG_CACHE_HOME") },
+        }
+        match prev_path {
+            Some(value) => unsafe { std::env::set_var("PATH", value) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        assert_eq!(first.as_deref(), Some("1.2.3-1"));
+        assert_eq!(second, first);
+        assert_eq!(
+            fs::read_to_string(counter).expect("count").lines().count(),
+            1
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -328,19 +328,19 @@ fn passive_media_stack_creates_no_xdg_state() {
         );
     }
 
-    let digest_root = xdg_cache
-        .join("silvervine")
-        .join("diagnostics")
-        .join("exe-digests");
+    let diagnostics_root = xdg_cache.join("silvervine").join("diagnostics");
     let cache_files = collect_files(&xdg_cache);
     for path in &cache_files {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let allowed = path.starts_with(&diagnostics_root)
+            && name.ends_with(".json")
+            && (name.starts_with("sha-") || name.starts_with("txt-") || name.starts_with("exe-"));
         assert!(
-            path.starts_with(&digest_root)
-                && path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("exe-") && name.ends_with(".json")),
-            "passive media-stack created non-digest cache path: {path:?}"
+            allowed,
+            "passive media-stack created non-memo cache path: {path:?}"
         );
     }
 }

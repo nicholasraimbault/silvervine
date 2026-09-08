@@ -10,14 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::eme::probe::{CapabilityAssessment, RawProbeResult};
 use crate::error::{Error, Result};
-use crate::platform;
-use crate::widevine::download::sha512_reader;
 use crate::widevine::sha512_hex;
 
 /// Current on-disk capability-report schema.
 pub const STORE_SCHEMA_VERSION: u8 = 3;
 const MAX_REPORT_BYTES: u64 = 1024 * 1024;
-const MAX_DIGEST_CACHE_BYTES: u64 = 8 * 1024;
 
 /// One CDM library identity included in a probe fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -112,9 +109,9 @@ impl ProbeFingerprint {
 
     /// Build a fingerprint by canonicalizing `executable` and reading len/mtime/SHA-512.
     ///
-    /// The executable digest is memoized under [`platform::cache_dir`] by
-    /// canonical path, length, and mtime so a later identical binary is not
-    /// hashed again. The live file is still opened with `O_NOFOLLOW`.
+    /// The executable digest is memoized by canonical path, length, and mtime
+    /// so a later identical binary is not hashed again. The live file is still
+    /// opened with `O_NOFOLLOW`.
     ///
     /// # Errors
     ///
@@ -134,51 +131,13 @@ impl ProbeFingerprint {
                 "exact probe fingerprints require browser and byte-exact CDM identities",
             ));
         }
-        let canonical = canonicalize_path(executable)?;
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW);
-        }
-        let mut file = options.open(&canonical).map_err(Error::from)?;
-        let metadata = file.metadata().map_err(Error::from)?;
-        if !metadata.is_file() {
-            return Err(Error::unknown_bundle_structure(format!(
-                "{} must be a regular executable file",
-                canonical.display()
-            )));
-        }
-        let modified = metadata
-            .modified()
-            .map_err(Error::from)?
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| {
-                Error::other("executable mtime predates the Unix epoch").with_source(error)
-            })?
-            .as_secs();
-        let canonical_string = canonical.to_string_lossy().into_owned();
-        let executable_len = metadata.len();
-        let executable_sha512 =
-            match load_cached_executable_digest(&canonical_string, executable_len, modified) {
-                Some(digest) => digest,
-                None => {
-                    let digest = sha512_reader(&mut file)?;
-                    store_cached_executable_digest(&CachedExecutableDigest {
-                        canonical_executable: canonical_string.clone(),
-                        executable_len,
-                        executable_modified: modified,
-                        executable_sha512: digest.clone(),
-                    });
-                    digest
-                }
-            };
+        let (identity, executable_sha512) =
+            crate::file_memo::sha512_memoized_with_identity(executable)?;
         Ok(Self::new(
-            canonical_string,
+            identity.canonical.to_string_lossy().into_owned(),
             browser_version,
-            executable_len,
-            modified,
+            identity.len,
+            identity.modified,
             executable_sha512,
             cdm_entries,
         ))
@@ -416,81 +375,6 @@ pub(crate) fn canonicalize_path(path: &Path) -> Result<PathBuf> {
         ))
         .with_source(error)
     })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CachedExecutableDigest {
-    canonical_executable: String,
-    executable_len: u64,
-    executable_modified: u64,
-    executable_sha512: String,
-}
-
-fn executable_digest_cache_root() -> PathBuf {
-    platform::cache_dir()
-        .join("diagnostics")
-        .join("exe-digests")
-}
-
-fn executable_digest_cache_path(canonical: &str) -> PathBuf {
-    let digest = sha512_hex(canonical.as_bytes());
-    executable_digest_cache_root().join(format!("exe-{}.json", &digest[..24]))
-}
-
-fn is_lowercase_sha512(value: &str) -> bool {
-    value.len() == 128
-        && value
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-}
-
-fn load_cached_executable_digest(
-    canonical: &str,
-    executable_len: u64,
-    executable_modified: u64,
-) -> Option<String> {
-    let path = executable_digest_cache_path(canonical);
-    let metadata = fs::symlink_metadata(&path).ok()?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return None;
-    }
-    if metadata.len() > MAX_DIGEST_CACHE_BYTES {
-        return None;
-    }
-    let mut file = open_report(&path).ok()?;
-    let mut bytes = Vec::new();
-    (&mut file)
-        .take(MAX_DIGEST_CACHE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_DIGEST_CACHE_BYTES {
-        return None;
-    }
-    let cached: CachedExecutableDigest = serde_json::from_slice(&bytes).ok()?;
-    if cached.canonical_executable != canonical
-        || cached.executable_len != executable_len
-        || cached.executable_modified != executable_modified
-        || !is_lowercase_sha512(&cached.executable_sha512)
-    {
-        return None;
-    }
-    Some(cached.executable_sha512)
-}
-
-fn store_cached_executable_digest(cached: &CachedExecutableDigest) {
-    let root = executable_digest_cache_root();
-    if ensure_store_root(&root).is_err() {
-        return;
-    }
-    let path = executable_digest_cache_path(&cached.canonical_executable);
-    if reject_unsafe_target(&path).is_err() {
-        return;
-    }
-    let Ok(bytes) = serde_json::to_vec(cached) else {
-        return;
-    };
-    let _ = atomic_write_report(&path, &bytes);
 }
 
 fn ensure_store_root(root: &Path) -> Result<()> {
