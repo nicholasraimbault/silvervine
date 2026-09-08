@@ -274,11 +274,6 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
-    /// RAII env-var setter that restores on drop. Mirrors the helper in
-    /// the per-platform impl modules but exposed at the public-API test
-    /// layer so we can exercise `is_registered`/`registration_path`
-    /// without going through the impl-private test helpers.
-
     /// `SILVERVINE_TEST_LIFECYCLE_NOOP=1` short-circuits register/unregister
     /// and forces `is_registered()` to `false`.
     #[test]

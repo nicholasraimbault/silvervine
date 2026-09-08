@@ -63,6 +63,7 @@ pub struct ScopedEnv {
 
 impl ScopedEnv {
     /// Set `key` to `value`, remembering the previous mapping.
+    #[must_use]
     pub fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
         let prev = std::env::var_os(key);
         // SAFETY: the caller holds `env_lock` for the guard's lifetime.
@@ -71,6 +72,7 @@ impl ScopedEnv {
     }
 
     /// Remove `key` for the lifetime of the guard.
+    #[must_use]
     pub fn unset(key: &'static str) -> Self {
         let prev = std::env::var_os(key);
         // SAFETY: the caller holds `env_lock` for the guard's lifetime.
@@ -89,14 +91,23 @@ impl Drop for ScopedEnv {
 }
 
 /// Point `XDG_CACHE_HOME` at a fresh tempdir. Hold [`env_lock`] first.
+///
+/// # Panics
+///
+/// Panics if a temporary directory cannot be created.
 #[cfg(test)]
+#[must_use]
 pub fn isolated_xdg_cache() -> (tempfile::TempDir, ScopedEnv) {
     let home = tempfile::TempDir::new().expect("cache home");
     let env = ScopedEnv::set("XDG_CACHE_HOME", home.path());
     (home, env)
 }
 
-/// Set a regular file's mtime. Panics on failure — tests only.
+/// Set a regular file's mtime.
+///
+/// # Panics
+///
+/// Panics if `path` cannot be opened or its mtime cannot be set.
 #[cfg(test)]
 pub fn set_mtime(path: &std::path::Path, modified: std::time::SystemTime) {
     std::fs::File::open(path)
@@ -106,6 +117,10 @@ pub fn set_mtime(path: &std::path::Path, modified: std::time::SystemTime) {
 }
 
 /// Write an executable shell script at `path`.
+///
+/// # Panics
+///
+/// Panics if the parent directory, file, or `0o755` mode cannot be applied.
 #[cfg(all(test, unix))]
 pub fn write_executable_script(path: &std::path::Path, body: &str) {
     use std::os::unix::fs::PermissionsExt;

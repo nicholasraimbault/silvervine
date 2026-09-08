@@ -270,8 +270,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn package_manager_version_is_memoized_for_unchanged_executable() {
-        use std::os::unix::fs::PermissionsExt;
-
         let _env = crate::test_support::env_lock();
         let _cache = crate::test_support::isolated_xdg_cache();
         let tmp = TempDir::new().expect("tmp");

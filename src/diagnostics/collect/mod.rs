@@ -1,6 +1,6 @@
 //! Passive, local-only browser, CDM, codec, and graphics diagnostics.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
