@@ -341,6 +341,20 @@ mod tests {
         }
     }
 
+    /// Hold the crate env lock and clear the self-update noop flag.
+    ///
+    /// Sidecar tests that skip this can observe `SILVERVINE_TEST_SELF_UPDATE_NOOP`
+    /// while [`run_honors_noop_env`] is running (tarpaulin hits that race).
+    fn isolate_self_update() -> (
+        std::sync::MutexGuard<'static, ()>,
+        crate::test_support::ScopedEnv,
+    ) {
+        (
+            crate::test_support::env_lock(),
+            crate::test_support::ScopedEnv::unset(NOOP_ENV),
+        )
+    }
+
     #[test]
     fn run_honors_noop_env() {
         let _guard = crate::test_support::env_lock();
@@ -359,14 +373,8 @@ mod tests {
 
     #[test]
     fn run_without_sidecar_errors() {
-        let _guard = crate::test_support::env_lock();
-        let previous = std::env::var_os(NOOP_ENV);
-        unsafe { std::env::remove_var(NOOP_ENV) };
+        let _iso = isolate_self_update();
         let err = run(&args()).unwrap_err();
-        match previous {
-            Some(value) => unsafe { std::env::set_var(NOOP_ENV, value) },
-            None => unsafe { std::env::remove_var(NOOP_ENV) },
-        }
         assert!(
             err.message.contains("silvervine-update") || err.message.contains("install receipt"),
             "unexpected error: {}",
@@ -376,6 +384,7 @@ mod tests {
 
     #[test]
     fn missing_sidecar_errors_even_when_receipt_exists() {
+        let _iso = isolate_self_update();
         let tmp = TempDir::new().unwrap();
         let sidecar = tmp.path().join(SIDECAR_NAME);
         let receipt = tmp.path().join(RECEIPT_NAME);
@@ -386,6 +395,7 @@ mod tests {
 
     #[test]
     fn missing_receipt_errors_when_sidecar_exists() {
+        let _iso = isolate_self_update();
         let tmp = TempDir::new().unwrap();
         let sidecar = tmp.path().join(SIDECAR_NAME);
         write_executable(&sidecar, "#!/bin/sh\nexit 0\n");
@@ -396,6 +406,7 @@ mod tests {
 
     #[test]
     fn dry_run_does_not_invoke_sidecar() {
+        let _iso = isolate_self_update();
         let tmp = TempDir::new().unwrap();
         let sidecar = tmp.path().join(SIDECAR_NAME);
         let marker = tmp.path().join("ran");
@@ -415,6 +426,7 @@ mod tests {
 
     #[test]
     fn successful_sidecar_does_not_overwrite_a_running_binary() {
+        let _iso = isolate_self_update();
         let tmp = TempDir::new().unwrap();
         let running = tmp.path().join("silvervine");
         fs::write(&running, b"running-daemon-bytes").unwrap();
@@ -444,6 +456,7 @@ mod tests {
 
     #[test]
     fn sidecar_nonzero_exit_is_an_error() {
+        let _iso = isolate_self_update();
         let tmp = TempDir::new().unwrap();
         let sidecar = tmp.path().join(SIDECAR_NAME);
         write_executable(&sidecar, "#!/bin/sh\nexit 3\n");
@@ -514,6 +527,7 @@ mod tests {
 
     #[test]
     fn sidecar_already_up_to_date_is_not_updated() {
+        let _iso = isolate_self_update();
         let tmp = TempDir::new().unwrap();
         let (sidecar, receipt) = seeded(
             &tmp,
@@ -527,6 +541,7 @@ mod tests {
 
     #[test]
     fn sidecar_empty_success_is_not_updated() {
+        let _iso = isolate_self_update();
         let tmp = TempDir::new().unwrap();
         let (sidecar, receipt) = seeded(&tmp, "#!/bin/sh\nexit 0\n");
         let outcome = run_with(&args(), Some(&sidecar), Some(&receipt), &mut Vec::new()).unwrap();
@@ -537,6 +552,7 @@ mod tests {
 
     #[test]
     fn sidecar_install_phrasing_is_updated() {
+        let _iso = isolate_self_update();
         let tmp = TempDir::new().unwrap();
         let (sidecar, receipt) = seeded(
             &tmp,
@@ -550,6 +566,7 @@ mod tests {
 
     #[test]
     fn json_path_does_not_include_sidecar_stdout() {
+        let _iso = isolate_self_update();
         let tmp = TempDir::new().unwrap();
         let (sidecar, receipt) = seeded(
             &tmp,
@@ -573,6 +590,7 @@ mod tests {
 
     #[test]
     fn human_path_prints_sidecar_then_restart_only_when_updated() {
+        let _iso = isolate_self_update();
         let tmp = TempDir::new().unwrap();
         let (sidecar, receipt) = seeded(
             &tmp,
