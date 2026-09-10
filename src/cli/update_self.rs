@@ -10,7 +10,8 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+use std::time::Duration;
 
 use crate::cli::OutputOptions;
 use crate::error::{Error, Result};
@@ -139,9 +140,7 @@ fn receipt_path() -> PathBuf {
 }
 
 fn invoke_sidecar(sidecar: &Path) -> Result<String> {
-    let output = Command::new(sidecar)
-        .output()
-        .map_err(|e| Error::other(format!("failed to run {SIDECAR_NAME}: {e}")))?;
+    let output = spawn_sidecar(sidecar)?;
     let captured = combine_captured(&output.stdout, &output.stderr);
     if output.status.success() {
         Ok(captured)
@@ -157,6 +156,32 @@ fn invoke_sidecar(sidecar: &Path) -> Result<String> {
             captured.trim()
         )))
     }
+}
+
+fn spawn_sidecar(sidecar: &Path) -> Result<Output> {
+    let mut last_error = None;
+    for delay_ms in [0_u64, 1, 2, 5, 10, 20, 50] {
+        if delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
+        match Command::new(sidecar).output() {
+            Ok(output) => return Ok(output),
+            Err(error) if is_etxtbsy(&error) => last_error = Some(error),
+            Err(error) => {
+                return Err(Error::other(format!(
+                    "failed to run {SIDECAR_NAME}: {error}"
+                )));
+            }
+        }
+    }
+    Err(Error::other(format!(
+        "failed to run {SIDECAR_NAME}: {}",
+        last_error.expect("ETXTBSY retry loop always records the last error")
+    )))
+}
+
+fn is_etxtbsy(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ETXTBSY)
 }
 
 fn combine_captured(stdout: &[u8], stderr: &[u8]) -> String {
@@ -286,6 +311,24 @@ mod tests {
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invoke_sidecar_retries_etxtbsy() {
+        let tmp = TempDir::new().unwrap();
+        let sidecar = tmp.path().join("sidecar.sh");
+        write_executable(&sidecar, "#!/bin/sh\nprintf ok\nexit 0\n");
+        let hold = fs::OpenOptions::new().write(true).open(&sidecar).unwrap();
+        let sidecar_for_thread = sidecar.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            drop(hold);
+            sidecar_for_thread
+        });
+        let captured = super::invoke_sidecar(&sidecar).expect("retry past ETXTBSY");
+        worker.join().unwrap();
+        assert!(captured.contains("ok"), "captured: {captured:?}");
     }
 
     fn args() -> SelfArgs {
