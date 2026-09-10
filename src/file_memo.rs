@@ -19,6 +19,7 @@ use crate::widevine::download::sha512_reader;
 use crate::widevine::sha512_hex;
 
 const MAX_MEMO_BYTES: u64 = 8 * 1024;
+#[cfg(any(test, target_os = "linux"))]
 const MAX_TEXT_BYTES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +31,7 @@ struct DigestMemo {
     sha512: String,
 }
 
+#[cfg(any(test, target_os = "linux"))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TextMemo {
@@ -60,6 +62,7 @@ pub(crate) fn sha512_memoized_with_identity(path: &Path) -> Result<(FileIdentity
 }
 
 /// Return a previously stored short string for `path`, or `compute` and store it.
+#[cfg(any(test, target_os = "linux"))]
 pub(crate) fn text_memoized(
     path: &Path,
     compute: impl FnOnce() -> Option<String>,
@@ -148,6 +151,7 @@ fn digest_root() -> PathBuf {
         .join("file-digests")
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn text_root() -> PathBuf {
     platform::cache_dir().join("diagnostics").join("file-text")
 }
@@ -164,6 +168,7 @@ fn is_lowercase_sha512(value: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn is_short_text(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_TEXT_BYTES
 }
@@ -188,6 +193,7 @@ fn store_digest(cached: &DigestMemo) {
     );
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn load_text(canonical: &str, len: u64, modified: u64) -> Option<String> {
     let cached: TextMemo = load_json(&memo_path(&text_root(), "txt", canonical))?;
     if cached.canonical_path != canonical
@@ -200,6 +206,7 @@ fn load_text(canonical: &str, len: u64, modified: u64) -> Option<String> {
     Some(cached.value)
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn store_text(cached: &TextMemo) {
     store_json(
         &text_root(),

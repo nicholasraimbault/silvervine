@@ -116,6 +116,17 @@ pub fn set_mtime(path: &std::path::Path, modified: std::time::SystemTime) {
         .expect("set mtime");
 }
 
+/// Default `hooks/<name>` path under the current platform config dir.
+///
+/// Call after `HOME` / `XDG_CONFIG_HOME` are redirected, while holding
+/// [`env_lock`]. Linux uses `$XDG_CONFIG_HOME/silvervine/hooks/<name>`;
+/// macOS uses `$HOME/Library/Application Support/silvervine/hooks/<name>`.
+#[cfg(test)]
+#[must_use]
+pub fn default_hook_path(name: &str) -> std::path::PathBuf {
+    crate::platform::config_dir().join("hooks").join(name)
+}
+
 /// Write an executable shell script at `path`.
 ///
 /// # Panics

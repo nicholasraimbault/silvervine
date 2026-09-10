@@ -373,7 +373,7 @@ fn is_executable_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{write_executable_script, ScopedEnv};
+    use crate::test_support::{default_hook_path, write_executable_script, ScopedEnv};
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -627,12 +627,7 @@ exit 0
 
         let config = Config::default();
         let path = resolve_hook_path("post-patch", &config).expect("default path resolves");
-        let expected = dirs::config_dir()
-            .expect("config dir")
-            .join("silvervine")
-            .join("hooks")
-            .join("post-patch");
-        assert_eq!(path, expected);
+        assert_eq!(path, default_hook_path("post-patch"));
     }
 
     /// `run_hook(name, env)` returns `NotConfigured` when no script exists
@@ -657,11 +652,7 @@ exit 0
         let _xdg = ScopedEnv::set("XDG_CONFIG_HOME", tmp.path());
         let _home = ScopedEnv::set("HOME", tmp.path());
 
-        let hook_path = dirs::config_dir()
-            .expect("config dir")
-            .join("silvervine")
-            .join("hooks")
-            .join("post-patch");
+        let hook_path = default_hook_path("post-patch");
         write_executable_script(&hook_path, "#!/bin/sh\necho yo\nexit 0\n");
 
         let outcome = run_hook("post-patch", &HashMap::new()).unwrap();
@@ -700,11 +691,7 @@ exit 0
         let _xdg = ScopedEnv::set("XDG_CONFIG_HOME", tmp.path());
         let _home = ScopedEnv::set("HOME", tmp.path());
         let path = resolve_hook_path("custom-hook-name", &Config::default()).unwrap();
-        assert!(path.ends_with(
-            std::path::Path::new("silvervine")
-                .join("hooks")
-                .join("custom-hook-name")
-        ));
+        assert_eq!(path, default_hook_path("custom-hook-name"));
     }
 
     /// A hook that sleeps past the bound must be killed, not waited out.
@@ -737,10 +724,9 @@ exit 0
     fn run_pre_patch_errors_on_nonzero() {
         let _guard = crate::test_support::env_lock();
         let dir = TempDir::new().unwrap();
-        let script = dir.path().join("silvervine/hooks/pre-patch");
-        write_executable_script(&script, "#!/bin/sh\nexit 7\n");
         let _cfg = ScopedEnv::set("XDG_CONFIG_HOME", dir.path());
         let _home = ScopedEnv::set("HOME", dir.path());
+        write_executable_script(&default_hook_path("pre-patch"), "#!/bin/sh\nexit 7\n");
         let err = run_pre_patch(&["Helium"]).unwrap_err();
         assert!(err.message.contains("pre-patch"));
     }
@@ -750,10 +736,9 @@ exit 0
     fn run_pre_patch_errors_on_timeout() {
         let _guard = crate::test_support::env_lock();
         let dir = TempDir::new().unwrap();
-        let script = dir.path().join("silvervine/hooks/pre-patch");
-        write_executable_script(&script, "#!/bin/sh\nsleep 30\n");
         let _cfg = ScopedEnv::set("XDG_CONFIG_HOME", dir.path());
         let _home = ScopedEnv::set("HOME", dir.path());
+        write_executable_script(&default_hook_path("pre-patch"), "#!/bin/sh\nsleep 30\n");
         let started = std::time::Instant::now();
         let err = run_pre_patch(&["Helium"]).unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -769,10 +754,9 @@ exit 0
     fn run_pre_patch_ok_on_zero_exit() {
         let _guard = crate::test_support::env_lock();
         let dir = TempDir::new().unwrap();
-        let script = dir.path().join("silvervine/hooks/pre-patch");
-        write_executable_script(&script, "#!/bin/sh\nexit 0\n");
         let _cfg = ScopedEnv::set("XDG_CONFIG_HOME", dir.path());
         let _home = ScopedEnv::set("HOME", dir.path());
+        write_executable_script(&default_hook_path("pre-patch"), "#!/bin/sh\nexit 0\n");
         run_pre_patch(&["Helium"]).unwrap();
     }
 }

@@ -525,12 +525,11 @@ fn run_event_loop(
         let cmd = {
             #[cfg(target_os = "macos")]
             {
-                match tray.try_recv() {
-                    Some(cmd) => Some(cmd),
-                    None => {
-                        tray.wait_for_platform_event(Duration::from_millis(100));
-                        tray.try_recv()
-                    }
+                if let Some(cmd) = tray.try_recv() {
+                    Some(cmd)
+                } else {
+                    tray.wait_for_platform_event(Duration::from_millis(100));
+                    tray.try_recv()
                 }
             }
             #[cfg(not(target_os = "macos"))]
@@ -968,7 +967,7 @@ fn install_tracing_subscriber() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{write_executable_script, ScopedEnv};
+    use crate::test_support::{default_hook_path, write_executable_script, ScopedEnv};
     use std::sync::Mutex;
     use tempfile::TempDir;
 
@@ -1719,7 +1718,7 @@ mod tests {
         let _home = ScopedEnv::set("HOME", tmp.path());
         let marker = tmp.path().join("pre-patch.ran");
         write_executable_script(
-            &tmp.path().join("silvervine/hooks/pre-patch"),
+            &default_hook_path("pre-patch"),
             &format!("#!/bin/sh\necho ran > {}\nexit 7\n", marker.display()),
         );
         let install = tmp.path().join("h");

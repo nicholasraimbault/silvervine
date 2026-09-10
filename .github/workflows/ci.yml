@@ -127,7 +127,9 @@ jobs:
     name: musl static-pie
     runs-on: ubuntu-22.04
     env:
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      # Match cargo-dist 0.31 (build/cargo.rs): +crt-static and
+      # link-self-contained, and do not override the linker. Pointing the
+      # musl target at musl-gcc injects INTERP and yields a dynamic PIE.
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-Ctarget-feature=+crt-static -Clink-self-contained=yes"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -148,7 +150,16 @@ jobs:
           bin=target/x86_64-unknown-linux-musl/release/silvervine
           file "$bin"
           file "$bin" | grep -q 'static-pie'
+          if readelf -l "$bin" | grep -q 'INTERP'; then
+            echo 'unexpected INTERP segment (not static-pie)'
+            readelf -l "$bin"
+            exit 1
+          fi
           "$bin" --version
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: silvervine-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/silvervine
 
   msrv:
     name: MSRV (1.88)

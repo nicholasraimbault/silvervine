@@ -287,7 +287,7 @@ pub fn run_privileged(args: &PrivilegedArgs) -> Result<()> {
 mod tests {
     use super::*;
     use crate::browsers::BrowserKind;
-    use crate::test_support::{write_executable_script, ScopedEnv};
+    use crate::test_support::{default_hook_path, write_executable_script, ScopedEnv};
     use std::cell::RefCell;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -443,10 +443,7 @@ mod tests {
     fn run_patch_flow_pre_patch_failure_skips_execute() {
         let tmp = TempDir::new().unwrap();
         let _iso = isolate_user_config(&tmp);
-        write_executable_script(
-            &tmp.path().join("silvervine/hooks/pre-patch"),
-            "#!/bin/sh\nexit 7\n",
-        );
+        write_executable_script(&default_hook_path("pre-patch"), "#!/bin/sh\nexit 7\n");
         let cache = tmp.path().join("cache");
         fs::create_dir_all(&cache).unwrap();
         let h = tmp.path().join("h");
@@ -480,10 +477,7 @@ mod tests {
     fn run_patch_flow_privileged_skips_pre_patch() {
         let tmp = TempDir::new().unwrap();
         let _iso = isolate_user_config(&tmp);
-        write_executable_script(
-            &tmp.path().join("silvervine/hooks/pre-patch"),
-            "#!/bin/sh\nexit 7\n",
-        );
+        write_executable_script(&default_hook_path("pre-patch"), "#!/bin/sh\nexit 7\n");
         let cache = tmp.path().join("cache");
         fs::create_dir_all(&cache).unwrap();
         let h = tmp.path().join("h");

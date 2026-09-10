@@ -247,12 +247,11 @@ jobs:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-22.04
             packages: musl-tools
-            # Mirror cargo-dist musl linkage (build/cargo.rs): static CRT +
-            # self-contained link via musl-gcc from musl-tools.
-            linker: musl-gcc
+            # cargo-dist 0.31 (build/cargo.rs) sets +crt-static and
+            # link-self-contained and does not override the linker.
+            # musl-gcc as linker injects INTERP and is not static-pie.
             rustflags: "-Ctarget-feature=+crt-static -Clink-self-contained=yes"
     env:
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.linker }}
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
