@@ -10,11 +10,18 @@ Future entries are generated from
 
 ## [Unreleased]
 
+## [2.2.0-rc.2] - 2026-09-10
+
 ### Added
 
 - Opt-in `[updates] auto_apply = true`: the daemon applies the latest stable
   GitHub release through the cargo-dist sidecar, skips while a patch lock is
   held, and restarts the user unit after a swap. Default remains off.
+
+### Fixed
+
+- Sidecar tests no longer race with `SILVERVINE_TEST_SELF_UPDATE_NOOP` under
+  tarpaulin.
 
 ## [2.2.0-rc.1] - 2026-09-10
 
@@ -422,7 +429,8 @@ rc.1 has a hard deadlock on the patch path.
   scripts. Both bugs are obsoleted by the rewrite, but the reports
   were on the money.
 
-[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.2.0-rc.1...HEAD
+[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.2.0-rc.2...HEAD
+[2.2.0-rc.2]: https://github.com/nicholasraimbault/silvervine/compare/v2.2.0-rc.1...v2.2.0-rc.2
 [2.2.0-rc.1]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.3...v2.2.0-rc.1
 [2.1.3]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.2...v2.1.3
 [2.1.2]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.1...v2.1.2
