@@ -85,6 +85,10 @@ pub const HEARTBEAT_INTERVAL_SECS: u64 = 60;
 /// the cached library hash against its persisted installation metadata.
 pub const INTEGRITY_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 
+/// How often the daemon re-checks GitHub for a stable self-update when
+/// `[updates].auto_apply` is enabled.
+pub const AUTO_APPLY_INTERVAL_SECS: u64 = 60 * 60 * 24;
+
 /// Filename of the heartbeat artifact under `cache_dir/silvervine/`.
 pub const HEARTBEAT_FILENAME: &str = "heartbeat";
 
@@ -235,6 +239,15 @@ pub fn run_with(options: &RunOptions) -> Result<()> {
         .unwrap_or_else(|| Duration::from_secs(INTEGRITY_INTERVAL_SECS));
     let integrity_handle = spawn_integrity_check(integrity_interval, Arc::clone(&stop));
 
+    let auto_apply_handle = if config.updates.auto_apply && !options.test_mode {
+        spawn_auto_apply(
+            Duration::from_secs(AUTO_APPLY_INTERVAL_SECS),
+            Arc::clone(&stop),
+        )
+    } else {
+        None
+    };
+
     // Run the main event loop. In production this blocks until the user
     // clicks Quit / sends SIGTERM. In test mode (`single_iteration`) we run
     // one iteration then return.
@@ -249,6 +262,9 @@ pub fn run_with(options: &RunOptions) -> Result<()> {
         let _ = h.join();
     }
     if let Some(h) = integrity_handle {
+        let _ = h.join();
+    }
+    if let Some(h) = auto_apply_handle {
         let _ = h.join();
     }
     write_shutdown_timestamp(heartbeat_path.parent().unwrap_or_else(|| Path::new("/tmp")));
@@ -441,6 +457,66 @@ fn spawn_integrity_check(interval: Duration, stop: Arc<AtomicBool>) -> Option<Jo
             }
         })
         .ok()
+}
+
+fn spawn_auto_apply(interval: Duration, stop: Arc<AtomicBool>) -> Option<JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("silvervine-auto-apply".to_string())
+        .spawn(move || {
+            let startup = Duration::from_secs(30).min(interval);
+            sleep_while_running(startup, &stop);
+            while !stop.load(Ordering::SeqCst) {
+                run_auto_apply_once();
+                sleep_while_running(interval, &stop);
+            }
+        })
+        .ok()
+}
+
+fn sleep_while_running(interval: Duration, stop: &AtomicBool) {
+    let mut slept = Duration::ZERO;
+    let granularity = Duration::from_millis(500);
+    while slept < interval && !stop.load(Ordering::SeqCst) {
+        std::thread::sleep(granularity);
+        slept += granularity;
+    }
+}
+
+fn run_auto_apply_once() {
+    let Some(lock) = crate::patch::default_patch_lock() else {
+        tracing::debug!(
+            target: "silvervine::daemon",
+            "auto-apply skipped: cannot resolve patch lock path"
+        );
+        return;
+    };
+    let enabled = load_config().is_ok_and(|config| config.updates.auto_apply);
+    match crate::cli::update_self::auto_apply(enabled, &lock, None, None, lifecycle::restart) {
+        Ok(crate::cli::update_self::AutoApplyOutcome::Updated { latest_version }) => {
+            tracing::info!(
+                target: "silvervine::daemon",
+                version = %latest_version,
+                "auto-applied GitHub self-update"
+            );
+            notify_user::notify_info(&format!(
+                "Updated Silvervine to {latest_version}. Restarting the daemon."
+            ));
+        }
+        Ok(
+            crate::cli::update_self::AutoApplyOutcome::Disabled
+            | crate::cli::update_self::AutoApplyOutcome::AlreadyCurrent
+            | crate::cli::update_self::AutoApplyOutcome::PatchInProgress
+            | crate::cli::update_self::AutoApplyOutcome::SkippedMissingInstall,
+        ) => {}
+        Err(error) => {
+            tracing::warn!(
+                target: "silvervine::daemon",
+                error = %error,
+                "auto-apply failed"
+            );
+            notify_user::notify_failure(error.category, &error.message);
+        }
+    }
 }
 
 /// Run the integrity check once. Best-effort: failures are logged but

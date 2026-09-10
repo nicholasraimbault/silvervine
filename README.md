@@ -34,6 +34,11 @@ Custom installations can be added to the configuration file:
 name = "My Browser"
 install_path = "/home/me/my-browser" # Linux
 # bundle_path = "/Users/me/Applications/My Browser.app" # macOS
+
+[updates]
+# Off by default. When true, the daemon applies the latest *stable* GitHub
+# release via silvervine-update (cargo-dist sidecar + receipt). Never mid-patch.
+auto_apply = false
 ```
 
 Chrome, Edge, Brave, and Firefox already manage Widevine and do not need Silvervine.

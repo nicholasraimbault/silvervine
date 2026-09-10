@@ -100,6 +100,25 @@ pub fn unregister() -> Result<()> {
     imp::unregister()
 }
 
+/// Restart a registered user daemon so it loads a newly swapped binary.
+///
+/// Linux: `systemctl --user try-restart silvervine.service`.
+/// macOS: `launchctl kickstart -k gui/<uid>/<label>`.
+///
+/// # Errors
+///
+/// Same categories as [`register`].
+///
+/// # Test mode
+///
+/// `SILVERVINE_TEST_LIFECYCLE_NOOP=1` returns `Ok(())`.
+pub fn restart() -> Result<()> {
+    if noop_enabled() {
+        return Ok(());
+    }
+    imp::restart()
+}
+
 /// Stop and unregister Silvervine during migration rollback, including a
 /// loaded job whose registration artifact was already removed by a failed
 /// inner rollback.
@@ -235,6 +254,11 @@ mod imp {
             "daemon registration is only implemented on Linux and macOS",
         ))
     }
+    pub(super) fn restart() -> Result<()> {
+        Err(Error::unsupported_platform(
+            "daemon registration is only implemented on Linux and macOS",
+        ))
+    }
     pub(super) fn unregister_for_rollback() -> Result<()> {
         Err(Error::unsupported_platform(
             "daemon registration is only implemented on Linux and macOS",
@@ -282,6 +306,7 @@ mod tests {
         let _noop = ScopedEnv::set(NOOP_ENV, Path::new("1"));
         assert!(register().is_ok(), "register short-circuits under NOOP");
         assert!(unregister().is_ok(), "unregister short-circuits under NOOP");
+        assert!(restart().is_ok(), "restart short-circuits under NOOP");
         assert!(
             !is_registered(),
             "is_registered must return false under NOOP"

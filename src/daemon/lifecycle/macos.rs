@@ -302,6 +302,11 @@ pub(super) fn remove_legacy_registration() -> Result<()> {
     remove_plist_if_present(&registration_path()?.with_file_name(LEGACY_PLIST_NAME))
 }
 
+pub(super) fn restart() -> Result<()> {
+    let target = gui_target(current_uid());
+    launchctl_required(&["kickstart", "-k", &target])
+}
+
 pub(super) fn unregister() -> Result<()> {
     let plist_path = registration_path()?;
     if !plist_path.try_exists().map_err(Error::from)? {

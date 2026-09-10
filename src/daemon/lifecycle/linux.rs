@@ -309,6 +309,10 @@ pub(super) fn remove_legacy_registration() -> Result<()> {
     )
 }
 
+pub(super) fn restart() -> Result<()> {
+    systemctl_user(&["try-restart", SERVICE_NAME])
+}
+
 pub(super) fn unregister() -> Result<()> {
     let unit_path = registration_path()?;
     if !unit_path.try_exists().map_err(Error::from)? {

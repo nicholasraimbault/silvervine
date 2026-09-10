@@ -18,6 +18,9 @@
 //! pre_patch = "~/.config/silvervine/hooks/pre-patch"
 //! post_patch = "~/.config/silvervine/hooks/post-patch"
 //! post_update = "~/.config/silvervine/hooks/post-update"
+//!
+//! [updates]
+//! auto_apply = false
 //! ```
 //!
 //! ## Loading rules
@@ -62,6 +65,8 @@ pub struct Config {
     pub browsers: Vec<CustomBrowserConfig>,
     /// `[hooks]` block — paths to scripts run on patch / update events.
     pub hooks: HooksConfig,
+    /// `[updates]` block — opt-in GitHub self-update.
+    pub updates: UpdatesConfig,
 }
 
 /// `[notifications]` section.
@@ -120,6 +125,15 @@ pub struct HooksConfig {
     /// A configured script that exits non-zero or times out aborts the patch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pre_patch: Option<String>,
+}
+
+/// `[updates]` section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdatesConfig {
+    /// When `true`, the daemon applies the latest stable GitHub release via
+    /// the cargo-dist sidecar. Default: `false` (prompted `update self` only).
+    pub auto_apply: bool,
 }
 
 /// Top-level sections from older config schemas that should be silently
@@ -273,6 +287,7 @@ mod tests {
         assert!(cfg.browsers.is_empty());
         assert!(cfg.hooks.post_patch.is_none());
         assert!(cfg.hooks.pre_patch.is_none());
+        assert!(!cfg.updates.auto_apply);
     }
 
     #[test]
@@ -315,6 +330,12 @@ post_update = "~/.config/silvervine/hooks/post-update"
             cfg.hooks.post_patch.as_deref(),
             Some("~/.config/silvervine/hooks/post-patch")
         );
+    }
+
+    #[test]
+    fn parses_updates_auto_apply() {
+        let cfg = Config::from_toml_str("[updates]\nauto_apply = true").expect("parses");
+        assert!(cfg.updates.auto_apply);
     }
 
     #[test]
@@ -413,6 +434,7 @@ typo_field = false
                 post_update: None,
                 pre_patch: None,
             },
+            updates: UpdatesConfig::default(),
         };
         let s = cfg.to_toml_string().expect("round trip serializes");
         let back = Config::from_toml_str(&s).expect("round trip parses");
