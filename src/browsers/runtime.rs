@@ -102,6 +102,7 @@ fn package_manager_version(browser: &Browser) -> Option<String> {
     crate::file_memo::text_memoized(&executable, || query_package_version(&executable))
 }
 
+#[cfg(target_os = "linux")]
 fn query_package_version(executable: &Path) -> Option<String> {
     let executable = executable.to_str()?;
 
