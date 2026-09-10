@@ -121,7 +121,7 @@ enum Command {
         url: Option<String>,
     },
 
-    /// Update or roll back the Widevine CDM.
+    /// Update the Widevine CDM or this GitHub-installed binary.
     Update {
         #[command(subcommand)]
         target: UpdateTarget,
@@ -188,6 +188,14 @@ enum UpdateTarget {
         /// Override the Mozilla manifest URL with a custom CRX3 source.
         #[arg(long)]
         cdm_source: Option<String>,
+    },
+
+    /// Replace this GitHub-installed binary after verifying release checksums.
+    #[command(name = "self")]
+    SelfUpdate {
+        /// Confirm sidecar and install receipt without invoking the updater.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -374,6 +382,9 @@ fn dispatch(cmd: Command, output: cli::OutputOptions) -> silvervine::Result<()> 
                 cdm_source,
                 output,
             }),
+            UpdateTarget::SelfUpdate { dry_run } => {
+                cli::update::run_self(&cli::update_self::SelfArgs { dry_run, output }).map(|_| ())
+            }
         },
         Command::Repair => cli::repair::run(&cli::repair::Args { output }),
         Command::Launch { browser } => cli::launch::run(&cli::launch::Args { browser, output }),

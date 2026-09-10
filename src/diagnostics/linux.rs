@@ -1,6 +1,6 @@
 //! Linux host media/GPU passive diagnostics.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -202,7 +202,7 @@ fn vainfo_check() -> DiagnosticCheck {
             details: BTreeMap::from([("utility".into(), "vainfo".into())]),
         };
     };
-    match run_output_with_timeout(&executable, &[], UTILITY_TIMEOUT) {
+    match run_output_with_timeout(&executable, &[], UTILITY_TIMEOUT, &HashMap::new()) {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -276,7 +276,7 @@ fn glibc_check() -> DiagnosticCheck {
             details: BTreeMap::from([("utility".into(), "ldd".into())]),
         };
     };
-    match run_output_with_timeout(&ldd, &["--version"], UTILITY_TIMEOUT) {
+    match run_output_with_timeout(&ldd, &["--version"], UTILITY_TIMEOUT, &HashMap::new()) {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);

@@ -15,6 +15,7 @@
 //! # install_path = "/home/me/dev/my-build"
 //!
 //! [hooks]
+//! pre_patch = "~/.config/silvervine/hooks/pre-patch"
 //! post_patch = "~/.config/silvervine/hooks/post-patch"
 //! post_update = "~/.config/silvervine/hooks/post-update"
 //! ```
@@ -114,6 +115,11 @@ pub struct HooksConfig {
     /// Path to a post-update script. `~` is expanded to `$HOME`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_update: Option<String>,
+    /// Path to a pre-patch script. `~` is expanded to `$HOME`.
+    ///
+    /// A configured script that exits non-zero or times out aborts the patch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_patch: Option<String>,
 }
 
 /// Top-level sections from older config schemas that should be silently
@@ -174,6 +180,14 @@ impl Config {
     #[must_use]
     pub fn post_update_hook(&self) -> Option<PathBuf> {
         self.hooks.post_update.as_deref().map(resolve_hook_path)
+    }
+
+    /// Resolve the pre-patch hook script path (with `~` expansion).
+    ///
+    /// Returns `None` if no `[hooks].pre_patch` entry is set.
+    #[must_use]
+    pub fn pre_patch_hook(&self) -> Option<PathBuf> {
+        self.hooks.pre_patch.as_deref().map(resolve_hook_path)
     }
 }
 
@@ -258,6 +272,7 @@ mod tests {
         assert!(cfg.notifications.on_failure);
         assert!(cfg.browsers.is_empty());
         assert!(cfg.hooks.post_patch.is_none());
+        assert!(cfg.hooks.pre_patch.is_none());
     }
 
     #[test]
@@ -277,6 +292,7 @@ name = "LinuxBrowser"
 install_path = "/home/me/dev/my-build"
 
 [hooks]
+pre_patch = "~/.config/silvervine/hooks/pre-patch"
 post_patch = "~/.config/silvervine/hooks/post-patch"
 post_update = "~/.config/silvervine/hooks/post-update"
 "#;
@@ -291,6 +307,10 @@ post_update = "~/.config/silvervine/hooks/post-update"
         );
         assert!(cfg.browsers[0].bundle_path.is_some());
         assert!(cfg.browsers[1].install_path.is_some());
+        assert_eq!(
+            cfg.hooks.pre_patch.as_deref(),
+            Some("~/.config/silvervine/hooks/pre-patch")
+        );
         assert_eq!(
             cfg.hooks.post_patch.as_deref(),
             Some("~/.config/silvervine/hooks/post-patch")
@@ -391,6 +411,7 @@ typo_field = false
             hooks: HooksConfig {
                 post_patch: Some("/tmp/post-patch".into()),
                 post_update: None,
+                pre_patch: None,
             },
         };
         let s = cfg.to_toml_string().expect("round trip serializes");
@@ -451,6 +472,7 @@ on_failure = true
             hooks: HooksConfig {
                 post_patch: Some("/absolute/post-patch".into()),
                 post_update: None,
+                pre_patch: None,
             },
             ..Default::default()
         };
@@ -459,6 +481,7 @@ on_failure = true
             Some(PathBuf::from("/absolute/post-patch"))
         );
         assert_eq!(cfg.post_update_hook(), None);
+        assert_eq!(cfg.pre_patch_hook(), None);
     }
 
     #[test]
@@ -517,6 +540,7 @@ on_failure = true
             hooks: HooksConfig {
                 post_patch: None,
                 post_update: Some("/tmp/post-update".into()),
+                pre_patch: None,
             },
             ..Default::default()
         };
@@ -524,6 +548,25 @@ on_failure = true
             cfg.post_update_hook(),
             Some(PathBuf::from("/tmp/post-update"))
         );
+    }
+
+    #[test]
+    fn pre_patch_hook_returns_none_when_unset() {
+        let cfg = Config::default();
+        assert!(cfg.pre_patch_hook().is_none());
+    }
+
+    #[test]
+    fn pre_patch_hook_returns_path_when_set() {
+        let cfg = Config {
+            hooks: HooksConfig {
+                post_patch: None,
+                post_update: None,
+                pre_patch: Some("/tmp/pre-patch".into()),
+            },
+            ..Default::default()
+        };
+        assert_eq!(cfg.pre_patch_hook(), Some(PathBuf::from("/tmp/pre-patch")));
     }
 
     #[test]

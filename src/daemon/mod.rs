@@ -521,9 +521,22 @@ fn run_event_loop(
         if stop.load(Ordering::SeqCst) {
             return Ok(());
         }
-        // Try to receive a command without blocking forever — we want
-        // to observe the stop flag periodically.
-        let cmd = tray.try_recv();
+        // Bounded wait so the stop flag is observed at least every 100 ms.
+        let cmd = {
+            #[cfg(target_os = "macos")]
+            {
+                if let Some(cmd) = tray.try_recv() {
+                    Some(cmd)
+                } else {
+                    tray.wait_for_platform_event(Duration::from_millis(100));
+                    tray.try_recv()
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                tray.recv_timeout(Duration::from_millis(100))
+            }
+        };
         match cmd {
             Some(TrayCommand::Quit) => {
                 tracing::info!(target: "silvervine::daemon", "tray Quit; exiting");
@@ -558,9 +571,7 @@ fn run_event_loop(
                 );
                 handle_toggle_launch_at_login(target);
             }
-            None => {
-                tray.wait_for_platform_event(Duration::from_millis(100));
-            }
+            None => {}
         }
         if single_iteration {
             return Ok(());
@@ -668,6 +679,20 @@ fn drive_patch_flow_with_cdm(
         }
     }
     if needs.is_empty() {
+        return results;
+    }
+
+    let names: Vec<&str> = needs.iter().map(|browser| browser.name()).collect();
+    if let Err(error) = crate::hooks::run_pre_patch(&names) {
+        tracing::warn!(
+            error = %error,
+            "pre-patch hook failed; skipping patch"
+        );
+        results.extend(
+            needs
+                .into_iter()
+                .map(|browser| (browser.name().to_string(), false)),
+        );
         return results;
     }
 
@@ -942,31 +967,11 @@ fn install_tracing_subscriber() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
+    use crate::test_support::{default_hook_path, write_executable_script, ScopedEnv};
     use std::sync::Mutex;
     use tempfile::TempDir;
 
     use crate::browsers::BrowserKind;
-
-    struct ScopedEnv {
-        key: &'static str,
-        prev: Option<OsString>,
-    }
-    impl ScopedEnv {
-        fn set(key: &'static str, value: &Path) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prev }
-        }
-    }
-    impl Drop for ScopedEnv {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
 
     fn fake_browser(name: &str, install: PathBuf) -> Browser {
         Browser {
@@ -1702,6 +1707,54 @@ mod tests {
         let results = drive_patch_flow(&browsers, Some("Helium"), false);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, "Helium");
+    }
+
+    #[cfg(unix)]
+    fn fake_host_patch_install(tmp: &TempDir) -> PathBuf {
+        #[cfg(target_os = "macos")]
+        {
+            let application = tmp.path().join("Helium.app");
+            let contents = application.join("Contents");
+            std::fs::create_dir_all(&contents).unwrap();
+            std::fs::write(
+                contents.join("Info.plist"),
+                "<plist><dict><key>CFBundleIdentifier</key><string>net.imput.helium</string></dict></plist>",
+            )
+            .unwrap();
+            application
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let install = tmp.path().join("h");
+            std::fs::create_dir_all(&install).unwrap();
+            install
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn drive_patch_flow_pre_patch_failure_skips_execute() {
+        let _g = crate::test_support::env_lock();
+        let tmp = TempDir::new().unwrap();
+        let _xdg = ScopedEnv::set("XDG_CONFIG_HOME", tmp.path());
+        let _home = ScopedEnv::set("HOME", tmp.path());
+        let marker = tmp.path().join("pre-patch.ran");
+        write_executable_script(
+            &default_hook_path("pre-patch"),
+            &format!("#!/bin/sh\nprintf ran > '{}'\nexit 7\n", marker.display()),
+        );
+        let install = fake_host_patch_install(&tmp);
+        let browsers = vec![fake_browser("Helium", install.clone())];
+        let cdm = make_candidate(tmp.path(), "4.10.2934.0", b"candidate");
+        let results = drive_patch_flow_with_cdm(&browsers, None, false, Some(cdm));
+        assert!(marker.exists(), "pre-patch hook must run before execute");
+        assert_eq!(results, vec![("Helium".into(), false)]);
+        assert!(!install.join("WidevineCdm").exists());
+        #[cfg(target_os = "macos")]
+        assert!(!tmp
+            .path()
+            .join("Library/Application Support/net.imput.helium/WidevineCdm/4.10.2934.0")
+            .exists());
     }
 
     /// `IpcSharedState::browsers` mutex round-trip.

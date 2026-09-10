@@ -270,38 +270,9 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
+    use crate::test_support::ScopedEnv;
     use std::path::Path;
     use tempfile::TempDir;
-
-    /// RAII env-var setter that restores on drop. Mirrors the helper in
-    /// the per-platform impl modules but exposed at the public-API test
-    /// layer so we can exercise `is_registered`/`registration_path`
-    /// without going through the impl-private test helpers.
-    struct ScopedEnv {
-        key: &'static str,
-        prev: Option<OsString>,
-    }
-    impl ScopedEnv {
-        fn set(key: &'static str, value: &Path) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prev }
-        }
-        fn unset(key: &'static str) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::remove_var(key) };
-            Self { key, prev }
-        }
-    }
-    impl Drop for ScopedEnv {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
 
     /// `SILVERVINE_TEST_LIFECYCLE_NOOP=1` short-circuits register/unregister
     /// and forces `is_registered()` to `false`.

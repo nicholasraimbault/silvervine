@@ -1,5 +1,6 @@
 //! Bounded subprocess execution and executable lookup.
 
+use std::collections::HashMap;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -56,12 +57,16 @@ fn is_executable_file(path: &Path) -> bool {
 ///
 /// Returns a categorized error when spawning, waiting, reading output, or
 /// joining a reader thread fails.
-pub fn run_output_with_timeout(
+pub fn run_output_with_timeout<S: std::hash::BuildHasher>(
     program: &Path,
     args: &[&str],
     timeout: Duration,
+    extra_env: &HashMap<String, String, S>,
 ) -> Result<CommandOutput> {
     let mut command = Command::new(program);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
     command
         .args(args)
         .stdin(Stdio::null())
@@ -160,7 +165,7 @@ fn join_reader(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::collections::HashMap;
     use std::fs;
     use std::path::Path;
     use std::time::Duration;
@@ -168,30 +173,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{find_executable, run_output_with_timeout, MAX_CAPTURE_BYTES};
-    use crate::test_support::env_lock;
-
-    struct ScopedPath(Option<OsString>);
-
-    impl ScopedPath {
-        fn set(value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os("PATH");
-            // SAFETY: every environment-mutating test holds the crate-wide lock.
-            unsafe { std::env::set_var("PATH", value) };
-            Self(previous)
-        }
-    }
-
-    impl Drop for ScopedPath {
-        fn drop(&mut self) {
-            if let Some(previous) = self.0.take() {
-                // SAFETY: the crate-wide environment lock remains held until after this guard drops.
-                unsafe { std::env::set_var("PATH", previous) };
-            } else {
-                // SAFETY: see above.
-                unsafe { std::env::remove_var("PATH") };
-            }
-        }
-    }
+    use crate::test_support::{env_lock, ScopedEnv};
 
     #[test]
     fn find_executable_rejects_directories_and_non_executable_files() {
@@ -199,7 +181,7 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         fs::create_dir(tmp.path().join("directory-tool")).expect("directory");
         fs::write(tmp.path().join("plain-tool"), b"not executable").expect("plain file");
-        let _path = ScopedPath::set(tmp.path());
+        let _path = ScopedEnv::set("PATH", tmp.path());
 
         assert_eq!(find_executable("directory-tool"), None);
         assert_eq!(find_executable("plain-tool"), None);
@@ -219,7 +201,7 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&tool, permissions).expect("chmod");
         let joined = std::env::join_paths([first.path(), second.path()]).expect("PATH");
-        let _path = ScopedPath::set(&joined);
+        let _path = ScopedEnv::set("PATH", &joined);
 
         assert_eq!(find_executable("media-tool"), Some(tool));
     }
@@ -230,6 +212,7 @@ mod tests {
             Path::new("/bin/sh"),
             &["-c", "printf stdout; printf stderr >&2"],
             Duration::from_secs(1),
+            &HashMap::new(),
         )
         .expect("command");
 
@@ -241,9 +224,13 @@ mod tests {
 
     #[test]
     fn run_output_with_timeout_kills_slow_child() {
-        let output =
-            run_output_with_timeout(Path::new("/bin/sleep"), &["2"], Duration::from_millis(40))
-                .expect("command");
+        let output = run_output_with_timeout(
+            Path::new("/bin/sleep"),
+            &["2"],
+            Duration::from_millis(40),
+            &HashMap::new(),
+        )
+        .expect("command");
 
         assert!(output.timed_out);
         assert!(!output.status.success());
@@ -256,6 +243,7 @@ mod tests {
             Path::new("/bin/sh"),
             &["-c", "sleep 5 & wait"],
             Duration::from_millis(40),
+            &HashMap::new(),
         )
         .expect("command");
 
@@ -268,9 +256,13 @@ mod tests {
 
     #[test]
     fn run_output_with_timeout_caps_verbose_output() {
-        let output =
-            run_output_with_timeout(Path::new("/usr/bin/yes"), &[], Duration::from_millis(40))
-                .expect("command");
+        let output = run_output_with_timeout(
+            Path::new("/usr/bin/yes"),
+            &[],
+            Duration::from_millis(40),
+            &HashMap::new(),
+        )
+        .expect("command");
 
         assert!(output.timed_out);
         assert_eq!(output.stdout.len(), MAX_CAPTURE_BYTES);

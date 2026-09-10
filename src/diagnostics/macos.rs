@@ -1,6 +1,6 @@
 //! macOS host media/GPU passive diagnostics.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::Duration;
 
@@ -163,6 +163,7 @@ fn run_codesign_check(codesign: &Path, paths: CodesignPaths<'_>, managed: bool) 
             codesign,
             &["--verify", "--strict", &path.to_string_lossy()],
             UTILITY_TIMEOUT,
+            &HashMap::new(),
         ) {
             Ok(output) => {
                 if output.timed_out {
@@ -236,7 +237,12 @@ fn system_profiler_check() -> DiagnosticCheck {
         };
     };
 
-    match run_output_with_timeout(&profiler, &["SPDisplaysDataType", "-json"], UTILITY_TIMEOUT) {
+    match run_output_with_timeout(
+        &profiler,
+        &["SPDisplaysDataType", "-json"],
+        UTILITY_TIMEOUT,
+        &HashMap::new(),
+    ) {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let summary = parse_system_profiler_summary(&stdout);

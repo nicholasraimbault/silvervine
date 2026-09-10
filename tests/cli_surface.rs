@@ -110,23 +110,30 @@ fn parser_rejects_experimental_doctor_bridge_option() {
 }
 
 #[test]
-fn update_help_excludes_unsigned_self_update() {
+fn update_help_exposes_self_subcommand() {
     let help = run_help(&["update", "--help"]);
     assert!(
-        !help
-            .lines()
-            .any(|line| line.trim_start().starts_with("self ")),
-        "release CLI unexpectedly exposes `update self`: {help}"
+        help.lines()
+            .any(|line| line.trim_start().starts_with("self")),
+        "expected `self` subcommand in update help: {help}"
     );
 }
 
 #[test]
-fn parser_rejects_unsigned_self_update() {
-    let output = run(&["update", "self"]);
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "unexpected result: {output:?}"
+fn update_self_without_install_receipt_is_an_error() {
+    let dir = TempDir::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_silvervine"))
+        .env("HOME", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("SILVERVINE_TEST_DATA_MIGRATION_NOOP", "1")
+        .args(["update", "self"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("install receipt") || stderr.contains("silvervine-update"),
+        "unexpected stderr: {stderr}"
     );
 }
 
@@ -308,7 +315,6 @@ fn passive_media_stack_creates_no_xdg_state() {
 
     for (label, dir) in [
         ("config", xdg_config.as_path()),
-        ("cache", xdg_cache.as_path()),
         ("data", xdg_data.as_path()),
         ("state", xdg_state.as_path()),
     ] {
@@ -321,4 +327,41 @@ fn passive_media_stack_creates_no_xdg_state() {
             "passive media-stack created {label} paths: {entries:?}"
         );
     }
+
+    let diagnostics_root = xdg_cache.join("silvervine").join("diagnostics");
+    let cache_files = collect_files(&xdg_cache);
+    for path in &cache_files {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let allowed = path.starts_with(&diagnostics_root)
+            && name.ends_with(".json")
+            && (name.starts_with("sha-") || name.starts_with("txt-") || name.starts_with("exe-"));
+        assert!(
+            allowed,
+            "passive media-stack created non-memo cache path: {path:?}"
+        );
+    }
+}
+
+fn collect_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    use std::fs;
+
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
 }

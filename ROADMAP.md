@@ -86,7 +86,7 @@ support needs.
 
 ### Operational improvements
 
-- **Pre-patch hooks.** `~/.config/silvervine/hooks/pre-patch` runs before each patch; non-zero exit aborts. Symmetric with the existing post-patch / post-update hooks.
+- **Pre-patch hooks.** Shipped in 2.2.0-rc.1: `~/.config/silvervine/hooks/pre-patch` runs before each patch; non-zero exit aborts.
 - **`silvervine log` TUI viewer** — ratatui-based, over the daily-rotated logs at `~/.cache/silvervine/logs/`; filter by category, browser, time window.
 - **Schema versioning for IPC.** `"version"` field in the JSON envelope, default 0 for back-compat. Triggered by the first post-V2 schema change.
 

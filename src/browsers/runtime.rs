@@ -99,6 +99,11 @@ fn read_nonempty(path: &Path) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn package_manager_version(browser: &Browser) -> Option<String> {
     let executable = executable_path(browser).ok()?;
+    crate::file_memo::text_memoized(&executable, || query_package_version(&executable))
+}
+
+#[cfg(target_os = "linux")]
+fn query_package_version(executable: &Path) -> Option<String> {
     let executable = executable.to_str()?;
 
     if let Some(output) = run_version_command("pacman", &["-Qo", executable]) {
@@ -126,7 +131,13 @@ fn package_manager_version(browser: &Browser) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn run_version_command(name: &str, arguments: &[&str]) -> Option<String> {
     let executable = find_executable(name)?;
-    let output = run_output_with_timeout(&executable, arguments, Duration::from_secs(3)).ok()?;
+    let output = run_output_with_timeout(
+        &executable,
+        arguments,
+        Duration::from_secs(3),
+        &std::collections::HashMap::new(),
+    )
+    .ok()?;
     if output.timed_out || !output.status.success() {
         return None;
     }
@@ -255,6 +266,39 @@ mod tests {
             Some("150.0.7871.186")
         );
         assert!(!sentinel.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn package_manager_version_is_memoized_for_unchanged_executable() {
+        let _env = crate::test_support::env_lock();
+        let _cache = crate::test_support::isolated_xdg_cache();
+        let tmp = TempDir::new().expect("tmp");
+        let bin = tmp.path().join("bin");
+        fs::create_dir(&bin).expect("bin");
+        let counter = tmp.path().join("count");
+        crate::test_support::write_executable_script(
+            &bin.join("pacman"),
+            &format!(
+                "#!/bin/sh\necho x >> '{}'\necho \"$2 is owned by fake-pkg 1.2.3-1\"\n",
+                counter.display()
+            ),
+        );
+        let _path = crate::test_support::ScopedEnv::set("PATH", &bin);
+
+        let install = tmp.path().join("Helium");
+        fs::create_dir(&install).expect("install");
+        executable(&install.join("helium"));
+
+        let first = passive_version(&browser("Helium", install.clone()));
+        let second = passive_version(&browser("Helium", install));
+
+        assert_eq!(first.as_deref(), Some("1.2.3-1"));
+        assert_eq!(second, first);
+        assert_eq!(
+            fs::read_to_string(counter).expect("count").lines().count(),
+            1
+        );
     }
 
     #[cfg(target_os = "linux")]

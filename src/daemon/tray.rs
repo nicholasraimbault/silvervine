@@ -628,6 +628,13 @@ impl Tray {
         self.rx.lock().unwrap().recv().ok()
     }
 
+    /// Wait up to `timeout` for the next [`TrayCommand`].
+    ///
+    /// Returns `None` on timeout or if the sender has been dropped.
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Option<TrayCommand> {
+        self.rx.lock().unwrap().recv_timeout(timeout).ok()
+    }
+
     /// Synthesize a [`TrayCommand`] as if the user had clicked. Used
     /// by tests and by the daemon when it wants to drive its main loop
     /// from a non-UI source (e.g. a wake event triggers a re-check).
@@ -653,8 +660,9 @@ impl Tray {
     #[cfg_attr(
         not(target_os = "macos"),
         allow(
+            dead_code,
             clippy::unused_self,
-            reason = "receiver is used only by the macOS branch; kept for one cross-platform call boundary"
+            reason = "Linux idle blocks on recv_timeout; this pump is the macOS AppKit path"
         )
     )]
     pub(crate) fn wait_for_platform_event(&self, timeout: std::time::Duration) {
@@ -901,6 +909,7 @@ impl TrayInner {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use crate::browsers::BrowserKind;
 
@@ -1292,5 +1301,23 @@ mod tests {
             launch_at_login: false,
         });
         assert!(t.try_recv().is_none());
+    }
+
+    /// `recv_timeout` returns `None` on an empty channel after waiting,
+    /// then `Some` once a command is sent.
+    #[test]
+    fn recv_timeout_returns_none_on_empty_and_some_when_sent() {
+        let t = Tray::headless(MenuState {
+            browsers: vec![],
+            launch_at_login: false,
+        });
+        let start = std::time::Instant::now();
+        assert!(t.recv_timeout(Duration::from_millis(20)).is_none());
+        assert!(start.elapsed() >= Duration::from_millis(15));
+        t.synthesize(TrayCommand::Quit);
+        assert_eq!(
+            t.recv_timeout(Duration::from_millis(50)),
+            Some(TrayCommand::Quit)
+        );
     }
 }

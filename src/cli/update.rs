@@ -4,7 +4,10 @@
 //!
 //! ```text
 //! silvervine update widevine [--rollback] [--cdm-source=<url>]
+//! silvervine update self [--dry-run]
 //! ```
+//!
+//! `silvervine update self` is implemented in [`crate::cli::update_self`].
 //!
 //! ### `silvervine update widevine`
 //!
@@ -42,6 +45,17 @@ pub struct WidevineUpdateOutcome {
     pub downloaded: bool,
     /// Patch reports for each browser re-patched after the update.
     pub patch_reports: Vec<crate::patch::PatchReport>,
+}
+
+/// Dispatch `silvervine update self` to the cargo-dist sidecar runner.
+///
+/// # Errors
+///
+/// See [`crate::cli::update_self::run`].
+pub fn run_self(
+    args: &crate::cli::update_self::SelfArgs,
+) -> Result<crate::cli::update_self::SelfUpdateOutcome> {
+    crate::cli::update_self::run(args)
 }
 
 /// Run the `silvervine update widevine` flow.

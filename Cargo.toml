@@ -1,6 +1,6 @@
 [package]
 name = "silvervine"
-version = "2.1.3"
+version = "2.2.0-rc.1"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Nicholas Raimbault <nraimbault16@gmail.com>"]
@@ -195,6 +195,6 @@ targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Whether to install an updater program
-install-updater = false
+install-updater = true
 # Which actions to run on pull requests
 pr-run-mode = "plan"

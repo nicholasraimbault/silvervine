@@ -34,6 +34,7 @@ pub mod daemon;
 pub mod diagnostics;
 pub mod eme;
 pub mod error;
+mod file_memo;
 pub mod hooks;
 pub mod lockfile;
 pub mod log;

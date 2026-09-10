@@ -34,6 +34,8 @@
 //!   browser it would spawn but does not actually call `Command::spawn`.
 //! * `SILVERVINE_TEST_BROWSER_TEST_NOOP=1` — `silvervine test` builds the launch
 //!   plan but does not actually drive a real browser.
+//! * `SILVERVINE_TEST_SELF_UPDATE_NOOP=1` — `silvervine update self` returns a
+//!   no-op outcome without locating the sidecar or install receipt.
 //! * `SILVERVINE_TEST_ESCALATE_NOOP=1` — already honored at the platform
 //!   layer; CLI subcommands inherit the gate.
 
@@ -56,6 +58,7 @@ pub mod status;
 pub mod test;
 pub mod uninstall;
 pub mod update;
+pub mod update_self;
 
 /// Stream pretty JSON directly to the destination and terminate the record.
 fn write_json<T: Serialize + ?Sized>(out: &mut dyn Write, value: &T) -> Result<()> {

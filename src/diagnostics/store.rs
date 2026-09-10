@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::eme::probe::{CapabilityAssessment, RawProbeResult};
 use crate::error::{Error, Result};
-use crate::widevine::download::sha512_reader;
 use crate::widevine::sha512_hex;
 
 /// Current on-disk capability-report schema.
@@ -108,7 +107,11 @@ impl ProbeFingerprint {
         }
     }
 
-    /// Build a fingerprint by canonicalizing `executable` and reading len/mtime.
+    /// Build a fingerprint by canonicalizing `executable` and reading len/mtime/SHA-512.
+    ///
+    /// The executable digest is memoized by canonical path, length, and mtime
+    /// so a later identical binary is not hashed again. The live file is still
+    /// opened with `O_NOFOLLOW`.
     ///
     /// # Errors
     ///
@@ -128,36 +131,13 @@ impl ProbeFingerprint {
                 "exact probe fingerprints require browser and byte-exact CDM identities",
             ));
         }
-        let canonical = canonicalize_path(executable)?;
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW);
-        }
-        let mut file = options.open(&canonical).map_err(Error::from)?;
-        let metadata = file.metadata().map_err(Error::from)?;
-        if !metadata.is_file() {
-            return Err(Error::unknown_bundle_structure(format!(
-                "{} must be a regular executable file",
-                canonical.display()
-            )));
-        }
-        let modified = metadata
-            .modified()
-            .map_err(Error::from)?
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| {
-                Error::other("executable mtime predates the Unix epoch").with_source(error)
-            })?
-            .as_secs();
-        let executable_sha512 = sha512_reader(&mut file)?;
+        let (identity, executable_sha512) =
+            crate::file_memo::sha512_memoized_with_identity(executable)?;
         Ok(Self::new(
-            canonical.to_string_lossy().into_owned(),
+            identity.canonical.to_string_lossy().into_owned(),
             browser_version,
-            metadata.len(),
-            modified,
+            identity.len,
+            identity.modified,
             executable_sha512,
             cdm_entries,
         ))
@@ -770,11 +750,13 @@ mod tests {
 
     #[test]
     fn from_executable_captures_len_and_mtime() {
+        let _env = crate::test_support::env_lock();
+        let _cache = crate::test_support::isolated_xdg_cache();
         let tmp = TempDir::new().expect("tempdir");
         let exe = tmp.path().join("chromium");
         fs::write(&exe, b"browser-bytes").expect("write");
         let modified = SystemTime::now() - Duration::from_secs(30);
-        filetime_set(&exe, modified);
+        crate::test_support::set_mtime(&exe, modified);
 
         let fingerprint = ProbeFingerprint::from_executable(
             &exe,
@@ -797,6 +779,79 @@ mod tests {
         assert!(fingerprint.executable_modified > 0);
         assert_eq!(fingerprint.executable_sha512, sha512_hex(b"browser-bytes"));
         assert_eq!(fingerprint.cdm_entries.len(), 1);
+    }
+
+    #[test]
+    fn from_executable_reuses_digest_when_path_len_and_mtime_match() {
+        let _env = crate::test_support::env_lock();
+        let _cache = crate::test_support::isolated_xdg_cache();
+        let tmp = TempDir::new().expect("tempdir");
+        let exe = tmp.path().join("chromium");
+        fs::write(&exe, b"AAAAAAAAAAAA").expect("write");
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        crate::test_support::set_mtime(&exe, mtime);
+
+        let first = fingerprint_from(&exe);
+        assert_eq!(first.executable_sha512, sha512_hex(b"AAAAAAAAAAAA"));
+
+        fs::write(&exe, b"BBBBBBBBBBBB").expect("rewrite same length");
+        crate::test_support::set_mtime(&exe, mtime);
+
+        let second = fingerprint_from(&exe);
+        assert_eq!(second.executable_len, first.executable_len);
+        assert_eq!(second.executable_modified, first.executable_modified);
+        assert_eq!(second.executable_sha512, sha512_hex(b"AAAAAAAAAAAA"));
+        assert_ne!(second.executable_sha512, sha512_hex(b"BBBBBBBBBBBB"));
+    }
+
+    #[test]
+    fn from_executable_rehashes_when_mtime_changes() {
+        let _env = crate::test_support::env_lock();
+        let _cache = crate::test_support::isolated_xdg_cache();
+        let tmp = TempDir::new().expect("tempdir");
+        let exe = tmp.path().join("chromium");
+        fs::write(&exe, b"AAAAAAAAAAAA").expect("write");
+        crate::test_support::set_mtime(
+            &exe,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        );
+        let first = fingerprint_from(&exe);
+
+        fs::write(&exe, b"BBBBBBBBBBBB").expect("rewrite");
+        crate::test_support::set_mtime(
+            &exe,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_001),
+        );
+        let second = fingerprint_from(&exe);
+
+        assert_eq!(first.executable_sha512, sha512_hex(b"AAAAAAAAAAAA"));
+        assert_eq!(second.executable_sha512, sha512_hex(b"BBBBBBBBBBBB"));
+        assert_ne!(second.executable_modified, first.executable_modified);
+    }
+
+    #[test]
+    fn from_executable_rehashes_when_len_changes() {
+        let _env = crate::test_support::env_lock();
+        let _cache = crate::test_support::isolated_xdg_cache();
+        let tmp = TempDir::new().expect("tempdir");
+        let exe = tmp.path().join("chromium");
+        fs::write(&exe, b"AAAA").expect("write");
+        crate::test_support::set_mtime(
+            &exe,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        );
+        let first = fingerprint_from(&exe);
+
+        fs::write(&exe, b"AAAAAAAA").expect("grow");
+        crate::test_support::set_mtime(
+            &exe,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        );
+        let second = fingerprint_from(&exe);
+
+        assert_eq!(first.executable_sha512, sha512_hex(b"AAAA"));
+        assert_eq!(second.executable_sha512, sha512_hex(b"AAAAAAAA"));
+        assert_ne!(second.executable_len, first.executable_len);
     }
 
     #[test]
@@ -828,10 +883,12 @@ mod tests {
         assert_eq!(fs::read(outside).expect("outside preserved"), b"outside");
     }
 
-    fn filetime_set(path: &Path, modified: SystemTime) {
-        // Best-effort: touch via std only keeps current time on some hosts.
-        // The test primarily asserts from_executable reads metadata fields.
-        let _ = (path, modified);
-        let _ = fs::File::open(path).and_then(|file| file.sync_all());
+    fn fingerprint_from(exe: &Path) -> ProbeFingerprint {
+        ProbeFingerprint::from_executable(
+            exe,
+            Some("150.0".into()),
+            vec![cdm_entry("/opt/cdm/lib.so", "digest")],
+        )
+        .expect("fingerprint")
     }
 }

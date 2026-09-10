@@ -202,6 +202,33 @@ jobs:
           key: release-msrv
       - run: cargo build --verbose
 
+  # CycloneDX SBOM from the exact tagged commit (read-only; publish attaches it).
+  release-sbom:
+    name: release-sbom
+    needs:
+      - plan
+    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    permissions:
+      contents: read
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+      - name: Generate CycloneDX SBOM
+        run: cargo cyclonedx --format json --all
+      - name: Upload SBOM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: artifacts-sbom
+          path: silvervine.cdx.json
+
   # Build every cargo-dist shipping target on the exact tagged SHA before publish.
   release-target-build:
     name: release-target (${{ matrix.target }})
@@ -220,12 +247,11 @@ jobs:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-22.04
             packages: musl-tools
-            # Mirror cargo-dist musl linkage (build/cargo.rs): static CRT +
-            # self-contained link via musl-gcc from musl-tools.
-            linker: musl-gcc
+            # cargo-dist 0.31 (build/cargo.rs) sets +crt-static and
+            # link-self-contained and does not override the linker.
+            # musl-gcc as linker injects INTERP and is not static-pie.
             rustflags: "-Ctarget-feature=+crt-static -Clink-self-contained=yes"
     env:
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.linker }}
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -451,27 +477,32 @@ jobs:
           name: artifacts-dist-manifest
           path: dist-manifest.json
 
-  # Sole write-capable publication boundary. Keep this to one trusted shell
-  # step so no checkout, third-party action, or build tool receives the token.
+  # Sole write-capable publication boundary. No checkout or build tooling;
+  # only the trusted assemble/release shell and GitHub's attest action.
   publish:
     needs:
       - plan
       - host
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' }}
+      - release-sbom
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' && needs.release-sbom.result == 'success' }}
     permissions:
       actions: read
       contents: write
+      id-token: write
+      attestations: write
     runs-on: "ubuntu-22.04"
     steps:
-      - name: Publish exact tested commit
+      - name: Download CycloneDX SBOM
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: artifacts-sbom
+          path: artifacts/
+      - name: Assemble release artifacts
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.plan.outputs.tag }}
           RELEASE_COMMIT: ${{ github.sha }}
-          PRERELEASE: ${{ fromJson(needs.host.outputs.val).announcement_is_prerelease }}
-          ANNOUNCEMENT_TITLE: ${{ fromJson(needs.host.outputs.val).announcement_title }}
-          ANNOUNCEMENT_BODY: ${{ fromJson(needs.host.outputs.val).announcement_github_body }}
         run: |
           set -euo pipefail
 
@@ -519,6 +550,31 @@ jobs:
             echo "release tag $RELEASE_TAG resolves to $remote_commit, expected $RELEASE_COMMIT" >&2
             exit 1
           fi
+
+          mapfile -d '' -t release_artifacts < <(
+            find artifacts -type f ! -name '*-dist-manifest.json' -print0 | sort -z
+          )
+          if (( ${#release_artifacts[@]} == 0 )); then
+            echo "no release artifacts were produced" >&2
+            exit 1
+          fi
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: artifacts/**
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ github.sha }}
+          PRERELEASE: ${{ fromJson(needs.host.outputs.val).announcement_is_prerelease }}
+          ANNOUNCEMENT_TITLE: ${{ fromJson(needs.host.outputs.val).announcement_title }}
+          ANNOUNCEMENT_BODY: ${{ fromJson(needs.host.outputs.val).announcement_github_body }}
+        run: |
+          set -euo pipefail
 
           mapfile -d '' -t release_artifacts < <(
             find artifacts -type f ! -name '*-dist-manifest.json' -print0 | sort -z

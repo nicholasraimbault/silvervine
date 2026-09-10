@@ -29,6 +29,7 @@
 
 #![cfg(any(test, debug_assertions))]
 
+use std::ffi::{OsStr, OsString};
 use std::sync::{Mutex, MutexGuard};
 
 /// Global env-mutation guard shared by every test module in the crate.
@@ -49,6 +50,101 @@ pub fn env_lock() -> MutexGuard<'static, ()> {
     global_env_mutex()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// RAII process environment setter. Restores the previous value on drop.
+///
+/// Callers that mutate the environment must hold [`env_lock`] for the
+/// lifetime of this guard.
+pub struct ScopedEnv {
+    key: &'static str,
+    prev: Option<OsString>,
+}
+
+impl ScopedEnv {
+    /// Set `key` to `value`, remembering the previous mapping.
+    #[must_use]
+    pub fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+        let prev = std::env::var_os(key);
+        // SAFETY: the caller holds `env_lock` for the guard's lifetime.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, prev }
+    }
+
+    /// Remove `key` for the lifetime of the guard.
+    #[must_use]
+    pub fn unset(key: &'static str) -> Self {
+        let prev = std::env::var_os(key);
+        // SAFETY: the caller holds `env_lock` for the guard's lifetime.
+        unsafe { std::env::remove_var(key) };
+        Self { key, prev }
+    }
+}
+
+impl Drop for ScopedEnv {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
+/// Point `XDG_CACHE_HOME` at a fresh tempdir. Hold [`env_lock`] first.
+///
+/// # Panics
+///
+/// Panics if a temporary directory cannot be created.
+#[cfg(test)]
+#[must_use]
+pub fn isolated_xdg_cache() -> (tempfile::TempDir, ScopedEnv) {
+    let home = tempfile::TempDir::new().expect("cache home");
+    let env = ScopedEnv::set("XDG_CACHE_HOME", home.path());
+    (home, env)
+}
+
+/// Set a regular file's mtime.
+///
+/// # Panics
+///
+/// Panics if `path` cannot be opened or its mtime cannot be set.
+#[cfg(test)]
+pub fn set_mtime(path: &std::path::Path, modified: std::time::SystemTime) {
+    std::fs::File::open(path)
+        .expect("open for mtime")
+        .set_modified(modified)
+        .expect("set mtime");
+}
+
+/// Default `hooks/<name>` path under the current platform config dir.
+///
+/// Call after `HOME` / `XDG_CONFIG_HOME` are redirected, while holding
+/// [`env_lock`]. Linux uses `$XDG_CONFIG_HOME/silvervine/hooks/<name>`;
+/// macOS uses `$HOME/Library/Application Support/silvervine/hooks/<name>`.
+#[cfg(test)]
+#[must_use]
+pub fn default_hook_path(name: &str) -> std::path::PathBuf {
+    crate::platform::config_dir().join("hooks").join(name)
+}
+
+/// Write an executable shell script at `path`.
+///
+/// # Panics
+///
+/// Panics if the parent directory, file, or `0o755` mode cannot be applied.
+#[cfg(all(test, unix))]
+pub fn write_executable_script(path: &std::path::Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("script parent");
+    }
+    std::fs::write(path, body).expect("write script");
+    let mut permissions = std::fs::metadata(path)
+        .expect("script metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).expect("chmod script");
 }
 
 /// Flat `WidevineCdm` target used by cross-platform status tests.
@@ -85,5 +181,20 @@ mod tests {
         let g1 = env_lock();
         drop(g1);
         let _g2 = env_lock();
+    }
+
+    #[test]
+    fn scoped_env_restores_previous_value() {
+        let _lock = env_lock();
+        let key = "SILVERVINE_TEST_SCOPED_ENV";
+        let _clear = ScopedEnv::unset(key);
+        {
+            let _set = ScopedEnv::set(key, "one");
+            assert_eq!(
+                std::env::var_os(key).as_deref(),
+                Some(std::ffi::OsStr::new("one"))
+            );
+        }
+        assert!(std::env::var_os(key).is_none());
     }
 }
