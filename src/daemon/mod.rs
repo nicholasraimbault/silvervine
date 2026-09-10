@@ -1709,6 +1709,28 @@ mod tests {
         assert_eq!(results[0].0, "Helium");
     }
 
+    #[cfg(unix)]
+    fn fake_host_patch_install(tmp: &TempDir) -> PathBuf {
+        #[cfg(target_os = "macos")]
+        {
+            let application = tmp.path().join("Helium.app");
+            let contents = application.join("Contents");
+            std::fs::create_dir_all(&contents).unwrap();
+            std::fs::write(
+                contents.join("Info.plist"),
+                "<plist><dict><key>CFBundleIdentifier</key><string>net.imput.helium</string></dict></plist>",
+            )
+            .unwrap();
+            application
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let install = tmp.path().join("h");
+            std::fs::create_dir_all(&install).unwrap();
+            install
+        }
+    }
+
     #[test]
     #[cfg(unix)]
     fn drive_patch_flow_pre_patch_failure_skips_execute() {
@@ -1719,16 +1741,20 @@ mod tests {
         let marker = tmp.path().join("pre-patch.ran");
         write_executable_script(
             &default_hook_path("pre-patch"),
-            &format!("#!/bin/sh\necho ran > {}\nexit 7\n", marker.display()),
+            &format!("#!/bin/sh\nprintf ran > '{}'\nexit 7\n", marker.display()),
         );
-        let install = tmp.path().join("h");
-        std::fs::create_dir_all(&install).unwrap();
+        let install = fake_host_patch_install(&tmp);
         let browsers = vec![fake_browser("Helium", install.clone())];
         let cdm = make_candidate(tmp.path(), "4.10.2934.0", b"candidate");
         let results = drive_patch_flow_with_cdm(&browsers, None, false, Some(cdm));
         assert!(marker.exists(), "pre-patch hook must run before execute");
         assert_eq!(results, vec![("Helium".into(), false)]);
         assert!(!install.join("WidevineCdm").exists());
+        #[cfg(target_os = "macos")]
+        assert!(!tmp
+            .path()
+            .join("Library/Application Support/net.imput.helium/WidevineCdm/4.10.2934.0")
+            .exists());
     }
 
     /// `IpcSharedState::browsers` mutex round-trip.

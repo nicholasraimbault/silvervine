@@ -274,9 +274,15 @@ mod tests {
 
     #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {
+        use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
 
-        fs::write(path, contents).unwrap();
+        // Close+fsync before exec: Linux returns ETXTBSY if the file is still
+        // open for write when `Command` runs it (seen under `cargo test -jN`).
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
         let mut permissions = fs::metadata(path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).unwrap();
