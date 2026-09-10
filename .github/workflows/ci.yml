@@ -123,6 +123,33 @@ jobs:
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
+  musl:
+    name: musl static-pie
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-Ctarget-feature=+crt-static -Clink-self-contained=yes"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: musl-static-pie
+      - name: Install musl-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl --verbose
+      - name: Check static-pie and --version
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/silvervine
+          file "$bin"
+          file "$bin" | grep -q 'static-pie'
+          "$bin" --version
+
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest
