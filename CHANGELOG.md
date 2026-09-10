@@ -10,6 +10,12 @@ Future entries are generated from
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in `[updates] auto_apply = true`: the daemon applies the latest stable
+  GitHub release through the cargo-dist sidecar, skips while a patch lock is
+  held, and restarts the user unit after a swap. Default remains off.
+
 ## [2.2.0-rc.1] - 2026-09-10
 
 First 2.2 candidate. GitHub-installed updates go through the cargo-dist

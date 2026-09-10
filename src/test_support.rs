@@ -134,12 +134,16 @@ pub fn default_hook_path(name: &str) -> std::path::PathBuf {
 /// Panics if the parent directory, file, or `0o755` mode cannot be applied.
 #[cfg(all(test, unix))]
 pub fn write_executable_script(path: &std::path::Path, body: &str) {
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("script parent");
     }
-    std::fs::write(path, body).expect("write script");
+    let mut file = std::fs::File::create(path).expect("write script");
+    file.write_all(body.as_bytes()).expect("write script body");
+    file.sync_all().expect("fsync script");
+    drop(file);
     let mut permissions = std::fs::metadata(path)
         .expect("script metadata")
         .permissions();

@@ -108,6 +108,92 @@ fn run_with(
     Ok(outcome)
 }
 
+/// Result of an opt-in daemon auto-apply pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoApplyOutcome {
+    /// `[updates].auto_apply` is false.
+    Disabled,
+    /// Patch lock is held; skip so we never swap mid-patch.
+    PatchInProgress,
+    /// No cargo-dist sidecar or install receipt (not a GitHub install).
+    SkippedMissingInstall,
+    /// Sidecar ran and reported already current.
+    AlreadyCurrent,
+    /// Sidecar replaced the binary; caller should restart the user daemon.
+    Updated {
+        /// Version the sidecar reported as installed.
+        latest_version: String,
+    },
+}
+
+/// Apply the latest stable GitHub release when `enabled`.
+///
+/// Skips when a patch holds [`crate::patch::default_patch_lock`], or when this
+/// is not a cargo-dist GitHub install. After a successful swap, `restart` is
+/// invoked so the user unit loads the new binary.
+///
+/// # Errors
+///
+/// Sidecar spawn/non-zero exit, lock I/O, or `restart` failure.
+pub fn auto_apply(
+    enabled: bool,
+    patch_lock: &Path,
+    sidecar: Option<&Path>,
+    receipt: Option<&Path>,
+    restart: impl FnOnce() -> Result<()>,
+) -> Result<AutoApplyOutcome> {
+    if !enabled {
+        return Ok(AutoApplyOutcome::Disabled);
+    }
+    match crate::lockfile::try_with_lock(patch_lock, || {
+        apply_under_lock(sidecar, receipt, restart)
+    })? {
+        None => Ok(AutoApplyOutcome::PatchInProgress),
+        Some(outcome) => Ok(outcome),
+    }
+}
+
+fn apply_under_lock(
+    sidecar: Option<&Path>,
+    receipt: Option<&Path>,
+    restart: impl FnOnce() -> Result<()>,
+) -> Result<AutoApplyOutcome> {
+    let sidecar_path = match sidecar {
+        Some(path) => path.to_path_buf(),
+        None => match sidecar_beside_current_exe() {
+            Ok(path) => path,
+            Err(_) => return Ok(AutoApplyOutcome::SkippedMissingInstall),
+        },
+    };
+    if !sidecar_path.is_file() {
+        return Ok(AutoApplyOutcome::SkippedMissingInstall);
+    }
+    let receipt_path = match receipt {
+        Some(path) => path.to_path_buf(),
+        None => receipt_path(),
+    };
+    if !receipt_path.is_file() {
+        return Ok(AutoApplyOutcome::SkippedMissingInstall);
+    }
+    let args = SelfArgs {
+        output: OutputOptions {
+            quiet: true,
+            ..OutputOptions::default()
+        },
+        ..SelfArgs::default()
+    };
+    let mut sink = Vec::new();
+    let outcome = run_with(&args, Some(&sidecar_path), Some(&receipt_path), &mut sink)?;
+    if outcome.updated {
+        restart()?;
+        Ok(AutoApplyOutcome::Updated {
+            latest_version: outcome.latest_version,
+        })
+    } else {
+        Ok(AutoApplyOutcome::AlreadyCurrent)
+    }
+}
+
 fn noop_outcome() -> SelfUpdateOutcome {
     SelfUpdateOutcome {
         current_version: running_version(),
@@ -642,5 +728,105 @@ mod tests {
             None
         );
         assert_eq!(parse_installed_version("New release installed"), None);
+    }
+
+    #[test]
+    fn auto_apply_disabled_is_a_no_op() {
+        let tmp = TempDir::new().unwrap();
+        let restarts = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = auto_apply(false, &tmp.path().join("patch.lock"), None, None, || {
+            restarts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(outcome, AutoApplyOutcome::Disabled);
+        assert_eq!(restarts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn auto_apply_skips_when_patch_lock_is_held() {
+        use fs2::FileExt;
+
+        let _iso = isolate_self_update();
+        let tmp = TempDir::new().unwrap();
+        let lock = tmp.path().join("patch.lock");
+        let (sidecar, receipt) = seeded(&tmp, "#!/bin/sh\nexit 0\n");
+        let file = std::fs::File::create(&lock).unwrap();
+        file.lock_exclusive().unwrap();
+        let outcome = auto_apply(true, &lock, Some(&sidecar), Some(&receipt), || {
+            panic!("must not restart")
+        })
+        .unwrap();
+        drop(file);
+        assert_eq!(outcome, AutoApplyOutcome::PatchInProgress);
+    }
+
+    #[test]
+    fn auto_apply_skips_when_sidecar_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let outcome = auto_apply(
+            true,
+            &tmp.path().join("patch.lock"),
+            Some(&tmp.path().join("missing-sidecar")),
+            Some(&tmp.path().join("missing-receipt")),
+            || panic!("must not restart"),
+        )
+        .unwrap();
+        assert_eq!(outcome, AutoApplyOutcome::SkippedMissingInstall);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_apply_already_current_does_not_restart() {
+        let _iso = isolate_self_update();
+        let tmp = TempDir::new().unwrap();
+        let (sidecar, receipt) = seeded(
+            &tmp,
+            "#!/bin/sh\necho 'Already up to date; not upgrading' >&2\nexit 0\n",
+        );
+        let restarts = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = auto_apply(
+            true,
+            &tmp.path().join("patch.lock"),
+            Some(&sidecar),
+            Some(&receipt),
+            || {
+                restarts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, AutoApplyOutcome::AlreadyCurrent);
+        assert_eq!(restarts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_apply_updated_restarts_the_user_service() {
+        let _iso = isolate_self_update();
+        let tmp = TempDir::new().unwrap();
+        let (sidecar, receipt) = seeded(
+            &tmp,
+            "#!/bin/sh\necho 'New release 2.2.1 installed!' >&2\nexit 0\n",
+        );
+        let restarts = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = auto_apply(
+            true,
+            &tmp.path().join("patch.lock"),
+            Some(&sidecar),
+            Some(&receipt),
+            || {
+                restarts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            AutoApplyOutcome::Updated {
+                latest_version: "2.2.1".into()
+            }
+        );
+        assert_eq!(restarts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
