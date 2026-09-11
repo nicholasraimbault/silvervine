@@ -10,6 +10,31 @@ Future entries are generated from
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-09-11
+
+Promotes `2.2.0-rc.2` to stable. No code changes since that rc.
+
+### Added
+
+- Prompted `silvervine update self` via the cargo-dist `silvervine-update`
+  sidecar and install receipt. The running binary is never overwritten in
+  process; restart the user daemon after a swap. Existing GitHub installs
+  need the installer once to obtain a receipt.
+- Opt-in `[updates] auto_apply = true`: the daemon applies the latest stable
+  GitHub release through the cargo-dist sidecar, skips while a patch lock is
+  held, and restarts the user unit after a swap. Default remains off.
+- Pre-patch hook: non-zero exit or timeout aborts the patch.
+- CycloneDX SBOM and GitHub artifact attestations on tagged releases.
+- Pull-request job that builds the Linux musl binary and checks it is
+  static-pie.
+
+### Changed
+
+- Linux tray daemon waits with `recv_timeout` instead of spinning while idle.
+- Hook subprocesses are killed after 15 seconds.
+- `doctor --media-stack` reuses SHA-512 of unchanged browser executables and
+  CDMs, and memoizes short package-manager version strings.
+
 ## [2.2.0-rc.2] - 2026-09-10
 
 ### Added
@@ -429,7 +454,8 @@ rc.1 has a hard deadlock on the patch path.
   scripts. Both bugs are obsoleted by the rewrite, but the reports
   were on the money.
 
-[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.2.0-rc.2...HEAD
+[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/nicholasraimbault/silvervine/compare/v2.2.0-rc.2...v2.2.0
 [2.2.0-rc.2]: https://github.com/nicholasraimbault/silvervine/compare/v2.2.0-rc.1...v2.2.0-rc.2
 [2.2.0-rc.1]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.3...v2.2.0-rc.1
 [2.1.3]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.2...v2.1.3
