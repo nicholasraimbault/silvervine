@@ -1,6 +1,6 @@
 [package]
 name = "silvervine"
-version = "2.2.0-rc.2"
+version = "2.2.0"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Nicholas Raimbault <nraimbault16@gmail.com>"]
