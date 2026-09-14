@@ -33,7 +33,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # URL type used in the public `fetch_manifest` API.
 url = "2"
 # XDG / platform-conventional paths.
-dirs = "6"
+dirs = "7"
 # `flock`-based exclusive lockfile.
 fs2 = "0.4"
 # Compact, non-poisoning mutexes for daemon state shared across watcher threads.
