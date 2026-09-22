@@ -10,6 +10,30 @@ Future entries are generated from
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-09-21
+
+### Security
+
+- Updated rustls to 0.23.45 (RUSTSEC-2026-0285). rustls 0.23.13 through
+  0.23.44 could accept a TLS 1.3 handshake message that crossed an
+  encryption-level boundary in the same record. The handshake transcript
+  stayed authenticated, so a network attacker still could not alter the
+  handshake; a peer could deliver in plaintext a message rustls should
+  have rejected.
+
+### Fixed
+
+- Subprocess spawn retries `ETXTBSY` ("Text file busy"). A hook executed
+  in the same moment its script was closed no longer fails the spawn.
+
+### Changed
+
+- `dirs` 7. The breaking change is Windows `preference_dir`, which
+  Silvervine does not call. Linux and macOS path helpers are unchanged.
+- Patch updates: clap 4.6.7, toml 1.1.6, plist 1.10.1.
+- Release attestations use `actions/attest-build-provenance` 4.2.2, a
+  wrapper around `actions/attest` that still attests `subject-path`.
+
 ## [2.2.0] - 2026-09-11
 
 Promotes `2.2.0-rc.2` to stable. No code changes since that rc.
@@ -454,7 +478,8 @@ rc.1 has a hard deadlock on the patch path.
   scripts. Both bugs are obsoleted by the rewrite, but the reports
   were on the money.
 
-[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.2.0...HEAD
+[Unreleased]: https://github.com/nicholasraimbault/silvervine/compare/v2.2.1...HEAD
+[2.2.1]: https://github.com/nicholasraimbault/silvervine/compare/v2.2.0...v2.2.1
 [2.2.0]: https://github.com/nicholasraimbault/silvervine/compare/v2.2.0-rc.2...v2.2.0
 [2.2.0-rc.2]: https://github.com/nicholasraimbault/silvervine/compare/v2.2.0-rc.1...v2.2.0-rc.2
 [2.2.0-rc.1]: https://github.com/nicholasraimbault/silvervine/compare/v2.1.3...v2.2.0-rc.1

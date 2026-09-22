@@ -111,12 +111,12 @@ jobs:
         with:
           key: tarpaulin
       - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
         with:
           tool: cargo-tarpaulin
       - run: cargo tarpaulin --out Xml --workspace --skip-clean --timeout 300
       - name: Upload to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: cobertura.xml
           fail_ci_if_error: false
