@@ -77,9 +77,9 @@ pub fn run_output_with_timeout<S: std::hash::BuildHasher>(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command.spawn().map_err(|error| {
-        Error::other(format!("failed to spawn {}", program.display())).with_source(error)
-    })?;
+    // Linux returns ETXTBSY when exec races a writer that just closed the
+    // file. Hooks hit this under parallel tests.
+    let mut child = spawn_retrying_text_busy(&mut command, program)?;
     let stdout = child
         .stdout
         .take()
@@ -112,6 +112,30 @@ pub fn run_output_with_timeout<S: std::hash::BuildHasher>(
         timed_out,
     })
 }
+fn spawn_retrying_text_busy(command: &mut Command, program: &Path) -> Result<Child> {
+    let mut last_error = None;
+    for delay_ms in [0_u64, 1, 2, 5, 10, 20, 50] {
+        if delay_ms > 0 {
+            thread::sleep(Duration::from_millis(delay_ms));
+        }
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy => {
+                last_error = Some(error);
+            }
+            Err(error) => {
+                return Err(
+                    Error::other(format!("failed to spawn {}", program.display()))
+                        .with_source(error),
+                );
+            }
+        }
+    }
+    let error =
+        last_error.ok_or_else(|| Error::other("text-busy retry loop exited without an error"))?;
+    Err(Error::other(format!("failed to spawn {}", program.display())).with_source(error))
+}
+
 fn terminate_child(child: &mut Child, program: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -266,5 +290,37 @@ mod tests {
 
         assert!(output.timed_out);
         assert_eq!(output.stdout.len(), MAX_CAPTURE_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_output_with_timeout_retries_text_file_busy() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let script = tmp.path().join("hook.sh");
+        let mut file = fs::File::create(&script).expect("create");
+        file.write_all(b"#!/bin/sh\nprintf ok\n").expect("write");
+        file.sync_all().expect("fsync");
+        drop(file);
+        let mut permissions = fs::metadata(&script).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("chmod");
+
+        let hold = fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .expect("hold open");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(15));
+            drop(hold);
+        });
+
+        let output = run_output_with_timeout(&script, &[], Duration::from_secs(2), &HashMap::new())
+            .expect("retry past ETXTBSY");
+        releaser.join().expect("releaser");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ok");
     }
 }

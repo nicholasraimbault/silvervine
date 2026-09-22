@@ -1,6 +1,6 @@
 [package]
 name = "silvervine"
-version = "2.2.0"
+version = "2.2.1"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Nicholas Raimbault <nraimbault16@gmail.com>"]
@@ -32,8 +32,9 @@ toml = "1.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
 # URL type used in the public `fetch_manifest` API.
 url = "2"
-# XDG / platform-conventional paths.
-dirs = "6"
+# XDG / platform-conventional paths. dirs 7 only changes Windows
+# `preference_dir` (Roaming instead of Local); Silvervine does not call it.
+dirs = "7"
 # `flock`-based exclusive lockfile.
 fs2 = "0.4"
 # Compact, non-poisoning mutexes for daemon state shared across watcher threads.
