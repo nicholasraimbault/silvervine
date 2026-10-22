@@ -1,11 +1,15 @@
 //! Silvervine CDM provenance markers and overwrite policy.
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::ffi::{CStr, CString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -243,15 +247,10 @@ pub fn write_marker(target: &Path, marker: &ManagedMarker) -> Result<()> {
 /// Returns [`ErrorCategory::InvalidMarker`](crate::ErrorCategory::InvalidMarker)
 /// for malformed, symlinked, stale, or mismatched marker state.
 pub fn validate_installed_marker(target: &Path) -> Result<ManagedMarker> {
+    #[cfg(windows)]
+    let _target_guard = open_directory_tree(target)?;
     let path = marker_path(target);
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-        .map_err(|error| {
-            Error::invalid_marker(format!("could not safely open {}: {error}", path.display()))
-                .with_source(error)
-        })?;
+    let mut file = open_safe_file(&path)?;
     let metadata = file.metadata().map_err(|error| {
         Error::invalid_marker(format!("could not inspect {}: {error}", path.display()))
             .with_source(error)
@@ -369,7 +368,7 @@ pub fn classify_without_candidate(browser: &Browser, target: &Path) -> Result<Ow
         }
         Err(error) => return Err(Error::from(error)),
     };
-    if target_metadata.file_type().is_symlink() || !target_metadata.is_dir() {
+    if unsafe_metadata(&target_metadata) || !target_metadata.is_dir() {
         return Ok(invalid_assessment(
             "The existing CDM root is not a regular directory.",
         ));
@@ -512,8 +511,10 @@ pub fn stage_verified_payload(
         ));
     }
 
+    #[cfg(windows)]
+    let _parent_guard = open_directory_tree(trusted_parent)?;
     let parent_metadata = fs::symlink_metadata(trusted_parent).map_err(Error::from)?;
-    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+    if unsafe_metadata(&parent_metadata) || !parent_metadata.is_dir() {
         return Err(Error::invalid_marker(
             "privileged staging parent must be a regular directory",
         ));
@@ -525,19 +526,14 @@ pub fn stage_verified_payload(
     ));
     fs::create_dir(&stage_path).map_err(Error::from)?;
     let staged = StagedPayload(stage_path);
-    fs::set_permissions(staged.path(), fs::Permissions::from_mode(0o755)).map_err(Error::from)?;
+    set_directory_permissions(staged.path())?;
     let staged_platform = staged
         .path()
         .join("_platform_specific")
         .join(expected_platform_dir());
     fs::create_dir_all(&staged_platform).map_err(Error::from)?;
-    fs::set_permissions(
-        staged.path().join("_platform_specific"),
-        fs::Permissions::from_mode(0o755),
-    )
-    .map_err(Error::from)?;
-    fs::set_permissions(&staged_platform, fs::Permissions::from_mode(0o755))
-        .map_err(Error::from)?;
+    set_directory_permissions(&staged.path().join("_platform_specific"))?;
+    set_directory_permissions(&staged_platform)?;
 
     write_new_file(&staged.path().join("manifest.json"), &manifest_bytes, 0o644)?;
     copy_library(
@@ -552,6 +548,134 @@ pub fn stage_verified_payload(
     Ok(staged)
 }
 
+#[cfg(unix)]
+type SourceDirectory = fs::File;
+
+fn set_directory_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(Error::from)?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn open_safe_file(path: &Path) -> Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000).share_mode(1);
+    }
+    let file = options.open(path).map_err(|error| {
+        Error::invalid_marker(format!("could not safely open {}", path.display()))
+            .with_source(error)
+    })?;
+    if unsafe_metadata(&file.metadata().map_err(Error::from)?) {
+        return Err(Error::invalid_marker(
+            "CDM file must not be a reparse point or symlink",
+        ));
+    }
+    Ok(file)
+}
+
+fn unsafe_metadata(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct SourceDirectory {
+    path: PathBuf,
+    // Denying FILE_SHARE_DELETE pins every ancestor while resolving children.
+    handles: Vec<fs::File>,
+}
+
+#[cfg(windows)]
+fn open_directory_tree(path: &Path) -> Result<SourceDirectory> {
+    if !path.is_absolute() {
+        return Err(Error::invalid_marker("CDM source must be absolute"));
+    }
+    let mut directory = SourceDirectory {
+        path: PathBuf::new(),
+        handles: Vec::new(),
+    };
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) => directory.path.push(component.as_os_str()),
+            std::path::Component::RootDir | std::path::Component::Normal(_) => {
+                directory.path.push(component.as_os_str());
+                directory
+                    .handles
+                    .push(open_windows_directory(&directory.path)?);
+            }
+            _ => return Err(Error::invalid_marker("unsafe CDM source component")),
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(windows)]
+fn open_windows_directory(path: &Path) -> Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .custom_flags(0x0220_0000)
+        .open(path)
+        .map_err(Error::from)?;
+    let metadata = file.metadata().map_err(Error::from)?;
+    if !metadata.is_dir() || unsafe_metadata(&metadata) {
+        return Err(Error::invalid_marker(
+            "CDM source directory is a reparse point or not a directory",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_relative_directory_os(
+    parent: &SourceDirectory,
+    name: &std::ffi::OsStr,
+) -> Result<SourceDirectory> {
+    let path = parent.path.join(name);
+    let mut handles = parent
+        .handles
+        .iter()
+        .map(fs::File::try_clone)
+        .collect::<io::Result<Vec<_>>>()
+        .map_err(Error::from)?;
+    handles.push(open_windows_directory(&path)?);
+    Ok(SourceDirectory { path, handles })
+}
+
+#[cfg(windows)]
+fn open_relative_regular_file(
+    parent: &SourceDirectory,
+    name: &str,
+    label: &str,
+) -> Result<fs::File> {
+    let file = open_safe_file(&parent.path.join(name))?;
+    let metadata = file.metadata().map_err(Error::from)?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(Error::invalid_marker(format!(
+            "{label} must be a non-empty regular file"
+        )));
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
 fn open_directory_tree(path: &Path) -> Result<fs::File> {
     use std::path::Component;
 
@@ -577,6 +701,7 @@ fn open_directory_tree(path: &Path) -> Result<fs::File> {
     Ok(directory)
 }
 
+#[cfg(unix)]
 fn open_directory(path: &CStr) -> Result<fs::File> {
     // SAFETY: `path` is NUL-terminated and the returned descriptor is owned by
     // the `File`. O_NOFOLLOW rejects a symlink at the opened component.
@@ -589,10 +714,11 @@ fn open_directory(path: &CStr) -> Result<fs::File> {
     owned_descriptor(descriptor, "could not open privileged CDM source directory")
 }
 
-fn open_relative_directory(parent: &fs::File, name: &str) -> Result<fs::File> {
+fn open_relative_directory(parent: &SourceDirectory, name: &str) -> Result<SourceDirectory> {
     open_relative_directory_os(parent, std::ffi::OsStr::new(name))
 }
 
+#[cfg(unix)]
 fn open_relative_directory_os(parent: &fs::File, name: &std::ffi::OsStr) -> Result<fs::File> {
     let name = CString::new(name.as_bytes())
         .map_err(|_| Error::invalid_marker("CDM path component contains NUL"))?;
@@ -607,6 +733,7 @@ fn open_relative_directory_os(parent: &fs::File, name: &std::ffi::OsStr) -> Resu
     owned_descriptor(descriptor, "could not open privileged CDM source directory")
 }
 
+#[cfg(unix)]
 fn open_relative_regular_file(parent: &fs::File, name: &str, label: &str) -> Result<fs::File> {
     let name =
         CString::new(name).map_err(|_| Error::invalid_marker("CDM path component contains NUL"))?;
@@ -628,6 +755,7 @@ fn open_relative_regular_file(parent: &fs::File, name: &str, label: &str) -> Res
     Ok(file)
 }
 
+#[cfg(unix)]
 fn owned_descriptor(descriptor: libc::c_int, message: &str) -> Result<fs::File> {
     if descriptor < 0 {
         return Err(Error::invalid_marker(message).with_source(io::Error::last_os_error()));
@@ -636,7 +764,12 @@ fn owned_descriptor(descriptor: libc::c_int, message: &str) -> Result<fs::File> 
     Ok(unsafe { fs::File::from_raw_fd(descriptor) })
 }
 
-fn read_relative_file(parent: &fs::File, name: &str, limit: usize, label: &str) -> Result<Vec<u8>> {
+fn read_relative_file(
+    parent: &SourceDirectory,
+    name: &str,
+    limit: usize,
+    label: &str,
+) -> Result<Vec<u8>> {
     let mut file = open_relative_regular_file(parent, name, label)?;
     let mut bytes = Vec::with_capacity(limit.min(16 * 1024));
     (&mut file)
@@ -652,12 +785,13 @@ fn read_relative_file(parent: &fs::File, name: &str, limit: usize, label: &str) 
 }
 
 fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(path)
-        .map_err(Error::from)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(mode);
+    #[cfg(not(unix))]
+    let _ = mode;
+    let mut file = options.open(path).map_err(Error::from)?;
     file.write_all(bytes).map_err(Error::from)?;
     file.flush().map_err(Error::from)
 }
@@ -668,12 +802,11 @@ fn copy_library(
     limit: u64,
     expected_digest: &str,
 ) -> Result<()> {
-    let mut target = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o644)
-        .open(destination)
-        .map_err(Error::from)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o644);
+    let mut target = options.open(destination).map_err(Error::from)?;
     let mut hasher = Sha512::new();
     let mut copied = 0_u64;
     let mut buffer = vec![0_u8; 64 * 1024];
@@ -717,8 +850,13 @@ impl Drop for TempMarker {
 }
 
 fn atomic_write_marker(path: &Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(windows)]
+    let _parent_guard = open_directory_tree(
+        path.parent()
+            .ok_or_else(|| Error::invalid_marker("marker has no parent"))?,
+    )?;
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+        Ok(metadata) if unsafe_metadata(&metadata) || !metadata.is_file() => {
             return Err(Error::invalid_marker(format!(
                 "{} must be a regular file",
                 path.display()
@@ -749,6 +887,7 @@ fn atomic_write_marker(path: &Path, bytes: &[u8]) -> Result<()> {
     drop(file);
 
     fs::rename(&temp, path).map_err(Error::from)?;
+    #[cfg(unix)]
     fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(Error::from)?;
@@ -851,6 +990,12 @@ fn validate_marker_fields(marker: &ManagedMarker, identity: &PayloadIdentity) ->
 }
 
 fn inspect_payload(root: &Path) -> Result<PayloadIdentity> {
+    #[cfg(windows)]
+    let _root_guard = open_directory_tree(root)?;
+    #[cfg(windows)]
+    let _platform_guard = open_relative_directory(&_root_guard, "_platform_specific")?;
+    #[cfg(windows)]
+    let _library_guard = open_relative_directory(&_platform_guard, expected_platform_dir())?;
     require_regular_directory(root, "CDM root")?;
     let manifest_path = root.join("manifest.json");
     let manifest_bytes =
@@ -879,10 +1024,14 @@ fn inspect_payload(root: &Path) -> Result<PayloadIdentity> {
         let metadata = fs::symlink_metadata(&platform).map_err(|error| {
             Error::invalid_marker("could not inspect CDM platform entry").with_source(error)
         })?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        if unsafe_metadata(&metadata) || !metadata.is_dir() {
             continue;
         }
-        for name in ["libwidevinecdm.so", "libwidevinecdm.dylib"] {
+        for name in [
+            "libwidevinecdm.so",
+            "libwidevinecdm.dylib",
+            "widevinecdm.dll",
+        ] {
             let library = platform.join(name);
             if fs::symlink_metadata(&library).is_ok() {
                 libraries.push((entry.file_name().to_string_lossy().into_owned(), library));
@@ -904,9 +1053,24 @@ fn inspect_payload(root: &Path) -> Result<PayloadIdentity> {
             expected_platform_dir()
         )));
     }
+    #[cfg(not(windows))]
     let library_sha512 = crate::file_memo::sha512_memoized(&library).map_err(|error| {
         Error::invalid_marker("could not hash Widevine library").with_source(error)
     })?;
+    #[cfg(windows)]
+    let library_sha512 = {
+        let mut file = _library_file;
+        let mut hasher = Sha512::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).map_err(Error::from)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        hex_lower(&hasher.finalize())
+    };
     Ok(PayloadIdentity {
         version,
         platform,
@@ -919,7 +1083,7 @@ fn require_regular_directory(path: &Path, label: &str) -> Result<()> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         Error::invalid_marker(format!("could not inspect {label}")).with_source(error)
     })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if unsafe_metadata(&metadata) || !metadata.is_dir() {
         return Err(Error::invalid_marker(format!(
             "{label} must be a regular directory"
         )));
@@ -931,7 +1095,7 @@ fn require_regular_file(path: &Path, label: &str) -> Result<()> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         Error::invalid_marker(format!("could not inspect {label}")).with_source(error)
     })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+    if unsafe_metadata(&metadata) || !metadata.is_file() || metadata.len() == 0 {
         return Err(Error::invalid_marker(format!(
             "{label} must be a non-empty regular file"
         )));
@@ -940,13 +1104,7 @@ fn require_regular_file(path: &Path, label: &str) -> Result<()> {
 }
 
 fn open_bounded_regular_file(path: &Path, label: &str, limit: u64) -> Result<fs::File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|error| {
-            Error::invalid_marker(format!("could not safely open {label}")).with_source(error)
-        })?;
+    let file = open_safe_file(path)?;
     let metadata = file.metadata().map_err(|error| {
         Error::invalid_marker(format!("could not inspect opened {label}")).with_source(error)
     })?;
@@ -983,6 +1141,10 @@ fn read_bounded_regular_file(path: &Path, label: &str, limit: u64) -> Result<Vec
 }
 
 fn expected_platform_dir() -> &'static str {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        "win_x64"
+    }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         "mac_arm64"
@@ -997,6 +1159,7 @@ fn expected_platform_dir() -> &'static str {
     }
     #[cfg(not(any(
         all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86_64"),
         all(target_os = "macos", target_arch = "aarch64"),
         all(target_os = "macos", target_arch = "x86_64")
     )))]
@@ -1008,6 +1171,8 @@ fn expected_platform_dir() -> &'static str {
 fn expected_library_name() -> &'static str {
     if cfg!(target_os = "macos") {
         "libwidevinecdm.dylib"
+    } else if cfg!(target_os = "windows") {
+        "widevinecdm.dll"
     } else {
         "libwidevinecdm.so"
     }
@@ -1029,23 +1194,37 @@ mod tests {
     use crate::widevine::CachedCdm;
 
     fn platform_dir() -> &'static str {
-        if cfg!(target_os = "macos") {
-            if cfg!(target_arch = "aarch64") {
-                "mac_arm64"
-            } else {
-                "mac_x64"
-            }
-        } else {
-            "linux_x64"
-        }
+        super::expected_platform_dir()
     }
 
     fn library_name() -> &'static str {
-        if cfg!(target_os = "macos") {
-            "libwidevinecdm.dylib"
-        } else {
-            "libwidevinecdm.so"
-        }
+        super::expected_library_name()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_source_handles_pin_ancestors_and_library() {
+        let tmp = TempDir::new().unwrap();
+        let source = tmp.path().join("payload");
+        write_payload(&source, "4.10.1", b"verified-library");
+        let directory = super::open_directory_tree(&source).unwrap();
+        assert!(fs::rename(&source, tmp.path().join("moved")).is_err());
+        let platform = super::open_relative_directory(&directory, "_platform_specific").unwrap();
+        let host = super::open_relative_directory(&platform, platform_dir()).unwrap();
+        let file = super::open_relative_regular_file(&host, library_name(), "library").unwrap();
+        assert!(fs::write(
+            source
+                .join("_platform_specific")
+                .join(platform_dir())
+                .join(library_name()),
+            b"changed"
+        )
+        .is_err());
+        drop(file);
+        drop(host);
+        drop(platform);
+        drop(directory);
+        fs::rename(&source, tmp.path().join("moved")).unwrap();
     }
 
     fn write_payload(root: &Path, version: &str, library: &[u8]) {

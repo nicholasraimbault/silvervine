@@ -48,6 +48,8 @@ fn test_platform_dir() -> &'static str {
         } else {
             "mac_x64"
         }
+    } else if cfg!(windows) {
+        "win_x64"
     } else {
         "linux_x64"
     }
@@ -56,6 +58,8 @@ fn test_platform_dir() -> &'static str {
 fn test_library_name() -> &'static str {
     if cfg!(target_os = "macos") {
         "libwidevinecdm.dylib"
+    } else if cfg!(windows) {
+        "widevinecdm.dll"
     } else {
         "libwidevinecdm.so"
     }
@@ -669,7 +673,7 @@ fn default_patch_lock_path_resolves_to_silvervine_subdir() {
 #[test]
 fn host_patcher_returns_ok_on_supported_host() {
     let r = host_patcher();
-    if cfg!(any(target_os = "linux", target_os = "macos")) {
+    if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
         assert!(r.is_ok());
     } else {
         assert!(r.is_err());
@@ -809,6 +813,7 @@ fn take_snapshot_prefers_explicit_backups_dir_over_as_root_default() {
 /// When `as_root` is set and no `backups_dir` is provided, the snapshot
 /// uses an exclusively-created random sibling under `<install-parent>` so
 /// `atomic_rename` rollback works on a single filesystem.
+#[cfg(unix)]
 #[test]
 fn take_snapshot_uses_sibling_when_as_root_and_no_override() {
     let tmp = TempDir::new().expect("tempdir");

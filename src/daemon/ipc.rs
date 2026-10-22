@@ -47,12 +47,18 @@
 //! file. `Drop` calls `shutdown` if the user didn't.
 
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+#[path = "ipc_windows.rs"]
+mod windows;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
+#[cfg(windows)]
+use windows::{Listener as UnixListener, Stream as UnixStream};
 
 use serde::{Deserialize, Serialize};
 
@@ -218,6 +224,7 @@ impl IpcServer {
             // the daemon's main loop should also be shutting down).
             let _ = handle.join();
         }
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.socket_path);
     }
 }
@@ -261,12 +268,14 @@ pub fn start_at<F>(socket_path: &Path, handler: F) -> Result<IpcServer>
 where
     F: Fn(IpcRequest) -> IpcResponse + Send + Sync + 'static,
 {
+    #[cfg(unix)]
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             Error::other(format!("cannot create IPC socket parent: {e}")).with_source(e)
         })?;
     }
     // Best-effort: clear a stale socket file from a previous run.
+    #[cfg(unix)]
     let _ = std::fs::remove_file(socket_path);
 
     let listener = UnixListener::bind(socket_path).map_err(|e| {
@@ -276,6 +285,7 @@ where
         ))
         .with_source(e)
     })?;
+    #[cfg(unix)]
     set_socket_permissions(socket_path).map_err(|e| {
         Error::other(format!(
             "cannot chmod IPC socket at {}: {e}",
@@ -288,6 +298,7 @@ where
     // requiring a dedicated wakeup connection. We use a 200ms poll
     // interval — fast enough to shutdown promptly, slow enough to cost
     // ~0.0% CPU at idle.
+    #[cfg(unix)]
     listener.set_nonblocking(true).map_err(|e| {
         Error::other(format!("cannot set IPC listener non-blocking: {e}")).with_source(e)
     })?;
@@ -309,6 +320,7 @@ where
 }
 
 /// Set the socket's filesystem mode to 0600 (owner read+write only).
+#[cfg(unix)]
 fn set_socket_permissions(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut perms = std::fs::metadata(path)?.permissions();
@@ -359,6 +371,7 @@ where
     // Linux accepted sockets generally do not. The protocol handler uses
     // blocking `read_exact`/`write_all`, so establish the same semantics on
     // every supported platform before applying bounded I/O timeouts.
+    #[cfg(unix)]
     stream
         .set_nonblocking(false)
         .map_err(|e| Error::other(format!("set accepted stream blocking: {e}")).with_source(e))?;
@@ -375,6 +388,14 @@ where
     let request = read_request(&mut stream)?;
     let response = handler(request);
     write_response(&mut stream, &response)?;
+    #[cfg(windows)]
+    {
+        // DisconnectNamedPipe discards unread data; wait until the client consumed it.
+        let mut acknowledgement = [0];
+        stream
+            .read_exact(&mut acknowledgement)
+            .map_err(Error::from)?;
+    }
     Ok(())
 }
 
@@ -491,10 +512,12 @@ pub fn send_request(socket_path: &Path, request: &IpcRequest) -> Result<IpcRespo
             format!("invalid IPC response JSON: {e}"),
         )
     })?;
+    #[cfg(windows)]
+    stream.write_all(&[1]).map_err(Error::from)?;
     Ok(response)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;

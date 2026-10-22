@@ -65,9 +65,13 @@ pub const KNOWN_LINUX: &[KnownBrowser] = KNOWN;
 /// Returns a `Vec` in the same order as [`KNOWN`].
 #[must_use]
 pub fn known_for_os(os: Os, roots: &FilesystemRoots) -> Vec<Browser> {
+    if os == Os::Windows {
+        return super::windows::known(&roots.linux_search);
+    }
     let mut out = Vec::new();
     for kb in KNOWN {
         match os {
+            Os::Windows => unreachable!("Windows known browsers resolved above"),
             Os::Linux => {
                 if let Some(p) = first_existing_linux_path(kb, roots) {
                     out.push(Browser {

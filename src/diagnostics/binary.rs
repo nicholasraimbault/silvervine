@@ -1,4 +1,4 @@
-//! Minimal ELF and Mach-O architecture inspection.
+//! Minimal ELF, Mach-O and Windows PE architecture inspection.
 
 use std::fs::File;
 use std::io::Read;
@@ -16,6 +16,8 @@ pub enum BinaryFormat {
     Elf,
     /// Thin or universal Mach object.
     MachO,
+    /// Windows Portable Executable.
+    Pe,
 }
 
 /// CPU architecture declared by a binary slice.
@@ -63,7 +65,36 @@ fn inspect_header(bytes: &[u8]) -> std::result::Result<BinaryInfo, &'static str>
     if bytes.starts_with(b"\x7fELF") {
         return inspect_elf(bytes);
     }
+    if bytes.starts_with(b"MZ") {
+        return inspect_pe(bytes);
+    }
     inspect_mach_o(bytes)
+}
+
+fn inspect_pe(bytes: &[u8]) -> std::result::Result<BinaryInfo, &'static str> {
+    let offset = bytes.get(60..64).ok_or("truncated DOS header")?;
+    let offset = u32::from_le_bytes(offset.try_into().unwrap()) as usize;
+    let end = offset.checked_add(26).ok_or("PE header overflow")?;
+    let header = bytes.get(offset..end).ok_or("truncated PE header")?;
+    if &header[..4] != b"PE\0\0" {
+        return Err("invalid PE signature");
+    }
+    let machine = u16::from_le_bytes([header[4], header[5]]);
+    let bits = match u16::from_le_bytes([header[24], header[25]]) {
+        0x10b => 32,
+        0x20b => 64,
+        _ => return Err("invalid PE optional header"),
+    };
+    let architecture = match machine {
+        0x8664 => BinaryArchitecture::X86_64,
+        0xaa64 => BinaryArchitecture::Aarch64,
+        other => BinaryArchitecture::Other(u32::from(other)),
+    };
+    Ok(BinaryInfo {
+        format: BinaryFormat::Pe,
+        bits,
+        architectures: vec![architecture],
+    })
 }
 
 fn inspect_elf(bytes: &[u8]) -> std::result::Result<BinaryInfo, &'static str> {
@@ -171,6 +202,22 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{inspect, BinaryArchitecture, BinaryFormat};
+
+    #[test]
+    fn pe_architecture_and_truncated_offset() {
+        let mut bytes = vec![0_u8; 128];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[60..64].copy_from_slice(&64_u32.to_le_bytes());
+        bytes[64..68].copy_from_slice(b"PE\0\0");
+        bytes[68..70].copy_from_slice(&0x8664_u16.to_le_bytes());
+        bytes[88..90].copy_from_slice(&0x20b_u16.to_le_bytes());
+        let info = super::inspect_header(&bytes).unwrap();
+        assert_eq!(info.format, BinaryFormat::Pe);
+        assert_eq!(info.bits, 64);
+        assert_eq!(info.architectures, vec![BinaryArchitecture::X86_64]);
+        bytes[60..64].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(super::inspect_header(&bytes).is_err());
+    }
 
     fn elf64(machine: u16) -> Vec<u8> {
         let mut bytes = vec![0_u8; 64];

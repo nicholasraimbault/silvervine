@@ -92,7 +92,7 @@ notify = "8"
 dialoguer = { version = "0.12", default-features = false }
 # Cross-platform terminal control for `silvervine status --watch`. We use only
 # the cursor + clear primitives; no async event polling needed.
-crossterm = { version = "0.29", default-features = false }
+crossterm = { version = "0.29", default-features = false, features = ["windows"] }
 # Shell completion script generation for `silvervine completion <shell>`.
 clap_complete = "4.6"
 # Man-page generation for `silvervine manpage`.
@@ -153,6 +153,10 @@ tray-icon = { version = "0.24", default-features = false }
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5" }
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
+[target.'cfg(target_os = "windows")'.dependencies]
+tray-icon = { version = "0.24", default-features = false }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_IO", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_Power", "Win32_UI_WindowsAndMessaging"] }
+
 [dev-dependencies]
 plist = "1"
 

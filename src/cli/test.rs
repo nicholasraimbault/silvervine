@@ -480,6 +480,7 @@ mod tests {
     use crate::diagnostics::store::STORE_SCHEMA_VERSION;
     use crate::eme::probe::{assess, EmeProbeResult};
     use crate::widevine::ownership::OwnershipAssessment;
+    #[cfg(unix)]
     use std::fs;
     use tempfile::TempDir;
 

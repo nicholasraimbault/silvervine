@@ -30,12 +30,23 @@ pub struct CommandOutput {
 pub fn find_executable(name: &str) -> Option<PathBuf> {
     let path = Path::new(name);
     if path.components().count() > 1 {
-        return is_executable_file(path).then(|| path.to_path_buf());
+        return executable_candidate(path);
     }
     let path_var = std::env::var_os("PATH")?;
     std::env::split_paths(&path_var)
-        .map(|directory| directory.join(name))
-        .find(|candidate| is_executable_file(candidate))
+        .find_map(|directory| executable_candidate(&directory.join(name)))
+}
+
+fn executable_candidate(path: &Path) -> Option<PathBuf> {
+    if is_executable_file(path) {
+        return Some(path.to_path_buf());
+    }
+    #[cfg(windows)]
+    if path.extension().is_none() {
+        let executable = path.with_extension("exe");
+        return executable.is_file().then_some(executable);
+    }
+    None
 }
 
 #[cfg(unix)]
@@ -49,6 +60,9 @@ fn is_executable_file(path: &Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable_file(path: &Path) -> bool {
     path.is_file()
+        && path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
 }
 
 /// Run a subprocess while draining and bounding both output streams.
@@ -230,6 +244,7 @@ mod tests {
         assert_eq!(find_executable("media-tool"), Some(tool));
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_output_with_timeout_captures_successful_output() {
         let output = run_output_with_timeout(
@@ -246,6 +261,7 @@ mod tests {
         assert_eq!(output.stderr, b"stderr");
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_output_with_timeout_kills_slow_child() {
         let output = run_output_with_timeout(

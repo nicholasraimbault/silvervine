@@ -287,7 +287,9 @@ pub fn run_privileged(args: &PrivilegedArgs) -> Result<()> {
 mod tests {
     use super::*;
     use crate::browsers::BrowserKind;
-    use crate::test_support::{default_hook_path, write_executable_script, ScopedEnv};
+    use crate::test_support::ScopedEnv;
+    #[cfg(unix)]
+    use crate::test_support::{default_hook_path, write_executable_script};
     use std::cell::RefCell;
     use std::fs;
     use std::path::{Path, PathBuf};

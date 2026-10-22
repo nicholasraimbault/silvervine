@@ -48,7 +48,16 @@ pub fn executable_path(browser: &Browser) -> Result<PathBuf> {
             install.display()
         )))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        super::windows::executable(browser.install_path()).ok_or_else(|| {
+            Error::unknown_bundle_structure(format!(
+                "could not locate browser executable in {}",
+                browser.install_path().display()
+            ))
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = browser;
         Err(Error::unsupported_platform(
@@ -82,7 +91,16 @@ pub fn passive_version(browser: &Browser) -> Option<String> {
         .ok()
         .flatten()
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        super::windows::version_directory(browser.install_path())
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .or_else(|| super::windows::product_version(&executable_path(browser).ok()?))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = browser;
         None
@@ -175,7 +193,7 @@ fn is_executable_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use std::fs;
     #[cfg(target_os = "linux")]

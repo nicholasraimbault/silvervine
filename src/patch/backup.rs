@@ -480,7 +480,9 @@ mod tests {
         fs::create_dir_all(&nested).expect("mkdir nested");
         fs::write(nested.join("data.bin"), [1u8, 2, 3, 4]).expect("write data");
         // Symlink ./hello.txt → nested/link
+        #[cfg(unix)]
         let link = nested.join("link.txt");
+        #[cfg(unix)]
         let _ = std::os::unix::fs::symlink("../../hello.txt", &link);
     }
 
@@ -498,12 +500,15 @@ mod tests {
         assert!(snap.join("hello.txt").exists());
         assert!(snap.join("nested").join("deep").join("data.bin").exists());
         // Symlink is preserved.
-        let link = snap.join("nested").join("deep").join("link.txt");
-        let meta = fs::symlink_metadata(&link).expect("symlink metadata");
-        assert!(
-            meta.file_type().is_symlink(),
-            "snapshot must preserve symlinks"
-        );
+        #[cfg(unix)]
+        {
+            let link = snap.join("nested").join("deep").join("link.txt");
+            let meta = fs::symlink_metadata(&link).expect("symlink metadata");
+            assert!(
+                meta.file_type().is_symlink(),
+                "snapshot must preserve symlinks"
+            );
+        }
         // Path naming convention.
         assert!(snap
             .file_name()

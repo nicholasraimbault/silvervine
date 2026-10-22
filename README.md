@@ -1,10 +1,40 @@
-# Silvervine
+# Silvervine — Windows-compatible fork
 
 [![CI](https://github.com/nicholasraimbault/silvervine/actions/workflows/ci.yml/badge.svg)](https://github.com/nicholasraimbault/silvervine/actions/workflows/ci.yml)
 
-Silvervine installs and maintains Widevine L3 for compatible Chromium-family browsers that do not bundle it, enabling DRM-protected media on Linux and macOS.
+Silvervine installs and maintains Widevine L3 for compatible Chromium-family browsers that do not bundle it. This fork adds Windows x64 support while retaining the upstream Linux and macOS backends.
 
 ## Install
+
+### Windows x64
+
+Build with [Rust](https://rustup.rs/) and Visual Studio Build Tools (Desktop development with C++), or download the `silvervine-windows-x64` artifact from this fork's CI:
+
+```powershell
+cargo build --release --locked
+.\target\release\silvervine.exe setup
+.\target\release\silvervine.exe status
+.\target\release\silvervine.exe test --browser Helium
+```
+
+Keep the executable in a permanent location before running `setup`: its per-user Startup shortcut points to that file. Close the browser first. Use `setup --no-daemon` for manual installation only. No administrator privileges are required; the CDM is installed in the browser's user-data directory, not Program Files.
+
+Portable browsers and custom profiles can be configured in `%APPDATA%\silvervine\config.toml`:
+
+```toml
+[[browsers]]
+name = "Helium"
+install_path = 'C:\Browsers\Helium'
+user_data_dir = 'C:\Users\you\AppData\Local\Helium\User Data'
+```
+
+`user_data_dir` must be absolute and must identify the profile actually used by that browser. Silvervine passes it when launching/probing configured Windows browsers. Unknown products require this explicit path. Recognized Helium, Thorium and Chromium products use their standard LocalAppData profiles.
+
+Windows builds use Mozilla's SHA-512-verified Windows DLL, immutable version directories, and atomic component-registration updates. Existing conflicting versions are preserved rather than overwritten. The tray daemon uses user-restricted local named pipes and a native Windows tray. Hardware acceleration diagnostics and hardware DRM are not provided.
+
+Verified locally with Helium 0.20.1.1 x64 and Widevine 4.10.3112.0: browser EME baseline and software-secure video decoding accepted. Streaming-service playback and sleep/resume hardware behavior were not tested. Windows ARM64 and 32-bit builds are not supported. Upstream releases and their shell installer below do **not** contain this Windows port; self-update requires a matching fork release/receipt, not an upstream installer.
+
+### Linux and macOS (upstream)
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
@@ -28,6 +58,7 @@ Custom installations can be added to the configuration file:
 
 - Linux: `~/.config/silvervine/config.toml`
 - macOS: `~/Library/Application Support/silvervine/config.toml`
+- Windows: `%APPDATA%\silvervine\config.toml`
 
 ```toml
 [[browsers]]
@@ -47,7 +78,7 @@ Chrome, Edge, Brave, and Firefox already manage Widevine and do not need Silverv
 
 Silvervine provides software-only Widevine L3. Playback quality is controlled by each streaming service and may be lower than in an officially supported browser. Silvervine does not provide hardware-backed L1 DRM or guarantee HD, 4K, or HDR playback.
 
-Silvervine refuses to patch a running browser unless forced. It stages and verifies a complete CDM tree before atomically publishing it. On macOS, Silvervine installs the component in the browser's per-user profile and leaves the vendor application bundle and its code signature unchanged. The user-session daemon watches for browser updates and CDM changes.
+Silvervine refuses to patch a running browser unless forced on Unix. Windows always requires the browser to be closed, including with `--force`, because component registration modifies Local State. It stages and verifies a complete CDM tree before atomically publishing it. On macOS and Windows, Silvervine installs the component in the browser's per-user profile and leaves the vendor application untouched. The user-session daemon watches for browser updates and CDM changes.
 
 ## Commands
 
@@ -86,7 +117,7 @@ The former Homebrew tap is retired. See [MIGRATION.md](MIGRATION.md) for paths, 
 
 ## Platform support
 
-Silvervine supports x86_64 Linux and Intel or Apple Silicon macOS. Linux ARM64 and Windows are unsupported in V2. Linux receives native CI and maintainer testing on Arch; macOS receives native CI with contributor-led hardware verification.
+This fork targets Windows x64, x86_64 Linux, and Intel or Apple Silicon macOS. Windows CI builds a standalone executable artifact. Linux and macOS retain upstream CI; they were not re-exercised during the Windows port. Linux ARM64, Windows ARM64 and Windows x86 are unsupported.
 
 Linux tray integration uses the StatusNotifierItem protocol. Desktops without a compatible tray host can run Silvervine in notifications-only mode.
 

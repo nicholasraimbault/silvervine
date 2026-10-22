@@ -2,7 +2,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
@@ -51,8 +50,8 @@ impl ProbeServer {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(Error::from)?;
         listener.set_nonblocking(true).map_err(Error::from)?;
         let address = listener.local_addr().map_err(Error::from)?;
-        let token = hex_bytes(&read_urandom(32)?)?;
-        let nonce = hex_bytes(&read_urandom(16)?)?;
+        let token = hex_bytes(&random_bytes(32)?)?;
+        let nonce = hex_bytes(&random_bytes(16)?)?;
         Ok(Self {
             listener,
             address,
@@ -275,6 +274,14 @@ pub fn run_browser_probe_with_executable(
     let server = ProbeServer::bind(timeout, ownership.clone())?;
     let url = server.url();
     let mut command = Command::new(executable);
+    #[cfg(windows)]
+    if let Some(profile) =
+        crate::browsers::windows::configured_user_data_dir(browser.install_path())?
+    {
+        let mut argument = std::ffi::OsString::from("--user-data-dir=");
+        argument.push(profile);
+        command.arg(argument);
+    }
     command
         .arg(&url)
         .stdin(Stdio::null())
@@ -335,16 +342,12 @@ fn render_page(nonce: &str) -> String {
     )
 }
 
-fn read_urandom(len: usize) -> Result<Vec<u8>> {
-    let mut file = File::open("/dev/urandom").map_err(|error| {
-        Error::browser_probe_failed("could not read /dev/urandom for probe entropy")
-            .with_source(error)
-    })?;
+fn random_bytes(len: usize) -> Result<Vec<u8>> {
+    use ring::rand::SecureRandom;
     let mut bytes = vec![0_u8; len];
-    file.read_exact(&mut bytes).map_err(|error| {
-        Error::browser_probe_failed("could not read /dev/urandom for probe entropy")
-            .with_source(error)
-    })?;
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| Error::browser_probe_failed("could not obtain secure probe entropy"))?;
     Ok(bytes)
 }
 

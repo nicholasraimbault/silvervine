@@ -10,6 +10,11 @@ Future entries are generated from
 
 ## [Unreleased]
 
+### Added
+
+- Windows x64 fork: installed/portable browser discovery, explicit custom profiles, verified Windows Widevine downloads, safe profile-scoped publication and component registration, native tray/startup/wake integration, owner-restricted named-pipe IPC, PE diagnostics and cross-platform probe entropy.
+- Windows executable CI artifact and Windows-specific installation/security regression checks.
+
 ## [2.2.1] - 2026-09-21
 
 ### Security

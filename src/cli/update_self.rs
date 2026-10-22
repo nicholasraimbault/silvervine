@@ -19,7 +19,10 @@ use crate::error::{Error, Result};
 /// Env var that, when set, makes [`run`] return a no-op outcome.
 pub const NOOP_ENV: &str = "SILVERVINE_TEST_SELF_UPDATE_NOOP";
 
+#[cfg(not(windows))]
 const SIDECAR_NAME: &str = "silvervine-update";
+#[cfg(windows)]
+const SIDECAR_NAME: &str = "silvervine-update.exe";
 const RECEIPT_NAME: &str = "silvervine-receipt.json";
 const MISSING_SIDECAR: &str =
     "silvervine-update sidecar not installed; re-run the GitHub installer";
@@ -267,7 +270,7 @@ fn spawn_sidecar(sidecar: &Path) -> Result<Output> {
 }
 
 fn is_etxtbsy(error: &std::io::Error) -> bool {
-    error.raw_os_error() == Some(libc::ETXTBSY)
+    error.kind() == std::io::ErrorKind::ExecutableFileBusy
 }
 
 fn combine_captured(stdout: &[u8], stderr: &[u8]) -> String {
@@ -377,7 +380,7 @@ fn write_captured(out: &mut dyn Write, captured: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::fs;

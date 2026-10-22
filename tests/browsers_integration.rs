@@ -61,6 +61,7 @@ fn linux_full_pipeline_unions_known_detected_and_custom() {
             bundle_path: None,
             framework_name: None,
             install_path: Some(custom_path.clone()),
+            user_data_dir: None,
         }],
         ..Default::default()
     };

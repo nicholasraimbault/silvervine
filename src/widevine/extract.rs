@@ -79,6 +79,7 @@ const UNIX_S_IFREG: u32 = 0o100_000;
 /// Directory type bit in a Unix mode.
 const UNIX_S_IFDIR: u32 = 0o040_000;
 /// Permission bits preserved when applying Unix modes from ZIP metadata.
+#[cfg(any(unix, test))]
 const UNIX_PERMISSION_BITS: u32 = 0o777;
 
 /// Extract the ZIP body of a CRX3 file at `crx_path` into `out_dir`.
@@ -372,6 +373,21 @@ pub(super) fn extract_zip_body(zip: &[u8], out_dir: &Path) -> Result<()> {
 }
 
 pub(super) fn normalized_zip_entry_path(entry: &zip::read::ZipFile<'_>) -> Result<PathBuf> {
+    #[cfg(windows)]
+    for segment in entry.name().split(['/', '\\']) {
+        let stem = segment.split('.').next().unwrap_or("").to_ascii_uppercase();
+        if segment.contains(':')
+            || segment.ends_with([' ', '.']) && segment != "."
+            || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (stem.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+        {
+            return Err(Error::unknown_bundle_structure(
+                "unsafe Windows ZIP entry path",
+            ));
+        }
+    }
     let Some(enclosed) = entry.enclosed_name() else {
         return Err(Error::unknown_bundle_structure(format!(
             "zip entry {} has unsafe path",
@@ -502,10 +518,14 @@ pub fn verify_widevine_layout(extracted: &Path) -> Result<PathBuf> {
 
 /// Returns `true` if `dir` contains a supported Widevine shared library.
 fn has_widevine_so(dir: &Path) -> bool {
-    [Platform::LinuxX86_64, Platform::DarwinAarch64]
-        .into_iter()
-        .map(platform_library)
-        .any(|library| dir.join(library).exists())
+    [
+        Platform::LinuxX86_64,
+        Platform::DarwinAarch64,
+        Platform::WindowsX86_64,
+    ]
+    .into_iter()
+    .map(platform_library)
+    .any(|library| dir.join(library).exists())
 }
 
 #[cfg(test)]
@@ -1028,6 +1048,28 @@ mod tests {
             assert!(
                 wrote <= 4,
                 "wrote {wrote} bytes past the declared uncompressed limit"
+            );
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_path_tests {
+    use super::*;
+    #[test]
+    fn rejects_windows_device_and_stream_paths() {
+        for name in ["NUL", "dir/COM1.dll", "file:stream", "dir/trailing."] {
+            let mut bytes = Vec::new();
+            {
+                let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+                zip.start_file(name, zip::write::SimpleFileOptions::default())
+                    .expect("entry");
+                zip.finish().expect("ZIP");
+            }
+            let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("archive");
+            assert!(
+                normalized_zip_entry_path(&zip.by_index(0).expect("entry")).is_err(),
+                "{name}"
             );
         }
     }

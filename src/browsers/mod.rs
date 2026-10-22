@@ -23,6 +23,7 @@ use crate::widevine::CDM_MANIFEST_FILENAME;
 pub mod discovery;
 pub mod known;
 pub mod runtime;
+pub mod windows;
 
 pub use discovery::{discover_filesystem, discover_processes, is_running, FilesystemRoots};
 pub use known::{KnownBrowser, KNOWN_LINUX, KNOWN_MACOS};
@@ -39,6 +40,8 @@ pub enum Os {
     Linux,
     /// macOS.
     Macos,
+    /// Microsoft Windows.
+    Windows,
 }
 
 impl Os {
@@ -50,6 +53,8 @@ impl Os {
             Some(Self::Linux)
         } else if cfg!(target_os = "macos") {
             Some(Self::Macos)
+        } else if cfg!(target_os = "windows") {
+            Some(Self::Windows)
         } else {
             None
         }
@@ -99,6 +104,8 @@ impl BrowserKind {
 /// * macOS: the `.app` bundle — `/Applications/Helium.app`.
 /// * Linux: the install root that contains `chrome-sandbox` (or another
 ///   Chromium-family marker) — e.g. `/opt/helium-browser-bin`.
+/// * Windows: the directory containing the browser executable (`Application`
+///   for an installed browser, or the portable installation root).
 ///
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Browser {
@@ -246,6 +253,13 @@ pub fn detect_browsers_with(os: Os, roots: &FilesystemRoots, config: &Config) ->
 /// fields appropriate for the host OS.
 fn browser_from_custom(os: Os, entry: &CustomBrowserConfig) -> Option<Browser> {
     match os {
+        Os::Windows => entry.install_path.as_ref().and_then(|path| {
+            windows::resolve_install(path).map(|install_path| Browser {
+                name: entry.name.clone(),
+                install_path,
+                kind: BrowserKind::Custom,
+            })
+        }),
         Os::Macos => {
             // macOS entries identify the application bundle; profile placement
             // is derived from its Info.plist by the host patcher.
@@ -367,6 +381,7 @@ mod tests {
                 bundle_path: None,
                 framework_name: None,
                 install_path: Some(custom.clone()),
+                user_data_dir: None,
             }],
             ..Default::default()
         };
@@ -395,6 +410,7 @@ mod tests {
                 bundle_path: Some(PathBuf::from("/Applications/MacOnly.app")),
                 framework_name: Some("MacOnly Framework".into()),
                 install_path: None,
+                user_data_dir: None,
             }],
             ..Default::default()
         };
@@ -424,6 +440,7 @@ mod tests {
                 bundle_path: None,
                 framework_name: None,
                 install_path: Some(helium.clone()),
+                user_data_dir: None,
             }],
             ..Default::default()
         };
@@ -518,6 +535,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn macos_manifest_path_uses_profile_component_target() {
         let tmp = TempDir::new().expect("tempdir");
@@ -582,6 +600,7 @@ mod tests {
             bundle_path: None,
             framework_name: None,
             install_path: None,
+            user_data_dir: None,
         };
         assert!(browser_from_custom(Os::Macos, &mac_empty).is_none());
         assert!(browser_from_custom(Os::Linux, &mac_empty).is_none());
@@ -591,6 +610,7 @@ mod tests {
             bundle_path: None,
             framework_name: None,
             install_path: Some(PathBuf::from("/opt/x")),
+            user_data_dir: None,
         };
         assert!(browser_from_custom(Os::Macos, &linux_only).is_none());
         // ... but on Linux it works.
@@ -607,6 +627,7 @@ mod tests {
             bundle_path: Some(bundle.clone()),
             framework_name: Some("M Framework".into()),
             install_path: None,
+            user_data_dir: None,
         };
         let browser = browser_from_custom(Os::Macos, &mac).expect("macos");
         assert_eq!(browser.install_path, bundle);

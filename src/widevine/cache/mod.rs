@@ -9,6 +9,8 @@
 //! ├── current → 4.10.2934.0/   (symlink)
 //! └── previous → 4.10.2899.0/  (symlink, set when current advances)
 //! ```
+//! On Windows, `selection.json` atomically stores both version pointers as
+//! plain JSON; no symlink privilege is required. Unix retains relative symlinks.
 //!
 //! Each `<version>/` directory contains the unpacked CRX3 contents
 //! (`manifest.json` + `_platform_specific/<platform>/libwidevinecdm.{so,dylib}`).
@@ -446,6 +448,7 @@ pub fn rollback_in(cache_root: &Path) -> Result<CachedCdm> {
     })
 }
 
+#[cfg(unix)]
 fn rollback_unlocked(cache_root: &Path) -> Result<CachedCdm> {
     let previous = resolve_cache_link(cache_root, "previous")?.ok_or_else(|| {
         Error::state_corrupted("no previous CDM cached — nothing to roll back to")
@@ -949,6 +952,7 @@ fn platform_identifier(platform: Platform) -> &'static str {
         Platform::LinuxX86_64 => "linux-x86_64",
         Platform::DarwinAarch64 => "darwin-aarch64",
         Platform::DarwinX86_64 => "darwin-x86_64",
+        Platform::WindowsX86_64 => "windows-x86_64",
     }
 }
 
@@ -975,6 +979,7 @@ fn validate_version(version: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn resolve_cache_link(cache_root: &Path, name: &str) -> Result<Option<CachedCdm>> {
     let link = cache_root.join(name);
     let link_meta = match std::fs::symlink_metadata(&link) {
@@ -982,13 +987,7 @@ fn resolve_cache_link(cache_root: &Path, name: &str) -> Result<Option<CachedCdm>
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(Error::from(error)),
     };
-    if !link_meta.file_type().is_symlink() {
-        return Err(Error::state_corrupted(format!(
-            "{} is not a symlink",
-            link.display()
-        )));
-    }
-    let target = std::fs::read_link(&link).map_err(Error::from)?;
+    let target = read_cache_pointer(&link, &link_meta)?;
     let version = target.to_str().ok_or_else(|| {
         Error::state_corrupted(format!("{} has a non-UTF-8 target", link.display()))
     })?;
@@ -1004,13 +1003,14 @@ fn resolve_cache_link(cache_root: &Path, name: &str) -> Result<Option<CachedCdm>
     Ok(Some(CachedCdm::new(version.to_string(), resolved)))
 }
 
+#[cfg(unix)]
 fn remove_cache_link(path: &Path) -> Result<()> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(Error::from(error)),
     };
-    if !metadata.file_type().is_symlink() {
+    if !is_cache_pointer(&metadata) {
         return Err(Error::state_corrupted(format!(
             "{} is not a cache symlink",
             path.display()
@@ -1076,6 +1076,7 @@ fn list_versions(cache_root: &Path) -> Result<Vec<VersionEntry>> {
 /// * `previous` ← whatever `current` was (deleted if `current` didn't exist).
 /// * `current`  ← `new_version`.
 /// * Both symlinks are *relative* to the cache root.
+#[cfg(unix)]
 fn advance_current(cache_root: &Path, new_version: &str) -> Result<()> {
     validate_version(new_version)?;
     let current = resolve_cache_link(cache_root, "current")?;
@@ -1094,11 +1095,12 @@ fn advance_current(cache_root: &Path, new_version: &str) -> Result<()> {
     replace_cache_link(cache_root, "current", new_version)
 }
 
+#[cfg(unix)]
 fn replace_cache_link(cache_root: &Path, name: &str, target: &str) -> Result<()> {
     validate_version(target)?;
     let link = cache_root.join(name);
     if let Ok(metadata) = std::fs::symlink_metadata(&link) {
-        if !metadata.file_type().is_symlink() {
+        if !is_cache_pointer(&metadata) {
             return Err(Error::state_corrupted(format!(
                 "{} is not a cache symlink",
                 link.display()
@@ -1109,9 +1111,9 @@ fn replace_cache_link(cache_root: &Path, name: &str, target: &str) -> Result<()>
     let staged = cache_root.join(format!(".{name}.new"));
     remove_cache_entry(&staged)?;
     relative_symlink(target, &staged)?;
-    if let Err(error) = std::fs::rename(&staged, &link) {
+    if let Err(error) = publish_cache_pointer(&staged, &link) {
         let _ = remove_cache_entry(&staged);
-        return Err(Error::from(error).with_context(format!(
+        return Err(error.with_context(format!(
             "replace cache symlink {} -> {}",
             link.display(),
             target
@@ -1127,11 +1129,139 @@ fn relative_symlink(target: &str, link: &Path) -> Result<()> {
     })
 }
 
+#[cfg(unix)]
+fn is_cache_pointer(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(unix)]
+fn read_cache_pointer(path: &Path, metadata: &std::fs::Metadata) -> Result<PathBuf> {
+    if !is_cache_pointer(metadata) {
+        return Err(Error::state_corrupted(format!(
+            "{} is not a cache pointer",
+            path.display()
+        )));
+    }
+    std::fs::read_link(path).map_err(Error::from)
+}
+
+#[cfg(unix)]
+fn publish_cache_pointer(staged: &Path, destination: &Path) -> Result<()> {
+    std::fs::rename(staged, destination).map_err(Error::from)
+}
+
 #[cfg(not(unix))]
-fn relative_symlink(_target: &str, _link: &Path) -> Result<()> {
-    Err(Error::unsupported_platform(
-        "symlink creation is only supported on Unix",
-    ))
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CacheSelection {
+    current: Option<String>,
+    previous: Option<String>,
+}
+
+#[cfg(not(unix))]
+fn read_selection(root: &Path) -> Result<CacheSelection> {
+    use std::io::Read;
+    let path = root.join("selection.json");
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CacheSelection::default())
+        }
+        Err(error) => return Err(Error::from(error)),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 4096 {
+        return Err(Error::state_corrupted("invalid cache selection file"));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(Error::from)?
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(Error::from)?;
+    if bytes.len() > 4096 {
+        return Err(Error::state_corrupted("cache selection exceeds 4096 bytes"));
+    }
+    let selection: CacheSelection = serde_json::from_slice(&bytes).map_err(Error::from)?;
+    for version in [&selection.current, &selection.previous]
+        .into_iter()
+        .flatten()
+    {
+        validate_version(version)?;
+    }
+    Ok(selection)
+}
+
+#[cfg(not(unix))]
+fn write_selection(root: &Path, selection: &CacheSelection) -> Result<()> {
+    crate::platform::atomic_write(
+        &root.join("selection.json"),
+        &serde_json::to_vec(selection).map_err(Error::from)?,
+    )
+}
+
+#[cfg(not(unix))]
+fn resolve_cache_link(root: &Path, name: &str) -> Result<Option<CachedCdm>> {
+    let selection = read_selection(root)?;
+    let version = match name {
+        "current" => selection.current,
+        "previous" => selection.previous,
+        _ => return Err(Error::state_corrupted("unknown cache pointer")),
+    };
+    let Some(version) = version else {
+        return Ok(None);
+    };
+    let path = root.join(&version);
+    let metadata = std::fs::symlink_metadata(&path).map_err(Error::from)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(Error::state_corrupted(
+            "cache pointer does not target a real directory",
+        ));
+    }
+    Ok(Some(CachedCdm::new(version, path)))
+}
+
+#[cfg(not(unix))]
+fn advance_current(root: &Path, version: &str) -> Result<()> {
+    validate_version(version)?;
+    let current = resolve_cache_link(root, "current")?;
+    if current.as_ref().is_some_and(|cdm| cdm.version() == version) {
+        return Ok(());
+    }
+    write_selection(
+        root,
+        &CacheSelection {
+            current: Some(version.to_owned()),
+            previous: current.map(|cdm| cdm.version().to_owned()),
+        },
+    )
+}
+
+#[cfg(not(unix))]
+fn rollback_unlocked(root: &Path) -> Result<CachedCdm> {
+    let previous = resolve_cache_link(root, "previous")?.ok_or_else(|| {
+        Error::state_corrupted("no previous CDM cached — nothing to roll back to")
+    })?;
+    let current = resolve_cache_link(root, "current")?;
+    write_selection(
+        root,
+        &CacheSelection {
+            current: Some(previous.version().to_owned()),
+            previous: current.map(|cdm| cdm.version().to_owned()),
+        },
+    )?;
+    Ok(previous)
+}
+
+#[cfg(all(test, not(unix)))]
+fn relative_symlink(target: &str, link: &Path) -> Result<()> {
+    let root = link.parent().expect("pointer parent");
+    let mut selection = read_selection(root)?;
+    match link.file_name().and_then(|name| name.to_str()) {
+        Some("current") => selection.current = Some(target.to_owned()),
+        Some("previous") => selection.previous = Some(target.to_owned()),
+        _ => return Err(Error::state_corrupted("unknown cache pointer")),
+    }
+    write_selection(root, &selection)
 }
 
 #[cfg(test)]

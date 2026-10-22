@@ -110,7 +110,9 @@ pub fn isolated_xdg_cache() -> (tempfile::TempDir, ScopedEnv) {
 /// Panics if `path` cannot be opened or its mtime cannot be set.
 #[cfg(test)]
 pub fn set_mtime(path: &std::path::Path, modified: std::time::SystemTime) {
-    std::fs::File::open(path)
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
         .expect("open for mtime")
         .set_modified(modified)
         .expect("set mtime");

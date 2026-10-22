@@ -370,7 +370,7 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::test_support::{default_hook_path, write_executable_script, ScopedEnv};
