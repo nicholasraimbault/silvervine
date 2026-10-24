@@ -105,6 +105,6 @@ fn schedule_cleanup(backup: &std::path::Path, directory: &std::path::Path) -> Re
         .env("SILVERVINE_UPDATE_BACKUP", backup)
         .env("SILVERVINE_UPDATE_DIRECTORY", directory)
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-        .creation_flags(0x08000000).spawn()?;
+        .creation_flags(0x0800_0000).spawn()?;
     Ok(())
 }

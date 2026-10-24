@@ -71,12 +71,12 @@ pub const MAX_MESSAGE_SIZE: usize = 1 << 20; // 1 MiB
 
 /// Default socket path: `<cache_dir>/silvervine/daemon.sock`.
 ///
-/// Returns `None` when `dirs::cache_dir()` is unresolvable (e.g. no
+/// Returns `None` when `crate::platform::cache_home()` is unresolvable (e.g. no
 /// `$HOME` / `$XDG_CACHE_HOME`); callers in that case should treat IPC as
 /// unavailable.
 #[must_use]
 pub fn default_socket_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("silvervine").join("daemon.sock"))
+    crate::platform::cache_home().map(|d| d.join("silvervine").join("daemon.sock"))
 }
 
 /// Request methods sent by CLI clients.

@@ -35,15 +35,16 @@ pub(super) fn subscribe(callback: super::WakeCallback) -> Result<Handle> {
     let mut callback = Box::new(Mutex::new(callback));
     let parameters = SubscribeParameters {
         callback: on_power,
-        context: (&mut *callback as *mut Mutex<super::WakeCallback>).cast(),
+        context: (&raw mut *callback).cast(),
     };
     let mut registration = std::ptr::null_mut();
-    let status =
-        unsafe { PowerRegisterSuspendResumeNotification(2, &parameters, &mut registration) };
+    let status = unsafe {
+        PowerRegisterSuspendResumeNotification(2, &raw const parameters, &raw mut registration)
+    };
     if status != 0 {
         return Err(Error::other(format!(
             "register Windows wake callback: {}",
-            std::io::Error::from_raw_os_error(status as i32)
+            std::io::Error::from_raw_os_error(i32::from_ne_bytes(status.to_ne_bytes()))
         )));
     }
     Ok(Handle {

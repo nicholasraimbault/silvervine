@@ -99,7 +99,7 @@ fn version_resource(executable: &Path, field: &str) -> Option<String> {
     let mut ignored = 0;
     // SAFETY: all buffers remain live and Win32 receives their exact lengths.
     unsafe {
-        let length = GetFileVersionInfoSizeW(filename.as_ptr(), &mut ignored);
+        let length = GetFileVersionInfoSizeW(filename.as_ptr(), &raw mut ignored);
         if length == 0 || length > 1024 * 1024 {
             return None;
         }
@@ -113,8 +113,8 @@ fn version_resource(executable: &Path, field: &str) -> Option<String> {
         if VerQueryValueW(
             data.as_ptr().cast(),
             translations.as_ptr(),
-            &mut pointer,
-            &mut size,
+            &raw mut pointer,
+            &raw mut size,
         ) == 0
             || size < 4
         {
@@ -125,7 +125,12 @@ fn version_resource(executable: &Path, field: &str) -> Option<String> {
         let key: Vec<u16> = format!("\\StringFileInfo\\{language:04x}{codepage:04x}\\{field}\0")
             .encode_utf16()
             .collect();
-        if VerQueryValueW(data.as_ptr().cast(), key.as_ptr(), &mut pointer, &mut size) == 0
+        if VerQueryValueW(
+            data.as_ptr().cast(),
+            key.as_ptr(),
+            &raw mut pointer,
+            &raw mut size,
+        ) == 0
             || size == 0
             || size > 1024
         {

@@ -39,6 +39,31 @@ use crate::error::{Error, Result};
 
 pub mod process;
 
+/// Base for Silvervine configuration, with an explicit Windows XDG override.
+pub(crate) fn config_home() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(path) = absolute_env_path("XDG_CONFIG_HOME") {
+        return Some(path);
+    }
+    dirs::config_dir()
+}
+
+/// Base for Silvervine caches, with an explicit Windows XDG override.
+pub(crate) fn cache_home() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(path) = absolute_env_path("XDG_CACHE_HOME") {
+        return Some(path);
+    }
+    dirs::cache_dir()
+}
+
+#[cfg(windows)]
+fn absolute_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
 #[cfg(target_os = "linux")]
 use linux as imp;
 

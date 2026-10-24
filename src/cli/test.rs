@@ -845,7 +845,10 @@ mod tests {
             kind: BrowserKind::Detected,
         };
         let fingerprint = ProbeFingerprint::new(
-            "/opt/test/chromium",
+            std::env::current_dir()
+                .unwrap()
+                .join("fixture-chromium")
+                .to_string_lossy(),
             Some("150".into()),
             10,
             1_700_000_000,
@@ -905,13 +908,19 @@ mod tests {
 
     fn sample_fingerprint(digest: &str) -> ProbeFingerprint {
         ProbeFingerprint::new(
-            "/opt/test/chromium",
+            std::env::current_dir()
+                .unwrap()
+                .join("fixture-chromium")
+                .to_string_lossy(),
             Some("150".into()),
             10,
             1_700_000_000,
             digest,
             vec![crate::diagnostics::store::CdmFingerprintEntry::new(
-                "/opt/test/WidevineCdm/libwidevinecdm.so",
+                std::env::current_dir()
+                    .unwrap()
+                    .join("fixture-cdm")
+                    .to_string_lossy(),
                 Some("4.10.2891.0".into()),
                 Some("cdm-digest".into()),
             )],

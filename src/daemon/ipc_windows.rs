@@ -7,10 +7,29 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::*,
-    Security::{Authorization::*, *},
-    Storage::FileSystem::*,
-    System::{Pipes::*, Threading::*},
+    Foundation::{
+        CloseHandle, GetLastError, LocalFree, ERROR_NO_DATA, ERROR_PIPE_CONNECTED,
+        ERROR_PIPE_LISTENING, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    },
+    Security::{
+        Authorization::{
+            ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            GetSecurityInfo, SE_KERNEL_OBJECT,
+        },
+        EqualSid, GetTokenInformation, TokenUser, OWNER_SECURITY_INFORMATION, SECURITY_ATTRIBUTES,
+        TOKEN_QUERY, TOKEN_USER,
+    },
+    Storage::FileSystem::{
+        CreateFileW, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING,
+        PIPE_ACCESS_DUPLEX, READ_CONTROL, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+    },
+    System::{
+        Pipes::{
+            ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, SetNamedPipeHandleState,
+            PIPE_NOWAIT, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+        },
+        Threading::{GetCurrentProcess, OpenProcessToken},
+    },
 };
 
 struct Pipe(HANDLE);
@@ -40,19 +59,19 @@ fn name(path: &Path) -> Vec<u16> {
 fn current_user() -> io::Result<Vec<usize>> {
     unsafe {
         let mut token = std::ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) == 0 {
             return Err(io::Error::last_os_error());
         }
         let token = Pipe(token);
         let mut size = 0;
-        GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut size);
+        GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &raw mut size);
         let mut buffer = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
         if GetTokenInformation(
             token.0,
             TokenUser,
             buffer.as_mut_ptr().cast(),
             size,
-            &mut size,
+            &raw mut size,
         ) == 0
         {
             return Err(io::Error::last_os_error());
@@ -65,7 +84,7 @@ impl Listener {
         let user = current_user()?;
         let mut sid_text = std::ptr::null_mut();
         let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-        if unsafe { ConvertSidToStringSidW(sid, &mut sid_text) } == 0 {
+        if unsafe { ConvertSidToStringSidW(sid, &raw mut sid_text) } == 0 {
             return Err(io::Error::last_os_error());
         }
         let mut len = 0;
@@ -88,14 +107,15 @@ impl Listener {
             if ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl.as_ptr(),
                 1,
-                &mut descriptor,
+                &raw mut descriptor,
                 std::ptr::null_mut(),
             ) == 0
             {
                 return Err(io::Error::last_os_error());
             }
             let attributes = SECURITY_ATTRIBUTES {
-                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
+                    .expect("SECURITY_ATTRIBUTES fits DWORD"),
                 lpSecurityDescriptor: descriptor,
                 bInheritHandle: 0,
             };
@@ -107,7 +127,7 @@ impl Listener {
                 65536,
                 65536,
                 0,
-                &attributes,
+                &raw const attributes,
             );
             let error = io::Error::last_os_error();
             LocalFree(descriptor);
@@ -129,7 +149,7 @@ impl Listener {
                     return Err(if error == ERROR_PIPE_LISTENING {
                         io::ErrorKind::WouldBlock.into()
                     } else {
-                        io::Error::from_raw_os_error(error as i32)
+                        io::Error::from_raw_os_error(i32::from_ne_bytes(error.to_ne_bytes()))
                     });
                 }
             }
@@ -167,14 +187,16 @@ impl Stream {
                 handle,
                 SE_KERNEL_OBJECT,
                 OWNER_SECURITY_INFORMATION,
-                &mut owner,
+                &raw mut owner,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut descriptor,
+                &raw mut descriptor,
             );
             if status != 0 {
-                return Err(io::Error::from_raw_os_error(status as i32));
+                return Err(io::Error::from_raw_os_error(i32::from_ne_bytes(
+                    status.to_ne_bytes(),
+                )));
             }
             let trusted = EqualSid(owner, (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid) != 0;
             LocalFree(descriptor);
@@ -185,7 +207,9 @@ impl Stream {
                 ));
             }
             let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
-            if SetNamedPipeHandleState(handle, &mode, std::ptr::null(), std::ptr::null()) == 0 {
+            if SetNamedPipeHandleState(handle, &raw const mode, std::ptr::null(), std::ptr::null())
+                == 0
+            {
                 return Err(io::Error::last_os_error());
             }
             Ok(Self {
@@ -197,6 +221,12 @@ impl Stream {
     }
     // The transport stays nonblocking; Read/Write implement bounded blocking semantics.
     pub fn set_read_timeout(&mut self, value: Option<Duration>) -> io::Result<()> {
+        if value == Some(Duration::ZERO) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "timeout must be nonzero",
+            ));
+        }
         self.timeout = value.unwrap_or(Duration::from_secs(5));
         Ok(())
     }
@@ -212,16 +242,16 @@ impl Stream {
                     WriteFile(
                         self.pipe.0,
                         buffer,
-                        len.min(u32::MAX as usize) as u32,
-                        &mut transferred,
+                        u32::try_from(len).unwrap_or(u32::MAX),
+                        &raw mut transferred,
                         std::ptr::null_mut(),
                     )
                 } else {
                     ReadFile(
                         self.pipe.0,
                         buffer,
-                        len.min(u32::MAX as usize) as u32,
-                        &mut transferred,
+                        u32::try_from(len).unwrap_or(u32::MAX),
+                        &raw mut transferred,
                         std::ptr::null_mut(),
                     )
                 }
@@ -232,7 +262,9 @@ impl Stream {
             if result == 0 {
                 let error = unsafe { GetLastError() };
                 if error != ERROR_NO_DATA {
-                    return Err(io::Error::from_raw_os_error(error as i32));
+                    return Err(io::Error::from_raw_os_error(i32::from_ne_bytes(
+                        error.to_ne_bytes(),
+                    )));
                 }
             }
             if Instant::now() >= deadline {

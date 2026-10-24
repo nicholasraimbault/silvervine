@@ -872,20 +872,25 @@ impl TrayInner {
         self.generation.set(next_generation);
     }
 
+    // Shares the instance-method interface with the macOS event pump.
     #[cfg(windows)]
+    #[allow(clippy::unused_self)]
     fn pump_events(&self, timeout: std::time::Duration) {
-        use windows_sys::Win32::UI::WindowsAndMessaging::*;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, MsgWaitForMultipleObjects, PeekMessageW, TranslateMessage, PM_REMOVE,
+            QS_ALLINPUT,
+        };
         unsafe {
             let mut message = std::mem::zeroed();
-            while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
-                TranslateMessage(&message);
-                DispatchMessageW(&message);
+            while PeekMessageW(&raw mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&raw const message);
+                DispatchMessageW(&raw const message);
             }
             MsgWaitForMultipleObjects(
                 0,
                 std::ptr::null(),
                 0,
-                timeout.as_millis().min(u128::from(u32::MAX)) as u32,
+                u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
                 QS_ALLINPUT,
             );
         }

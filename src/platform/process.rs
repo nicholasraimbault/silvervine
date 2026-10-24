@@ -203,14 +203,19 @@ fn join_reader(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::collections::HashMap;
     use std::fs;
+    #[cfg(unix)]
     use std::path::Path;
+    #[cfg(unix)]
     use std::time::Duration;
 
     use tempfile::TempDir;
 
-    use super::{find_executable, run_output_with_timeout, MAX_CAPTURE_BYTES};
+    use super::find_executable;
+    #[cfg(unix)]
+    use super::{run_output_with_timeout, MAX_CAPTURE_BYTES};
     use crate::test_support::{env_lock, ScopedEnv};
 
     #[test]
@@ -295,6 +300,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn run_output_with_timeout_caps_verbose_output() {
         let output = run_output_with_timeout(
             Path::new("/usr/bin/yes"),

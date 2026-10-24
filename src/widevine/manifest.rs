@@ -328,10 +328,10 @@ fn default_urls() -> Vec<Url> {
 
 /// Compute the path for the best-effort manifest diagnostic snapshot.
 ///
-/// Returns `None` if `dirs::cache_dir()` cannot be resolved.
+/// Returns `None` if `crate::platform::cache_home()` cannot be resolved.
 #[must_use]
 pub fn cached_manifest_path() -> Option<PathBuf> {
-    let cache = dirs::cache_dir()?;
+    let cache = crate::platform::cache_home()?;
     Some(cache.join("silvervine").join("last-manifest.json"))
 }
 
@@ -691,7 +691,7 @@ mod tests {
                 path.display()
             );
         }
-        // If `dirs::cache_dir()` returned None (no HOME), we just don't
+        // If `crate::platform::cache_home()` returned None (no HOME), we just don't
         // assert anything — that's a valid environment for the binary.
     }
 

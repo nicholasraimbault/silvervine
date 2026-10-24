@@ -126,12 +126,12 @@ pub fn host_patcher() -> Result<Box<dyn PlatformPatcher>> {
 
 /// Default lockfile path for patch operations.
 ///
-/// Per spec: `~/.cache/silvervine/patch.lock`. Returns `None` if `dirs::cache_dir()`
+/// Per spec: `~/.cache/silvervine/patch.lock`. Returns `None` if `crate::platform::cache_home()`
 /// is unresolvable (e.g. no `$HOME`); callers in that case should surface a
 /// `StateCorrupted` error or use a caller-supplied path.
 #[must_use]
 pub fn default_patch_lock() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("silvervine").join("patch.lock"))
+    crate::platform::cache_home().map(|d| d.join("silvervine").join("patch.lock"))
 }
 
 /// Options for [`patch_browser`].
@@ -343,7 +343,7 @@ fn target_identity(handle: &fs::File) -> std::io::Result<TargetIdentity> {
     };
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: the handle remains live and info points to writable storage.
-    if unsafe { GetFileInformationByHandle(handle.as_raw_handle(), &mut info) } == 0 {
+    if unsafe { GetFileInformationByHandle(handle.as_raw_handle(), &raw mut info) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(TargetIdentity {

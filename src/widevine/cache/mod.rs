@@ -47,10 +47,10 @@ pub const DEFAULT_RETENTION: usize = 3;
 
 /// Default cache root: `~/.cache/silvervine/widevine/`.
 ///
-/// Returns `None` if `dirs::cache_dir()` is unresolvable.
+/// Returns `None` if `crate::platform::cache_home()` is unresolvable.
 #[must_use]
 pub fn default_cache_root() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("silvervine").join("widevine"))
+    crate::platform::cache_home().map(|d| d.join("silvervine").join("widevine"))
 }
 
 /// Snapshot of an extracted CDM at a particular version.

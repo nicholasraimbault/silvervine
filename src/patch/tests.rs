@@ -414,6 +414,7 @@ fn explicit_targeted_replacement_preserves_an_invalid_marker() {
 }
 
 #[test]
+#[cfg(unix)]
 fn marker_commit_failure_rolls_back_the_browser_snapshot() {
     let tmp = TempDir::new().expect("tempdir");
     let install = tmp.path().join("install");
@@ -438,6 +439,7 @@ fn marker_commit_failure_rolls_back_the_browser_snapshot() {
     assert!(!install.join("WidevineCdm").exists());
 }
 #[test]
+#[cfg(unix)]
 fn finalizer_payload_mutation_rolls_back_before_commit() {
     let tmp = TempDir::new().expect("tempdir");
     let install = tmp.path().join("install");
@@ -484,6 +486,7 @@ fn dry_run_does_not_invoke_write_or_verify() {
 }
 
 #[test]
+#[cfg(unix)]
 fn write_failure_restores_from_snapshot() {
     let tmp = TempDir::new().expect("tempdir");
     let install = tmp.path().join("install");
@@ -517,6 +520,7 @@ fn write_failure_restores_from_snapshot() {
 }
 
 #[test]
+#[cfg(unix)]
 fn unknown_bundle_write_failure_still_restores_snapshot() {
     let tmp = TempDir::new().expect("tempdir");
     let install = tmp.path().join("install");
@@ -543,6 +547,7 @@ fn unknown_bundle_write_failure_still_restores_snapshot() {
 }
 
 #[test]
+#[cfg(unix)]
 fn verify_failure_restores_from_snapshot() {
     let tmp = TempDir::new().expect("tempdir");
     let install = tmp.path().join("install");
@@ -1006,6 +1011,7 @@ fn run_patch_escalates_when_install_path_is_not_writable() {
 /// and proceeds normally — the elevated child trusts that it has
 /// permission already.
 #[test]
+#[cfg(unix)]
 fn privileged_handoff_carries_exact_parent_selection() {
     let tmp = TempDir::new().unwrap();
     let root = canonical_fixture_root(tmp.path());
@@ -1054,6 +1060,7 @@ fn privileged_handoff_carries_exact_parent_selection() {
 }
 
 #[test]
+#[cfg(unix)]
 fn privileged_handoff_preserves_known_browser_kind_token() {
     let tmp = TempDir::new().unwrap();
     let root = canonical_fixture_root(tmp.path());
@@ -1172,7 +1179,13 @@ fn patch_batch_refreshes_processes_before_each_browser() {
         if capture == 0 {
             discovery::ProcessSnapshot::from_executables([])
         } else {
-            discovery::ProcessSnapshot::from_executables([thorium.install_path().join("thorium")])
+            discovery::ProcessSnapshot::from_executables([thorium.install_path().join(
+                if cfg!(windows) {
+                    "thorium.exe"
+                } else {
+                    "thorium"
+                },
+            )])
         }
     });
 

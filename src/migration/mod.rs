@@ -359,6 +359,8 @@ fn preflight_pairs(pairs: &[(&'static str, PathBuf, PathBuf)]) -> Result<()> {
     Ok(())
 }
 
+// Keep the fallible transport-check contract on platforms without Unix sockets.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn refuse_connectable_legacy_socket(paths: &DataMigrationPaths) -> Result<()> {
     #[cfg(not(unix))]
     let _ = paths;

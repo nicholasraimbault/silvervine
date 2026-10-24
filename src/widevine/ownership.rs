@@ -551,6 +551,8 @@ pub fn stage_verified_payload(
 #[cfg(unix)]
 type SourceDirectory = fs::File;
 
+// Unix mode bits have no Windows equivalent; keep staging's fallible API.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn set_directory_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(Error::from)?;
@@ -991,11 +993,11 @@ fn validate_marker_fields(marker: &ManagedMarker, identity: &PayloadIdentity) ->
 
 fn inspect_payload(root: &Path) -> Result<PayloadIdentity> {
     #[cfg(windows)]
-    let _root_guard = open_directory_tree(root)?;
+    let root_guard = open_directory_tree(root)?;
     #[cfg(windows)]
-    let _platform_guard = open_relative_directory(&_root_guard, "_platform_specific")?;
+    let platform_guard = open_relative_directory(&root_guard, "_platform_specific")?;
     #[cfg(windows)]
-    let _library_guard = open_relative_directory(&_platform_guard, expected_platform_dir())?;
+    let _library_guard = open_relative_directory(&platform_guard, expected_platform_dir())?;
     require_regular_directory(root, "CDM root")?;
     let manifest_path = root.join("manifest.json");
     let manifest_bytes =
@@ -1045,7 +1047,7 @@ fn inspect_payload(root: &Path) -> Result<PayloadIdentity> {
         )));
     }
     let (platform_dir, library) = libraries.pop().expect("one library");
-    let _library_file = open_bounded_regular_file(&library, "Widevine library", MAX_LIBRARY_BYTES)?;
+    let library_file = open_bounded_regular_file(&library, "Widevine library", MAX_LIBRARY_BYTES)?;
     let platform = current_platform_key()?.as_str().to_owned();
     if platform_dir != expected_platform_dir() {
         return Err(Error::invalid_marker(format!(
@@ -1054,14 +1056,16 @@ fn inspect_payload(root: &Path) -> Result<PayloadIdentity> {
         )));
     }
     #[cfg(not(windows))]
+    let _ = &library_file;
+    #[cfg(not(windows))]
     let library_sha512 = crate::file_memo::sha512_memoized(&library).map_err(|error| {
         Error::invalid_marker("could not hash Widevine library").with_source(error)
     })?;
     #[cfg(windows)]
     let library_sha512 = {
-        let mut file = _library_file;
+        let mut file = library_file;
         let mut hasher = Sha512::new();
-        let mut buffer = [0_u8; 64 * 1024];
+        let mut buffer = vec![0_u8; 64 * 1024];
         loop {
             let count = file.read(&mut buffer).map_err(Error::from)?;
             if count == 0 {
@@ -1442,7 +1446,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_without_candidate_reuses_library_digest_when_identity_matches() {
+    fn classify_without_candidate_applies_platform_digest_rules() {
         use std::time::{Duration, SystemTime};
 
         let _env = crate::test_support::env_lock();
@@ -1468,11 +1472,19 @@ mod tests {
             first.details.get("library_sha512"),
             Some(&crate::widevine::sha512_hex(b"AAAAAAAAAAAA"))
         );
+        #[cfg(not(windows))]
         assert_eq!(
             second.details.get("library_sha512"),
             first.details.get("library_sha512")
         );
+        #[cfg(not(windows))]
         assert_ne!(
+            second.details.get("library_sha512"),
+            Some(&crate::widevine::sha512_hex(b"BBBBBBBBBBBB"))
+        );
+        // Windows hashes through the held source handle on each assessment.
+        #[cfg(windows)]
+        assert_eq!(
             second.details.get("library_sha512"),
             Some(&crate::widevine::sha512_hex(b"BBBBBBBBBBBB"))
         );

@@ -57,10 +57,10 @@ use crate::error::{Error, Result};
 
 /// Default backup directory: `~/.cache/silvervine/backups/`.
 ///
-/// Returns `None` if `dirs::cache_dir()` is unresolvable.
+/// Returns `None` if `crate::platform::cache_home()` is unresolvable.
 #[must_use]
 pub fn default_backups_dir() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("silvervine").join("backups"))
+    crate::platform::cache_home().map(|d| d.join("silvervine").join("backups"))
 }
 
 /// Maximum age of backups before [`prune_backups`] deletes them.
@@ -415,6 +415,8 @@ fn copy_permissions(src: &Path, dst: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
+// Windows copies retain their native permissions; share the Unix Result API.
+#[allow(clippy::unnecessary_wraps)]
 fn copy_permissions(_src: &Path, _dst: &Path) -> Result<()> {
     Ok(())
 }
@@ -553,6 +555,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn restore_swaps_snapshot_back_into_original() {
         let tmp = TempDir::new().expect("tempdir");
         let bundle = tmp.path().join("install");
@@ -700,7 +703,7 @@ mod tests {
         build_fake_bundle(&bundle);
         // This will write to `~/.cache/silvervine/backups/<name>-<ts>/` on a
         // dev machine, which is fine for a test (we clean up immediately).
-        // If `dirs::cache_dir()` is None, snapshot returns a state-corrupted
+        // If `crate::platform::cache_home()` is None, snapshot returns a state-corrupted
         // error — also fine.
         match snapshot(&bundle) {
             Ok(handle) => {
@@ -761,6 +764,7 @@ mod tests {
     /// `BackupHandle::restore` can swap atomically — verified via a
     /// content-mutation round-trip.
     #[test]
+    #[cfg(unix)]
     fn snapshot_into_sibling_supports_atomic_restore() {
         let tmp = TempDir::new().expect("tempdir");
         let parent = tmp.path().join("opt");

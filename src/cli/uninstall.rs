@@ -33,7 +33,7 @@ pub struct UninstallOutcome {
 /// Run the uninstall flow against arbitrary cache + config paths.
 ///
 /// Production callers leave the paths `None` and resolve via
-/// `dirs::cache_dir()` / `dirs::config_dir()`; tests pass tempdirs.
+/// `crate::platform::cache_home()` / `crate::platform::config_home()`; tests pass tempdirs.
 ///
 /// # Errors
 ///
@@ -138,7 +138,7 @@ where
 ///
 /// See [`run_with`].
 pub fn run(args: &Args) -> Result<()> {
-    let cache_root = dirs::cache_dir()
+    let cache_root = crate::platform::cache_home()
         .ok_or_else(|| Error::other("cannot resolve ~/.cache directory"))?
         .join("silvervine");
     let config_path = crate::config::default_config_path()

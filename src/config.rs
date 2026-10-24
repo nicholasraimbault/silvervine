@@ -48,7 +48,11 @@ use crate::error::{Error, Result};
 /// callers should treat this as "no config file" (i.e. use defaults).
 #[must_use]
 pub fn default_config_path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("silvervine").join("config.toml"))
+    Some(
+        crate::platform::config_home()?
+            .join("silvervine")
+            .join("config.toml"),
+    )
 }
 
 /// Top-level config schema.

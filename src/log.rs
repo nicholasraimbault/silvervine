@@ -51,10 +51,10 @@ static GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::
 
 /// Default log directory: `<cache_dir>/silvervine/logs/`.
 ///
-/// Returns `None` if `dirs::cache_dir()` is unresolvable.
+/// Returns `None` if `crate::platform::cache_home()` is unresolvable.
 #[must_use]
 pub fn log_dir() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("silvervine").join("logs"))
+    crate::platform::cache_home().map(|d| d.join("silvervine").join("logs"))
 }
 
 /// Initialize the global tracing subscriber.

@@ -32,7 +32,7 @@ pub fn run(args: &Args) -> Result<()> {
     )
     .map_err(Error::from)?;
 
-    let cache_root = dirs::cache_dir()
+    let cache_root = crate::platform::cache_home()
         .ok_or_else(|| Error::other("cannot resolve ~/.cache directory"))?
         .join("silvervine");
     let config_path = crate::config::default_config_path()

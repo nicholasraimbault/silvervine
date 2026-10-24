@@ -1,5 +1,6 @@
 //! Per-user Startup shortcuts; no machine-wide registration or elevation.
 use crate::error::{Error, Result};
+use std::os::windows::process::CommandExt;
 use std::{path::PathBuf, process::Command};
 
 fn startup_path(name: &str) -> Result<PathBuf> {
@@ -29,7 +30,6 @@ fn powershell_path() -> Result<PathBuf> {
 const DAEMON_FILTER: &str = r#"$target=$w.CreateShortcut($env:SILVERVINE_LINK).TargetPath; $bare='^\s*'+[regex]::Escape($target)+'\s*$'; $quoted='^\s*"'+[regex]::Escape($target)+'"\s*$'; $p=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $target -and ($_.CommandLine -match $bare -or $_.CommandLine -match $quoted) -and $_.ProcessId -ne [int]$env:SILVERVINE_PID })"#;
 
 fn powershell(script: &str, values: &[(&str, &std::ffi::OsStr)]) -> Result<String> {
-    use std::os::windows::process::CommandExt;
     let output = Command::new(powershell_path()?)
         .args([
             "-NoLogo",
@@ -39,7 +39,7 @@ fn powershell(script: &str, values: &[(&str, &std::ffi::OsStr)]) -> Result<Strin
             script,
         ])
         .envs(values.iter().copied())
-        .creation_flags(0x08000000)
+        .creation_flags(0x0800_0000)
         .output()?;
     if !output.status.success() {
         return Err(Error::other(format!(
@@ -50,9 +50,8 @@ fn powershell(script: &str, values: &[(&str, &std::ffi::OsStr)]) -> Result<Strin
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 fn start() -> Result<()> {
-    use std::os::windows::process::CommandExt;
     Command::new(std::env::current_exe()?)
-        .creation_flags(0x08000000)
+        .creation_flags(0x0800_0000)
         .spawn()?;
     Ok(())
 }
@@ -106,12 +105,11 @@ pub(super) fn restart() -> Result<()> {
     stop_link(&path)?;
     // Only a daemon restarting itself needs delayed termination; a CLI caller
     // must remain alive to finish its update transaction and report the result.
-    use std::os::windows::process::CommandExt;
     let pid = std::process::id().to_string();
     Command::new(powershell_path()?).args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; $w=New-Object -ComObject WScript.Shell; $target=$w.CreateShortcut($env:SILVERVINE_LINK).TargetPath; if ($env:SILVERVINE_STOP_SELF -eq '1') { $p=Get-Process -Id ([int]$env:SILVERVINE_PID) -ErrorAction Stop; Start-Sleep -Seconds 2; if (-not $p.HasExited) { $p.Kill(); $p.WaitForExit() } }; Start-Process -FilePath $target -WindowStyle Hidden"])
         .env("SILVERVINE_PID", pid).env("SILVERVINE_LINK", path)
         .env("SILVERVINE_STOP_SELF", if std::env::args_os().len() == 1 { "1" } else { "0" })
-        .creation_flags(0x08000000).spawn()?;
+        .creation_flags(0x0800_0000).spawn()?;
     Ok(())
 }
 pub(super) fn legacy_is_registered() -> Result<bool> {

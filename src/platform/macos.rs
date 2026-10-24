@@ -35,16 +35,16 @@ pub struct MacosPaths;
 
 impl PlatformPaths for MacosPaths {
     fn cache_dir() -> PathBuf {
-        dirs::cache_dir()
+        crate::platform::cache_home()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join("silvervine")
     }
 
     fn config_dir() -> PathBuf {
-        // `dirs::config_dir()` returns `~/Library/Application Support`
+        // `crate::platform::config_home()` returns `~/Library/Application Support`
         // on macOS — that's where Silvervine's `config.toml` and `state.json`
         // live.
-        dirs::config_dir()
+        crate::platform::config_home()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join("silvervine")
     }

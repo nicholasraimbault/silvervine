@@ -91,10 +91,10 @@ impl VerifiedCrx {
 
 /// Default download cache directory: `~/.cache/silvervine/downloads/`.
 ///
-/// Returns `None` if `dirs::cache_dir()` is unresolvable.
+/// Returns `None` if `crate::platform::cache_home()` is unresolvable.
 #[must_use]
 pub fn default_download_dir() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("silvervine").join("downloads"))
+    crate::platform::cache_home().map(|d| d.join("silvervine").join("downloads"))
 }
 
 /// Download the CRX3 described by `entry` and verify its SHA-512.
@@ -874,7 +874,7 @@ mod tests {
     }
 
     /// `download_to_cache` (the public default-path variant) doesn't panic;
-    /// it surfaces a categorized error if `dirs::cache_dir()` is None.
+    /// it surfaces a categorized error if `crate::platform::cache_home()` is None.
     #[test]
     fn download_to_cache_does_not_panic() {
         let entry = PlatformEntry::Concrete {
