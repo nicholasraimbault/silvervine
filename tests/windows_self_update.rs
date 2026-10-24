@@ -19,9 +19,15 @@ fn windows_update_replaces_a_mapped_executable_and_recovers_failed_installs() {
             .path()
             .join(format!("installation with spaces {mode}"));
         fs::create_dir(&install).unwrap();
-        let executable = install.join("silvervine.exe");
+        let binary_dir = if mode == "noop" {
+            install.join("bin")
+        } else {
+            install.clone()
+        };
+        fs::create_dir_all(&binary_dir).unwrap();
+        let executable = binary_dir.join("silvervine.exe");
         fs::copy(env!("CARGO_BIN_EXE_silvervine"), &executable).unwrap();
-        fs::copy(&helper, install.join("silvervine-update.exe")).unwrap();
+        fs::copy(&helper, binary_dir.join("silvervine-update.exe")).unwrap();
         let config = install.join("config");
         fs::create_dir_all(config.join("silvervine")).unwrap();
         let receipt_path = config.join("silvervine/silvervine-receipt.json");
@@ -33,7 +39,8 @@ fn windows_update_replaces_a_mapped_executable_and_recovers_failed_installs() {
         } else {
             install.clone()
         };
-        let receipt = serde_json::to_vec(&serde_json::json!({"install_prefix": prefix, "install_layout": "flat", "version": env!("CARGO_PKG_VERSION")})).unwrap();
+        let layout = if mode == "noop" { "cargo-home" } else { "flat" };
+        let receipt = serde_json::to_vec(&serde_json::json!({"install_prefix": prefix, "install_layout": layout, "version": env!("CARGO_PKG_VERSION")})).unwrap();
         fs::write(&receipt_path, &receipt).unwrap();
         let arguments = install.join("arguments.txt");
         let result = Command::new(&executable)
