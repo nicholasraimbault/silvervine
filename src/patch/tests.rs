@@ -673,7 +673,12 @@ fn missing_lock_path_returns_state_corrupted_when_no_default() {
 #[test]
 fn default_patch_lock_path_resolves_to_silvervine_subdir() {
     if let Some(p) = default_patch_lock() {
-        let suffix = std::path::Path::new("silvervine").join("patch.lock");
+        let suffix = std::path::Path::new(if cfg!(windows) {
+            "silvervine/cache"
+        } else {
+            "silvervine"
+        })
+        .join("patch.lock");
         assert!(p.ends_with(&suffix), "got {}", p.display());
     }
 }

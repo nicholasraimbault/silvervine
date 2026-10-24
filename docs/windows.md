@@ -11,7 +11,7 @@ Open PowerShell as your normal user. No GitHub account, repository clone,
 Visual Studio, or Rust installation is required.
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://github.com/nicholasraimbault/silvervine/releases/download/v2.3.0-rc.1/silvervine-installer.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://github.com/nicholasraimbault/silvervine/releases/download/v2.3.0-rc.2/silvervine-installer.ps1 | iex"
 ```
 
 This explicitly selects the RC. It installs `silvervine.exe` and
@@ -39,7 +39,7 @@ If the command is not found, try:
 ```
 
 Use your chosen `$env:CARGO_HOME` location instead if customized. Public
-[release assets](https://github.com/nicholasraimbault/silvervine/releases/tag/v2.3.0-rc.1)
+[release assets](https://github.com/nicholasraimbault/silvervine/releases/tag/v2.3.0-rc.2)
 also contain a Windows zip and checksums. Extracting the zip is useful for a
 portable executable, but self-updates require the installer receipt.
 
@@ -57,7 +57,8 @@ the tray daemon. IPC uses a local named pipe restricted to your Windows user.
 
 Configure custom installations/profiles in the TUI or
 `%APPDATA%\silvervine\config.toml`; see [configuration](usage.md#configuration).
-The updater receipt normally lives separately under
+Disposable data lives under `%LOCALAPPDATA%\silvervine\cache`. Repair and
+uninstall remove that cache while keeping the updater receipt. The receipt normally lives under
 `%LOCALAPPDATA%\silvervine\silvervine-receipt.json` (or `$env:XDG_CONFIG_HOME`
 when explicitly configured for the installer).
 

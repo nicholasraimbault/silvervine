@@ -5,6 +5,39 @@
 use std::{fs, process::Command};
 
 #[test]
+fn windows_uninstall_preserves_the_receipt_and_configuration_next_to_the_cache() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("local");
+    let app = root.join("silvervine");
+    let cache = app.join("cache");
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(cache.join("disposable"), b"cached data").unwrap();
+    let receipt = app.join("silvervine-receipt.json");
+    let config = app.join("config.toml");
+    fs::write(&receipt, b"original receipt").unwrap();
+    fs::write(
+        &config,
+        "[updates]\nchannel = 'stable'\nauto_apply = false\n",
+    )
+    .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_silvervine"))
+        .arg("uninstall")
+        .env("XDG_CONFIG_HOME", &root)
+        .env("XDG_CACHE_HOME", &root)
+        .env("SILVERVINE_TEST_DATA_MIGRATION_NOOP", "1")
+        .env("SILVERVINE_TEST_LIFECYCLE_NOOP", "1")
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{result:?}");
+    assert!(!cache.exists(), "disposable cache was not removed");
+    assert_eq!(fs::read(&receipt).unwrap(), b"original receipt");
+    assert!(
+        config.exists(),
+        "configuration must survive repair's uninstall step"
+    );
+}
+
+#[test]
 fn windows_update_replaces_a_mapped_executable_and_recovers_failed_installs() {
     let temporary = tempfile::tempdir().unwrap();
     let helper = compile_sidecar(temporary.path());
@@ -104,7 +137,7 @@ fn compile_sidecar(root: &std::path::Path) -> std::path::PathBuf {
             match env::var("TEST_UPDATE_MODE").unwrap().as_str() {
                 "noop" => println!("already up to date"),
                 "fail" => { fs::write(target, b"incomplete installation").unwrap(); fs::write(env::var_os("TEST_UPDATE_RECEIPT").unwrap(), b"{\"version\":\"incomplete\"}").unwrap(); eprintln!("simulated failure"); std::process::exit(1); }
-                _ => { fs::copy(env::var_os("TEST_UPDATE_SOURCE").unwrap(), target).unwrap(); println!("new release 2.3.0-rc.2 installed"); }
+                _ => { fs::copy(env::var_os("TEST_UPDATE_SOURCE").unwrap(), target).unwrap(); println!("new release 2.3.0-rc.3 installed"); }
             }
         }
     "#).unwrap();

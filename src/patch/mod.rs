@@ -131,7 +131,7 @@ pub fn host_patcher() -> Result<Box<dyn PlatformPatcher>> {
 /// `StateCorrupted` error or use a caller-supplied path.
 #[must_use]
 pub fn default_patch_lock() -> Option<PathBuf> {
-    crate::platform::cache_home().map(|d| d.join("silvervine").join("patch.lock"))
+    crate::platform::app_cache_dir().map(|d| d.join("patch.lock"))
 }
 
 /// Options for [`patch_browser`].

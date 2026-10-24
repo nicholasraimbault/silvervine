@@ -811,7 +811,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // This sidecar fixture offers a newer RC only when explicitly asked.
         let (sidecar, receipt) = seeded(&tmp,
-            "#!/bin/sh\nif [ \"$#\" = 0 ]; then echo 'Already up to date; not upgrading'; elif [ \"$#\" = 1 ] && [ \"$1\" = '--prerelease' ]; then echo 'New release 2.3.0-rc.2 installed!'; else exit 9; fi\n");
+            "#!/bin/sh\nif [ \"$#\" = 0 ]; then echo 'Already up to date; not upgrading'; elif [ \"$#\" = 1 ] && [ \"$1\" = '--prerelease' ]; then echo 'New release 2.3.0-rc.3 installed!'; else exit 9; fi\n");
         for (channel, expected_updated) in [
             (UpdateChannel::Stable, false),
             (UpdateChannel::Preview, true),
@@ -822,7 +822,7 @@ mod tests {
                 run_with(&request, Some(&sidecar), Some(&receipt), &mut Vec::new()).unwrap();
             assert_eq!(outcome.updated, expected_updated);
             if expected_updated {
-                assert_eq!(outcome.latest_version, "2.3.0-rc.2");
+                assert_eq!(outcome.latest_version, "2.3.0-rc.3");
             }
         }
     }

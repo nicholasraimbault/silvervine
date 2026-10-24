@@ -76,7 +76,7 @@ pub const MAX_MESSAGE_SIZE: usize = 1 << 20; // 1 MiB
 /// unavailable.
 #[must_use]
 pub fn default_socket_path() -> Option<PathBuf> {
-    crate::platform::cache_home().map(|d| d.join("silvervine").join("daemon.sock"))
+    crate::platform::app_cache_dir().map(|d| d.join("daemon.sock"))
 }
 
 /// Request methods sent by CLI clients.
@@ -805,7 +805,12 @@ mod tests {
     #[test]
     fn default_socket_path_ends_with_silvervine_daemon_sock() {
         if let Some(p) = default_socket_path() {
-            let suffix = std::path::Path::new("silvervine").join("daemon.sock");
+            let suffix = std::path::Path::new(if cfg!(windows) {
+                "silvervine/cache"
+            } else {
+                "silvervine"
+            })
+            .join("daemon.sock");
             assert!(p.ends_with(&suffix), "{}", p.display());
         }
     }

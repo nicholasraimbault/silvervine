@@ -785,7 +785,12 @@ fn concurrent_authenticated_cache_hits_preserve_current_and_previous() {
 #[test]
 fn default_cache_root_resolves_under_silvervine_subdir() {
     if let Some(p) = default_cache_root() {
-        let suffix = std::path::Path::new("silvervine").join("widevine");
+        let suffix = std::path::Path::new(if cfg!(windows) {
+            "silvervine/cache"
+        } else {
+            "silvervine"
+        })
+        .join("widevine");
         assert!(p.ends_with(&suffix));
     }
 }

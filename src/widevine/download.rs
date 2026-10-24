@@ -94,7 +94,7 @@ impl VerifiedCrx {
 /// Returns `None` if `crate::platform::cache_home()` is unresolvable.
 #[must_use]
 pub fn default_download_dir() -> Option<PathBuf> {
-    crate::platform::cache_home().map(|d| d.join("silvervine").join("downloads"))
+    crate::platform::app_cache_dir().map(|d| d.join("downloads"))
 }
 
 /// Download the CRX3 described by `entry` and verify its SHA-512.
@@ -838,7 +838,12 @@ mod tests {
     #[test]
     fn default_download_dir_resolves_under_silvervine_subdir() {
         if let Some(p) = default_download_dir() {
-            let suffix = std::path::Path::new("silvervine").join("downloads");
+            let suffix = std::path::Path::new(if cfg!(windows) {
+                "silvervine/cache"
+            } else {
+                "silvervine"
+            })
+            .join("downloads");
             assert!(p.ends_with(&suffix), "got {}", p.display());
         }
     }

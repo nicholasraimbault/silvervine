@@ -5,10 +5,7 @@ use std::process::Output;
 use crate::error::{Error, Result};
 
 pub(super) fn cache_dir() -> PathBuf {
-    crate::platform::cache_home()
-        .expect("Windows local application data directory unavailable")
-        .join("silvervine")
-        .join("cache")
+    crate::platform::app_cache_dir().expect("Windows local application data directory unavailable")
 }
 
 pub(super) fn config_dir() -> PathBuf {
