@@ -4,7 +4,7 @@ Silvervine focuses on installing and maintaining Widevine L3 for compatible desk
 
 ## 2.3 release candidate
 
-Skip 2.2.2 and validate 2.3.0-rc.1 with:
+Skip 2.2.2 and validate 2.3.0-rc.2 with:
 
 - The pending dependency and CI updates, plus current security fixes.
 - Windows x64 discovery, profile-scoped Widevine installation, tray/startup/wake integration, and normal-user installation and updates. Credit the community port.

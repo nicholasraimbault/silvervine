@@ -60,7 +60,7 @@ use crate::error::{Error, Result};
 /// Returns `None` if `crate::platform::cache_home()` is unresolvable.
 #[must_use]
 pub fn default_backups_dir() -> Option<PathBuf> {
-    crate::platform::cache_home().map(|d| d.join("silvervine").join("backups"))
+    crate::platform::app_cache_dir().map(|d| d.join("backups"))
 }
 
 /// Maximum age of backups before [`prune_backups`] deletes them.
@@ -643,7 +643,12 @@ mod tests {
     #[test]
     fn default_backups_dir_resolves_under_silvervine_subdir() {
         if let Some(p) = default_backups_dir() {
-            let suffix = std::path::Path::new("silvervine").join("backups");
+            let suffix = std::path::Path::new(if cfg!(windows) {
+                "silvervine/cache"
+            } else {
+                "silvervine"
+            })
+            .join("backups");
             assert!(p.ends_with(&suffix), "got {}", p.display());
         }
     }

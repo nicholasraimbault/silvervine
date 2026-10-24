@@ -9,9 +9,11 @@ as a guide.
 
 ## [Unreleased]
 
-## [2.3.0-rc.1] - 2026-10-23
+## [2.3.0-rc.2] - 2026-10-23
 
-First 2.3 candidate, consolidating the pending updates instead of a 2.2.2 release.
+First public 2.3 candidate, consolidating the pending updates instead of a 2.2.2 release.
+The rc.1 publication was cancelled after review found that Windows repair could
+remove the updater receipt. The immutable rc.1 tag is retained.
 This is a prerelease: stable update checks exclude it unless users explicitly
 choose preview. Real Windows playback and sleep/resume verification remain
 required before 2.3 stable.
@@ -35,6 +37,8 @@ required before 2.3 stable.
 
 ### Fixed
 
+- Keep Windows caches in a disposable subdirectory, separate from the installer
+  receipt, so repair/uninstall cannot erase update eligibility.
 - Windows self-updates make the mapped executable's filename replaceable,
   require a receipt matching that installation, restore the previous binary and
   receipt after failed or no-op installation, and restart

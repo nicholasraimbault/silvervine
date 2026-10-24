@@ -54,7 +54,7 @@ static GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::
 /// Returns `None` if `crate::platform::cache_home()` is unresolvable.
 #[must_use]
 pub fn log_dir() -> Option<PathBuf> {
-    crate::platform::cache_home().map(|d| d.join("silvervine").join("logs"))
+    crate::platform::app_cache_dir().map(|d| d.join("logs"))
 }
 
 /// Initialize the global tracing subscriber.
@@ -168,7 +168,14 @@ mod tests {
     #[test]
     fn log_dir_ends_under_silvervine_logs() {
         if let Some(dir) = log_dir() {
-            assert!(dir.ends_with(std::path::Path::new("silvervine").join("logs")));
+            assert!(dir.ends_with(
+                std::path::Path::new(if cfg!(windows) {
+                    "silvervine/cache"
+                } else {
+                    "silvervine"
+                })
+                .join("logs")
+            ));
         }
     }
 

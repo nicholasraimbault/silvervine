@@ -57,6 +57,15 @@ pub(crate) fn cache_home() -> Option<PathBuf> {
     dirs::cache_dir()
 }
 
+/// Silvervine cache root. Windows keeps the install receipt in LocalAppData's
+/// `silvervine` directory, so disposable data must live in its `cache` child.
+pub(crate) fn app_cache_dir() -> Option<PathBuf> {
+    let root = cache_home()?.join("silvervine");
+    #[cfg(windows)]
+    let root = root.join("cache");
+    Some(root)
+}
+
 #[cfg(windows)]
 fn absolute_env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)

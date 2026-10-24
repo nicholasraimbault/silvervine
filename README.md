@@ -29,13 +29,13 @@ Linux / macOS:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/nicholasraimbault/silvervine/releases/download/v2.3.0-rc.1/silvervine-installer.sh | sh
+  https://github.com/nicholasraimbault/silvervine/releases/download/v2.3.0-rc.2/silvervine-installer.sh | sh
 ```
 
 Windows x64, from PowerShell:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://github.com/nicholasraimbault/silvervine/releases/download/v2.3.0-rc.1/silvervine-installer.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://github.com/nicholasraimbault/silvervine/releases/download/v2.3.0-rc.2/silvervine-installer.ps1 | iex"
 ```
 
 Then reopen your terminal, close the browser, and run:

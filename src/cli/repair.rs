@@ -32,9 +32,8 @@ pub fn run(args: &Args) -> Result<()> {
     )
     .map_err(Error::from)?;
 
-    let cache_root = crate::platform::cache_home()
-        .ok_or_else(|| Error::other("cannot resolve ~/.cache directory"))?
-        .join("silvervine");
+    let cache_root = crate::platform::app_cache_dir()
+        .ok_or_else(|| Error::other("cannot resolve ~/.cache directory"))?;
     let config_path = crate::config::default_config_path()
         .ok_or_else(|| Error::other("cannot resolve config path"))?;
 

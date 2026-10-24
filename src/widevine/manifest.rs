@@ -331,8 +331,8 @@ fn default_urls() -> Vec<Url> {
 /// Returns `None` if `crate::platform::cache_home()` cannot be resolved.
 #[must_use]
 pub fn cached_manifest_path() -> Option<PathBuf> {
-    let cache = crate::platform::cache_home()?;
-    Some(cache.join("silvervine").join("last-manifest.json"))
+    let cache = crate::platform::app_cache_dir()?;
+    Some(cache.join("last-manifest.json"))
 }
 
 /// Fetch a fresh manifest from the fixed Mozilla HTTPS origins.
@@ -683,7 +683,12 @@ mod tests {
     fn cached_manifest_path_is_under_xdg_cache() {
         if let Some(path) = cached_manifest_path() {
             // Always ends in `silvervine/last-manifest.json`.
-            let suffix = std::path::Path::new("silvervine").join("last-manifest.json");
+            let suffix = std::path::Path::new(if cfg!(windows) {
+                "silvervine/cache"
+            } else {
+                "silvervine"
+            })
+            .join("last-manifest.json");
             assert!(
                 path.ends_with(&suffix),
                 "expected cached manifest path to end with {} (got {})",

@@ -50,7 +50,7 @@ pub const DEFAULT_RETENTION: usize = 3;
 /// Returns `None` if `crate::platform::cache_home()` is unresolvable.
 #[must_use]
 pub fn default_cache_root() -> Option<PathBuf> {
-    crate::platform::cache_home().map(|d| d.join("silvervine").join("widevine"))
+    crate::platform::app_cache_dir().map(|d| d.join("widevine"))
 }
 
 /// Snapshot of an extracted CDM at a particular version.

@@ -254,8 +254,7 @@ pub enum CacheLookup {
 /// Default capability-report cache root.
 #[must_use]
 pub fn default_store_root() -> Option<PathBuf> {
-    crate::platform::cache_home()
-        .map(|root| root.join("silvervine").join("diagnostics").join("probes"))
+    crate::platform::app_cache_dir().map(|root| root.join("diagnostics").join("probes"))
 }
 
 /// Persist `report` beneath `root` using a same-directory atomic rename.
