@@ -27,7 +27,21 @@ fn powershell_path() -> Result<PathBuf> {
 
 // Only an exact executable command line (quoted or unquoted), with no arguments,
 // identifies our tray daemon. CLI patch/update processes must never be stopped.
-const DAEMON_FILTER: &str = r#"$target=$w.CreateShortcut($env:SILVERVINE_LINK).TargetPath; $bare='^\s*'+[regex]::Escape($target)+'\s*$'; $quoted='^\s*"'+[regex]::Escape($target)+'"\s*$'; $p=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $target -and ($_.CommandLine -match $bare -or $_.CommandLine -match $quoted) -and $_.ProcessId -ne [int]$env:SILVERVINE_PID })"#;
+const DAEMON_FILTER: &str = r#"
+$target=$w.CreateShortcut($env:SILVERVINE_LINK).TargetPath;
+$bare='^\s*'+[regex]::Escape($target)+'\s*$';
+$quoted='^\s*"'+[regex]::Escape($target)+'"\s*$';
+$p=@(Get-CimInstance Win32_Process | Where-Object {
+    $exe=$_.ExecutablePath;
+    if ($exe -and $exe.StartsWith('\\?\')) { $exe=$exe.Substring(4) };
+    $parent=if ($exe) { [IO.Path]::GetDirectoryName($exe) } else { '' };
+    $relocated=$exe -and [IO.Path]::GetFileName($exe) -eq 'silvervine.exe' -and
+        [IO.Path]::GetFileName($parent).StartsWith('.silvervine-update-') -and
+        [IO.Path]::GetDirectoryName($parent) -eq [IO.Path]::GetDirectoryName($target);
+    ($exe -eq $target -or $relocated) -and
+        ($_.CommandLine -match $bare -or $_.CommandLine -match $quoted) -and
+        $_.ProcessId -ne [int]$env:SILVERVINE_PID
+})"#;
 
 fn powershell(script: &str, values: &[(&str, &std::ffi::OsStr)]) -> Result<String> {
     let output = Command::new(powershell_path()?)
@@ -154,7 +168,7 @@ mod tests {
     #[test]
     fn daemon_filter_excludes_cli_arguments() {
         let script = format!(
-            r#"$ErrorActionPreference='Stop'; $target='C:\Program Files\Silvervine\silvervine.exe'; $w=New-Object PSObject; $w | Add-Member ScriptMethod CreateShortcut {{ param($path) [pscustomobject]@{{ TargetPath=$target }} }}; function Get-CimInstance {{ @([pscustomobject]@{{ExecutablePath=$target;CommandLine='"'+$target+'"';ProcessId=1}}, [pscustomobject]@{{ExecutablePath=$target;CommandLine='"'+$target+'" patch';ProcessId=2}}, [pscustomobject]@{{ExecutablePath=$target;CommandLine=$target+' update-self';ProcessId=3}}) }}; {DAEMON_FILTER}; if ($p.Count -ne 1 -or $p[0].ProcessId -ne 1) {{ throw 'Selected a CLI process' }}; 'ok'"#
+            r#"$ErrorActionPreference='Stop'; $target='C:\Program Files\Silvervine\silvervine.exe'; $w=New-Object PSObject; $w | Add-Member ScriptMethod CreateShortcut {{ param($path) [pscustomobject]@{{ TargetPath=$target }} }}; function Get-CimInstance {{ @([pscustomobject]@{{ExecutablePath=$target;CommandLine='"'+$target+'"';ProcessId=1}}, [pscustomobject]@{{ExecutablePath=$target;CommandLine='"'+$target+'" patch';ProcessId=2}}, [pscustomobject]@{{ExecutablePath=$target;CommandLine=$target+' update-self';ProcessId=3}}, [pscustomobject]@{{ExecutablePath='C:\Program Files\Silvervine\.silvervine-update-abc\silvervine.exe';CommandLine='"'+$target+'"';ProcessId=4}}, [pscustomobject]@{{ExecutablePath='C:\Other\.silvervine-update-abc\silvervine.exe';CommandLine='"'+$target+'"';ProcessId=5}}) }}; {DAEMON_FILTER}; if ($p.Count -ne 2 -or $p[0].ProcessId -ne 1 -or $p[1].ProcessId -ne 4) {{ throw 'Selected a CLI process' }}; 'ok'"#
         );
         assert_eq!(
             powershell(&script, &[("SILVERVINE_PID", std::ffi::OsStr::new("0"))]).unwrap(),

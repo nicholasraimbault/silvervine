@@ -203,7 +203,9 @@ fn transactional_patcher_must_override_authorized_publication() {
     assert!(!target.exists());
 }
 
+#[cfg(unix)]
 struct MutatingUnknownBundleMock;
+#[cfg(unix)]
 impl PlatformPatcher for MutatingUnknownBundleMock {
     fn write_cdm(&self, target: &Path, _source: &Path) -> Result<()> {
         fs::write(target.join("partial-write"), b"damaged").map_err(Error::from)?;
@@ -250,7 +252,9 @@ impl PlatformPatcher for PartialFailMock {
     }
 }
 
+#[cfg(unix)]
 struct MarkerPoisonMock;
+#[cfg(unix)]
 impl PlatformPatcher for MarkerPoisonMock {
     fn write_cdm(&self, target: &Path, source: &Path) -> Result<()> {
         MockPatcher::default().write_cdm(target, source)?;
@@ -270,8 +274,10 @@ impl PlatformPatcher for MarkerPoisonMock {
         None
     }
 }
+#[cfg(unix)]
 struct FinalizeMutationMock;
 
+#[cfg(unix)]
 impl PlatformPatcher for FinalizeMutationMock {
     fn write_cdm(&self, target: &Path, source: &Path) -> Result<()> {
         MockPatcher::default().write_cdm(target, source)

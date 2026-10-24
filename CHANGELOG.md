@@ -4,16 +4,60 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Future entries are generated from
-[Conventional Commits](https://www.conventionalcommits.org/) via
-[release-please](https://github.com/googleapis/release-please).
+Release notes are maintained alongside code changes, using Conventional Commits
+as a guide.
 
 ## [Unreleased]
 
+## [2.3.0-rc.1] - 2026-10-23
+
+First 2.3 candidate, consolidating the pending updates instead of a 2.2.2 release.
+This is a prerelease: stable update checks exclude it unless users explicitly
+choose preview. Real Windows playback and sleep/resume verification remain
+required before 2.3 stable.
+
 ### Added
 
-- Windows x64 fork: installed/portable browser discovery, explicit custom profiles, verified Windows Widevine downloads, safe profile-scoped publication and component registration, native tray/startup/wake integration, owner-restricted named-pipe IPC, PE diagnostics and cross-platform probe entropy.
-- Windows executable CI artifact and Windows-specific installation/security regression checks.
+- Windows x64 support: installed/portable browser discovery, explicit custom
+  profiles, verified Windows CDM downloads, immutable profile-scoped publication
+  and component registration, native tray/startup/wake integration, owner-only
+  named-pipe IPC, and PE diagnostics. Based on paparei's Windows port, preserving
+  the original commit authorship.
+- `silvervine tui`: Overview, Browsers, Diagnostics, Updates, Logs, and Settings.
+  Run browser actions, view/export diagnostics, search bounded local logs, edit
+  preferences/custom browsers/hooks, and manage the user daemon.
+- `silvervine daemon enable|disable|restart` for user-session lifecycle control.
+- Explicit `[updates] channel = "stable" | "preview"` and one-time
+  `update self --channel` overrides. Stable remains the default and `auto_apply`
+  remains a separate opt-in, including for existing configurations.
+- Windows release zip, PowerShell installer, updater/receipt support, and native
+  build, lint, test, and release gates.
+
+### Fixed
+
+- Windows self-updates make the mapped executable's filename replaceable,
+  restore the previous binary after failed or no-op installation, and restart
+  the registered daemon after a manual update.
+- Treat Windows lock contention as a skipped busy lock rather than an I/O failure.
+- Preserve authenticated ZIP read/expansion failures as invalid bundle structure.
+
+### Security
+
+- Update rustls to 0.23.46, rustls-webpki to 0.103.16, webpki-roots to 1.0.11,
+  and zip to 9.0.5. Retain archive/signature/digest checks across the ZIP upgrade.
+- Include Windows in dependency auditing. Three documented temporary exceptions
+  cover D-Bus unmaintained-package notices only, pending tray/notification
+  upstream migration; review by 2027-01-23. Vulnerability checks remain enforced.
+
+### Changed
+
+- Integrate pending updates to sha2, serde_json, objc2, libc, thiserror, and the
+  pinned install action.
+- Shorten the README; add focused usage, Windows testing, and troubleshooting
+  guides. Replace obsolete distribution/feature promises with a 2.3 release
+  checklist and evidence-driven maintenance roadmap.
+- Retain legacy Neon migration compatibility throughout 2.x and move its guidance
+  outside the main installation flow. Archive the unsupported bridge experiment.
 
 ## [2.2.1] - 2026-09-21
 

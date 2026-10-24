@@ -295,8 +295,19 @@ impl ProcessSnapshot {
 fn executable_under(executable: &Path, install: &Path) -> bool {
     #[cfg(windows)]
     {
-        let executable =
-            std::fs::canonicalize(executable).unwrap_or_else(|_| executable.to_path_buf());
+        // A missing/locked executable can still have an observable process.
+        // Canonicalize its parent too, so a regular path and a verbatim
+        // Windows installation path remain comparable in that case.
+        let executable = std::fs::canonicalize(executable)
+            .ok()
+            .or_else(|| {
+                Some(
+                    std::fs::canonicalize(executable.parent()?)
+                        .ok()?
+                        .join(executable.file_name()?),
+                )
+            })
+            .unwrap_or_else(|| executable.to_path_buf());
         let install = std::fs::canonicalize(install).unwrap_or_else(|_| install.to_path_buf());
         executable.starts_with(install)
     }

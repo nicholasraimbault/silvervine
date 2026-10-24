@@ -105,6 +105,22 @@ jobs:
         run: |
           ./target/release/silvervine.exe --version
           ./target/release/silvervine.exe list-browsers --json
+      - name: Install pinned Windows packaging tool
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'cargo-dist-installer.ps1'
+          Invoke-WebRequest 'https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.ps1' -OutFile $installer
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'ffec5b52cfbe29465d831150b01f8a254668fc271e5102fab7aea7da5d51ec69') { throw 'cargo-dist installer checksum mismatch' }
+          & $installer
+      - name: Package and test normal-user Windows installation
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          dist build --allow-dirty --artifacts=all --target x86_64-pc-windows-msvc --output-format=json > windows-dist-manifest.json
+          if ($LASTEXITCODE -ne 0) { throw 'Windows packaging failed' }
+          ./scripts/test_windows_installer.ps1
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: runner.os == 'Windows'
         with:

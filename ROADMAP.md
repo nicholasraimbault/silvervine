@@ -1,147 +1,42 @@
-# Silvervine Roadmap
+# Silvervine roadmap
 
-What's shipped, what's queued, what's a stretch goal, and who has to do it.
+Silvervine focuses on installing and maintaining Widevine L3 for compatible desktop Chromium browsers. Releases follow working features and verified fixes; there is no fixed feature schedule after 2.3.
 
-## Maintenance posture
+## 2.3 release candidate
 
-Silvervine is maintained by [@nicholasraimbault](https://github.com/nicholasraimbault). I develop on Arch, so **Arch (and Arch-like distros) get first-class testing.** Everything else is best-effort and contributor-driven:
+Skip 2.2.2 and validate 2.3.0-rc.1 with:
 
-- **macOS** — CI covers builds, lint, and tests on native runners. Silvervine
-  2.1 setup, browser discovery, profile-scoped CDM installation, EME playback
-  capability, LaunchAgent registration, and diagnostics were also exercised on
-  Apple Silicon macOS 26.6.
-- **Debian / Ubuntu / Fedora / RHEL** — V2's musl binary *runs*, but `.deb` / `.rpm` packaging and distro-specific migration paths need volunteers from those distros to verify.
-- **Windows** — speculative, contributor-driven entirely. The protocol is sketched below; the code isn't.
-- **ARM64 Linux** — not in V2's target list; needs Apple Silicon Asahi research or a maintainer with hardware.
+- The pending dependency and CI updates, plus current security fixes.
+- Windows x64 discovery, profile-scoped Widevine installation, tray/startup/wake integration, and normal-user installation and updates. Credit the community port.
+- A terminal control panel for browser actions, diagnostics, updates, filtered logs, configuration, and daemon controls. Keep the CLI and tray daemon.
+- Explicit Stable / Preview update preferences. Stable is the default; automatic installation remains a separate opt-in.
+- A shorter README and focused usage, Windows, and troubleshooting guides.
 
-Items below tagged `[contributor]` or `[needs <platform> verifier]` aren't blocked on me — they're blocked on someone who actually uses that platform stepping up. Open an issue when something breaks, send a PR when you fix it. The project will move at the speed of contributors on platforms I can't run.
+Before publishing an RC: formatting, strict lint, full tests, dependency audit, MSRV, and release builds pass on their applicable platforms. Publish it as a GitHub prerelease, with versioned installers and checksums.
 
-## V2.x — current
+Before 2.3 stable: exercise normal-user Windows installation, actual service playback, browser auto-updates, tray/startup, sleep/resume, repair/uninstall, and the TUI on real hardware. Repeat the Linux/macOS smoke checks and resolve release-blocking failures. The [Windows checklist](docs/windows.md#test-the-rc-on-a-real-pc) records the manual checks.
 
-V2 is the first Rust-rewrite release. The prior bash + Swift + Go implementation shipped as `v1.0.0` and is V1.x in retrospect. V2 ships:
+## Already available
 
-- **Single-binary cross-platform CLI + tray daemon.** One Rust executable; the same code path supports macOS (x86_64 + aarch64) and Linux (x86_64-musl).
-- **Atomic CDM publication.** Linux and macOS stage and verify a complete CDM tree before publishing it with `renameat2(RENAME_EXCHANGE)` or `renameatx_np(RENAME_SWAP)`. Linux privileged patches use exclusive, randomized snapshots under a validated same-filesystem parent and restore after write or verification failures.
-- **Browser-running detection.** Defers patches when the browser is running; retries when it quits (mtime-stable + 1h hard cap).
-- **Tray icon + native notifications.** `ksni` on Linux (StatusNotifierItem directly over D-Bus — zero GTK / libappindicator runtime dep); `tray-icon` on macOS; `notify-rust` for notifications.
-- **Mozilla manifest URL fallback chain.** `hg.mozilla.org` → GitHub mirror; both are fixed HTTPS origins. A successful response may be retained as a diagnostic snapshot, but mutable on-disk snapshots never authorize executable CDM content.
-- **Diagnostics.** `silvervine doctor` translates service error codes and
-  `--share` produces a pre-filled GitHub issue URL. `doctor --media-stack` adds
-  passive browser/CDM provenance, architecture, codec, and graphics evidence;
-  the explicit `silvervine test` command collects browser-reported EME,
-  robustness, Media Capabilities, and HDCP policy results through a bounded
-  loopback page.
-- **`silvervine repair`.** Uninstall + setup composition; preserves user config.
-- **Migration from V1.** Detects bash installs and packaged installs (AUR / .deb / .rpm) with a pkg-manager-aware uninstall hint sniffed from `/etc/os-release`. Probes `/etc/systemd/system/`, `/usr/lib/systemd/system/`, `/lib/systemd/system/`; dedupes merged-usr symlinks. See [MIGRATION.md](MIGRATION.md).
-- **Sleep/wake hooks.** `NSWorkspaceDidWakeNotification` on macOS; `org.freedesktop.login1.PrepareForSleep` on Linux.
-- **Distribution.** `cargo-dist`-driven `curl … | sh` installer + tarballs at GitHub Releases. The old Neon V1 AUR/deb sources and `homebrew-neon` tap are retired; migration remains supported. No Silvervine Homebrew tap is planned.
-- **Signature-preserving macOS installation.** Widevine is published under the
-  browser's per-user Chromium component directory, leaving the vendor
-  application bundle, signatures, and entitlements untouched.
+The CLI and tray daemon already provide verified CDM downloads, guarded publication and rollback, browser discovery, update watching, sleep/wake handling, hooks, notifications, status, repair, and passive/live media diagnostics. Diagnostics and media-stack helpers are maintenance surfaces, not a new promised feature bundle.
 
-V2.1 shipped the initial media-stack diagnostics and reliability hardening.
-The next cycle focuses on operational polish and additional distribution
-channels.
+Legacy Neon migration remains compatible throughout 2.x. Its instructions live in the [legacy guide](MIGRATION.md), outside the main install flow.
 
-## Performance budgets
+## After 2.3
 
-Performance changes are measured from optimized, stripped release builds.
-Command budgets use the median of nine warm runs; daemon budgets use a
-60-second idle window after startup.
+- Fix reproducible bugs and browser compatibility changes as evidence arrives.
+- Maintain dependencies and release security; revisit the temporary D-Bus maintenance exceptions by 2027-01-23.
+- Improve diagnostics or terminal usability where actual testing shows a useful gap.
+- Consider ARM64 Linux only with a viable CDM source and contributors able to verify it on hardware.
 
-| Surface | Linux x86_64 budget | Linux reference | macOS budget | Apple Silicon reference |
-|---|---:|---:|---:|---:|
-| Distributed executable | <= 10 MiB | 8.22 MiB musl | <= 10 MiB | 4.76 MiB arm64 / 5.50 MiB x86_64 |
-| Compressed release archive | <= 4 MiB | 2.70 MiB | <= 4 MiB | 1.77 MiB arm64 / 2.05 MiB x86_64 |
-| `--version` / `--help` | <= 25 ms | 0.68–0.73 ms | <= 50 ms | 9.54–13.50 ms |
-| List, status, or base doctor | <= 100 ms | 6.55–7.54 ms | <= 100 ms | 8.38–11.93 ms |
-| `doctor --media-stack` | <= 2 s | 487 ms | <= 3 s | 1.025 s |
-| Media-diagnostic peak RSS | <= 64 MiB | 27.5 MiB | <= 64 MiB | 25.2 MiB |
-| Idle daemon CPU / one core | <= 0.5% | 0.05% | <= 0.5% | 0.05% |
-| Idle daemon RSS | <= 64 MiB | 5.59 MiB | <= 64 MiB | 42.73 MiB |
+There are no commitments to AUR, deb, rpm, Homebrew, or other distribution channels. The existing installers and release archives remain the distribution path. HDR configuration automation and additional DRM capability detection are not planned for 2.3.
 
-The Linux command reference is an Intel Core Ultra X7 358H host; the macOS
-reference is an Apple M2 host running macOS 26.6. Absolute comparisons use the
-same host and installed browser set. The shipped-binary figures come from the
-2.1.0 cargo-dist archives; the command and daemon figures include the current
-unreleased optimizations. Reproduction steps live in
-[CONTRIBUTING.md](CONTRIBUTING.md#performance-validation).
+## Research archive
 
-## V2.2 — next
+The former bridge experiment is preserved at [archive/experimental-bridge](https://github.com/nicholasraimbault/silvervine/tree/archive/experimental-bridge). It is unsupported and excluded from releases. Silvervine does not provide L1 or a premium-streaming bypass.
 
-The next maintenance cycle is driven by production feedback and measured
-support needs.
+## Validation and versioning
 
-### Distribution channels
+[Performance budgets and historical measurements](docs/performance.md) guide regression checks. Native CI covers Linux, macOS, and Windows; real playback and desktop behavior require hardware tests. Linux maintainer testing is on Arch; other desktop environments benefit from contributor verification.
 
-- **AUR package** — `silvervine-bin` (downloads cargo-dist artifact) + `silvervine-git` (builds from source). Replaces the retired V1 `neon-drm` PKGBUILD.
-- **`.deb` package** for Debian / Ubuntu via [`cargo-deb`](https://github.com/kornelski/cargo-deb), auto-built in the cargo-dist release pipeline. `[needs Debian/Ubuntu verifier]`
-- **`.rpm` package** via `cargo-generate-rpm`. `[needs Fedora/RHEL verifier]`
-
-### Diagnostics + media-stack helpers
-
-- **Remaining media-stack work:** Wayland color-management, display HDR, and
-  deeper VideoToolbox capability checks. `[needs macOS verifier]`
-- **`silvervine configure-youtube-hdr`** — one-shot helper that flips the right flags + installs the right extension for YouTube HDR on supported configurations (Wayland + HDR display + HEVC). Linux-only at the start.
-
-### Operational improvements
-
-- **Pre-patch hooks.** Shipped in 2.2.0: `~/.config/silvervine/hooks/pre-patch` runs before each patch; non-zero exit aborts.
-- **`silvervine log` TUI viewer** — ratatui-based, over the daily-rotated logs at `~/.cache/silvervine/logs/`; filter by category, browser, time window.
-- **Schema versioning for IPC.** `"version"` field in the JSON envelope, default 0 for back-compat. Triggered by the first post-V2 schema change.
-
-
-## Experimental work
-
-The former premium-streaming experiment is not part of the release roadmap or
-release-branch build. Its code and documentation are preserved on the protected
-`experimental-bridge` branch for contributors who want to continue that research.
-The release branch remains focused on the software-only Widevine L3 helper.
-
-## Future / unscheduled
-
-Items with no release vehicle; gated on contributors or hardware I don't have.
-
-### Windows support `[contributor]`
-
-Chromium DRM mechanics on Windows are similar enough to macOS/Linux that a port is bounded:
-
-- Bundle layout: `<install>/Application/<version>/` (no `.app`).
-- Privilege escalation: `runas verb` + UAC prompt.
-- Daemon registration: Windows Service or Task Scheduler entry.
-- File watching: `ReadDirectoryChangesW` (the `notify` crate already abstracts this).
-- No `xattr` / `codesign` finalization.
-
-`tray-icon` already supports Windows; the cross-platform abstractions in `src/platform/` and `src/daemon/` will accept a third backend. The work lands when a Windows maintainer shows up — I have no Windows machine to develop or test against.
-
-### ARM64 Linux Widevine `[contributor / hardware]`
-
-V2 cuts ARM64 Linux because V1's LaCrOS-extraction approach probably never worked at runtime on Asahi / Pi. Doing it properly is two-three weeks of focused ELF patching:
-
-1. Extract Widevine from a ChromeOS LaCrOS aarch64 image.
-2. Patch relocations + symbol references against vanilla glibc (LaCrOS uses non-standard symbol versions).
-3. Patch hardcoded 4K-page assumptions for 16K-page Asahi systems.
-4. Output a patched `libwidevinecdm.so` that drops into Linux aarch64 Chromium-family browsers.
-
-This is specifically Asahi Linux + Raspberry Pi 4/5 + ARM Chromebooks running Linux. Apple Silicon Macs already work via the Darwin_arm64 CDM that Mozilla ships.
-
-## Watch list (no commitment, just monitoring)
-
-- **Wayland HDR maturity.** Once Helium / Thorium pick up first-class Wayland HDR, `silvervine configure-youtube-hdr` becomes more useful.
-- **HDCP 2.3 maturity.** Could open more Linux GPU drivers to the L1 path.
-
-## Out of scope (probably forever)
-
-- **Browser extension companion.** The Chromium sandbox prevents writing to the browser bundle from within an extension.
-- **Codec installation helpers.** Helium and Thorium ship full codec support already.
-- **Firefox / LibreWolf / Tor / Mullvad / Cromite support.** Firefox auto-downloads Widevine on x86_64; LibreWolf has a built-in toggle; Tor / Mullvad / Cromite reject DRM by design — patching them around their security model would break what their users want.
-- **Headless server / Docker image.** Silvervine needs a user session and a browser to be useful.
-- **Per-machine config sync.** XDG paths are user-local by design. Use a Syncthing share if you want this.
-- **Webhook integrations (Discord / Slack).** Out of scope for a desktop DRM helper.
-- **`silvervine://` URL handler.** Solving for use cases that don't exist.
-
-## Versioning
-
-V2 follows semantic versioning. Breaking changes to the IPC protocol bump the major version. Breaking changes to the CLI surface require a deprecation cycle (one minor with a warning, removal at the next major). CHANGELOG entries are generated from conventional commits via release-please.
-
-This document moves items between sections as they ship or get cut. Last updated: 2026-08-01.
+Stable releases follow semantic versioning. IPC breaking changes require a major version; CLI removals receive a deprecation cycle. Release notes are maintained in [CHANGELOG.md](CHANGELOG.md).
