@@ -45,6 +45,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Open the interactive Silvervine control panel.
+    Tui,
+
+    /// Manage the user-session daemon.
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
     /// Interactive first-run setup wizard.
     Init,
 
@@ -196,7 +204,20 @@ enum UpdateTarget {
         /// Confirm sidecar and install receipt without invoking the updater.
         #[arg(long)]
         dry_run: bool,
+        /// Override the configured release channel for this update only.
+        #[arg(long, value_enum)]
+        channel: Option<silvervine::config::UpdateChannel>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonAction {
+    /// Enable auto-start at login and start the daemon.
+    Enable,
+    /// Stop the daemon and disable auto-start at login.
+    Disable,
+    /// Restart a registered daemon to apply configuration changes.
+    Restart,
 }
 
 fn main() -> ExitCode {
@@ -331,6 +352,12 @@ fn report_data_migration(entries: &[silvervine::migration::DataMigrationEntry]) 
 /// Dispatch a parsed subcommand to its `cli::<name>::run` impl.
 fn dispatch(cmd: Command, output: cli::OutputOptions) -> silvervine::Result<()> {
     match cmd {
+        Command::Tui => cli::tui::run(output),
+        Command::Daemon { action } => match action {
+            DaemonAction::Enable => silvervine::daemon::lifecycle::register(),
+            DaemonAction::Disable => silvervine::daemon::lifecycle::unregister(),
+            DaemonAction::Restart => silvervine::daemon::lifecycle::restart(),
+        },
         Command::Init => cli::init::run(&cli::init::Args { output }),
         Command::Setup {
             no_daemon,
@@ -382,8 +409,13 @@ fn dispatch(cmd: Command, output: cli::OutputOptions) -> silvervine::Result<()> 
                 cdm_source,
                 output,
             }),
-            UpdateTarget::SelfUpdate { dry_run } => {
-                cli::update::run_self(&cli::update_self::SelfArgs { dry_run, output }).map(|_| ())
+            UpdateTarget::SelfUpdate { dry_run, channel } => {
+                cli::update::run_self(&cli::update_self::SelfArgs {
+                    dry_run,
+                    channel,
+                    output,
+                })
+                .map(|_| ())
             }
         },
         Command::Repair => cli::repair::run(&cli::repair::Args { output }),

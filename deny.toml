@@ -8,6 +8,7 @@ targets = [
     { triple = "x86_64-unknown-linux-musl" },
     { triple = "x86_64-apple-darwin" },
     { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-pc-windows-msvc" },
 ]
 all-features = false
 no-default-features = false
@@ -19,7 +20,16 @@ feature-depth = 1
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "warn"
-ignore = []
+# Reviewed 2026-10-23; revisit by 2027-01-23. These are maintenance notices,
+# not vulnerability exceptions. ksni 0.3.6 and notify-rust 4.x still require
+# zbus 5. The replacement types live inside zbus 6, which those upstreams
+# have not adopted. Keep all vulnerability advisories enforced.
+# https://github.com/z-galaxy/zbus/issues/2043
+ignore = [
+    { id = "RUSTSEC-2026-0370", reason = "zvariant merged into zbus 6; Linux tray/notification upstreams still use zbus 5; review by 2027-01-23" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names merged into zbus 6; Linux tray/notification upstreams still use zbus 5; review by 2027-01-23" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive merged into zbus 6; Linux tray/notification upstreams still use zbus 5; review by 2027-01-23" },
+]
 
 [licenses]
 # Allowed SPDX license identifiers. Anything outside this list fails the build.

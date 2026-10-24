@@ -663,7 +663,10 @@ fn authenticated_zip_entry_digest(
         Error::unknown_bundle_structure("authenticated ZIP entry size limit overflow")
     })?;
     let mut bounded = reader.take(read_limit);
-    let digest = download::sha512_reader(&mut bounded)?;
+    let digest = download::sha512_reader(&mut bounded).map_err(|error| {
+        Error::unknown_bundle_structure(format!("authenticated ZIP entry {name} could not be read"))
+            .with_source(error)
+    })?;
     let actual_size = read_limit - bounded.limit();
     if actual_size != expected_size {
         return Err(Error::unknown_bundle_structure(format!(
@@ -695,7 +698,7 @@ fn authenticated_payload_digests_from_zip(
         if !archive_paths.insert(rel) {
             return Err(Error::unknown_bundle_structure(format!(
                 "CRX3 contains duplicate normalized ZIP path {}",
-                entry.name()
+                entry.name().unwrap_or_default()
             )));
         }
     }

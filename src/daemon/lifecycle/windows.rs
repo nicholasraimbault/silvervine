@@ -107,10 +107,9 @@ pub(super) fn restart() -> Result<()> {
     // Only a daemon restarting itself needs delayed termination; a CLI caller
     // must remain alive to finish its update transaction and report the result.
     use std::os::windows::process::CommandExt;
-    let executable = std::env::current_exe()?;
     let pid = std::process::id().to_string();
-    Command::new(powershell_path()?).args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; if ($env:SILVERVINE_STOP_SELF -eq '1') { $p=Get-Process -Id ([int]$env:SILVERVINE_PID) -ErrorAction Stop; Start-Sleep -Seconds 2; if (-not $p.HasExited) { $p.Kill(); $p.WaitForExit() } }; Start-Process -FilePath $env:SILVERVINE_EXE -WindowStyle Hidden"])
-        .env("SILVERVINE_PID", pid).env("SILVERVINE_EXE", executable)
+    Command::new(powershell_path()?).args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; $w=New-Object -ComObject WScript.Shell; $target=$w.CreateShortcut($env:SILVERVINE_LINK).TargetPath; if ($env:SILVERVINE_STOP_SELF -eq '1') { $p=Get-Process -Id ([int]$env:SILVERVINE_PID) -ErrorAction Stop; Start-Sleep -Seconds 2; if (-not $p.HasExited) { $p.Kill(); $p.WaitForExit() } }; Start-Process -FilePath $target -WindowStyle Hidden"])
+        .env("SILVERVINE_PID", pid).env("SILVERVINE_LINK", path)
         .env("SILVERVINE_STOP_SELF", if std::env::args_os().len() == 1 { "1" } else { "0" })
         .creation_flags(0x08000000).spawn()?;
     Ok(())

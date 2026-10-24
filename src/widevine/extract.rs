@@ -265,7 +265,7 @@ fn validate_archive_metadata(archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]
         if !output_paths.insert(rel) {
             return Err(Error::unknown_bundle_structure(format!(
                 "CRX3 ZIP contains duplicate normalized output path {}",
-                entry.name()
+                entry.name().unwrap_or_default()
             )));
         }
     }
@@ -306,7 +306,7 @@ pub(super) fn extract_zip_body(zip: &[u8], out_dir: &Path) -> Result<()> {
         if !entry_is_regular_file(&entry) {
             return Err(Error::unknown_bundle_structure(format!(
                 "zip entry {} is not a regular file",
-                entry.name()
+                entry.name().unwrap_or_default()
             )));
         }
 
@@ -320,7 +320,7 @@ pub(super) fn extract_zip_body(zip: &[u8], out_dir: &Path) -> Result<()> {
             let n = entry.read(&mut buf).map_err(|e| {
                 Error::unknown_bundle_structure(format!(
                     "zip entry {} failed while streaming",
-                    entry.name()
+                    entry.name().unwrap_or_default()
                 ))
                 .with_source(e)
             })?;
@@ -331,13 +331,13 @@ pub(super) fn extract_zip_body(zip: &[u8], out_dir: &Path) -> Result<()> {
             written = written.checked_add(n_u64).ok_or_else(|| {
                 Error::unknown_bundle_structure(format!(
                     "zip entry {} expanded past the per-entry size limit",
-                    entry.name()
+                    entry.name().unwrap_or_default()
                 ))
             })?;
             if written > declared_size || written > MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES {
                 return Err(Error::unknown_bundle_structure(format!(
                     "zip entry {} expanded past its declared size limit",
-                    entry.name()
+                    entry.name().unwrap_or_default()
                 )));
             }
             written_total = written_total.checked_add(n_u64).ok_or_else(|| {
@@ -355,7 +355,7 @@ pub(super) fn extract_zip_body(zip: &[u8], out_dir: &Path) -> Result<()> {
         if written != declared_size {
             return Err(Error::unknown_bundle_structure(format!(
                 "zip entry {} expanded to {written} bytes, expected {declared_size}",
-                entry.name()
+                entry.name().unwrap_or_default()
             )));
         }
         // Preserve the executable bit on Unix — the CDM `.so`/`.dylib`
@@ -372,9 +372,14 @@ pub(super) fn extract_zip_body(zip: &[u8], out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn normalized_zip_entry_path(entry: &zip::read::ZipFile<'_>) -> Result<PathBuf> {
+pub(super) fn normalized_zip_entry_path<R: Read + ?Sized>(
+    entry: &zip::read::ZipFile<'_, R>,
+) -> Result<PathBuf> {
+    let name = entry.name().map_err(|error| {
+        Error::unknown_bundle_structure("ZIP entry name could not be decoded").with_source(error)
+    })?;
     #[cfg(windows)]
-    for segment in entry.name().split(['/', '\\']) {
+    for segment in name.split(['/', '\\']) {
         let stem = segment.split('.').next().unwrap_or("").to_ascii_uppercase();
         if segment.contains(':')
             || segment.ends_with([' ', '.']) && segment != "."
@@ -388,10 +393,12 @@ pub(super) fn normalized_zip_entry_path(entry: &zip::read::ZipFile<'_>) -> Resul
             ));
         }
     }
+    #[cfg(not(windows))]
+    let _ = name;
     let Some(enclosed) = entry.enclosed_name() else {
         return Err(Error::unknown_bundle_structure(format!(
             "zip entry {} has unsafe path",
-            entry.name()
+            entry.name().unwrap_or_default()
         )));
     };
     let mut normalized = PathBuf::new();
@@ -402,7 +409,7 @@ pub(super) fn normalized_zip_entry_path(entry: &zip::read::ZipFile<'_>) -> Resul
             _ => {
                 return Err(Error::unknown_bundle_structure(format!(
                     "zip entry {} has unsafe path",
-                    entry.name()
+                    entry.name().unwrap_or_default()
                 )));
             }
         }
@@ -410,7 +417,7 @@ pub(super) fn normalized_zip_entry_path(entry: &zip::read::ZipFile<'_>) -> Resul
     if normalized.as_os_str().is_empty() {
         return Err(Error::unknown_bundle_structure(format!(
             "zip entry {} has an empty output path",
-            entry.name()
+            entry.name().unwrap_or_default()
         )));
     }
     Ok(normalized)
@@ -418,8 +425,8 @@ pub(super) fn normalized_zip_entry_path(entry: &zip::read::ZipFile<'_>) -> Resul
 
 /// Reject unsupported entry kinds, normalize its output path, and accumulate
 /// declared uncompressed sizes.
-pub(super) fn validate_zip_entry_metadata(
-    entry: &zip::read::ZipFile<'_>,
+pub(super) fn validate_zip_entry_metadata<R: Read + ?Sized>(
+    entry: &zip::read::ZipFile<'_, R>,
     declared_total: &mut u64,
 ) -> Result<PathBuf> {
     let normalized = normalized_zip_entry_path(entry)?;
@@ -429,7 +436,7 @@ pub(super) fn validate_zip_entry_metadata(
             if file_type != 0 && file_type != UNIX_S_IFDIR {
                 return Err(Error::unknown_bundle_structure(format!(
                     "zip directory entry {} has non-directory unix mode {mode:#o}",
-                    entry.name()
+                    entry.name().unwrap_or_default()
                 )));
             }
         }
@@ -438,7 +445,7 @@ pub(super) fn validate_zip_entry_metadata(
     if !entry_is_regular_file(entry) {
         return Err(Error::unknown_bundle_structure(format!(
             "zip entry {} is a symlink or special file",
-            entry.name()
+            entry.name().unwrap_or_default()
         )));
     }
 
@@ -446,7 +453,7 @@ pub(super) fn validate_zip_entry_metadata(
     if size > MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES {
         return Err(Error::unknown_bundle_structure(format!(
             "zip entry {} declares {size} uncompressed bytes, exceeding the {MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES} byte limit",
-            entry.name()
+            entry.name().unwrap_or_default()
         )));
     }
     *declared_total = declared_total.checked_add(size).ok_or_else(|| {
@@ -463,7 +470,7 @@ pub(super) fn validate_zip_entry_metadata(
 }
 
 /// Returns true when the entry is a plain regular file (not a dir/symlink/special).
-fn entry_is_regular_file(entry: &zip::read::ZipFile<'_>) -> bool {
+fn entry_is_regular_file<R: Read + ?Sized>(entry: &zip::read::ZipFile<'_, R>) -> bool {
     if entry.is_dir() || entry.is_symlink() || !entry.is_file() {
         return false;
     }

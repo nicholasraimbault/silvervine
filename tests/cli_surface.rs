@@ -120,6 +120,28 @@ fn update_help_exposes_self_subcommand() {
 }
 
 #[test]
+fn update_channel_requires_a_known_explicit_value() {
+    let help = run_help(&["update", "self", "--help"]);
+    assert!(help.contains("--channel"));
+    assert!(help.contains("stable"));
+    assert!(help.contains("preview"));
+    assert_eq!(
+        run(&["update", "self", "--channel", "rc"]).status.code(),
+        Some(2)
+    );
+}
+
+#[test]
+fn tui_requires_a_terminal_and_exposes_daemon_controls() {
+    let help = run_help(&["--help"]);
+    assert!(help.contains("tui"));
+    assert!(run_help(&["daemon", "--help"]).contains("restart"));
+    let result = run(&["tui"]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("requires an interactive terminal"));
+}
+
+#[test]
 fn update_self_without_install_receipt_is_an_error() {
     let dir = TempDir::new().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_silvervine"))

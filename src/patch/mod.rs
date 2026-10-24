@@ -805,20 +805,7 @@ fn run_patch(
 
     // The locked parent performs process inspection once. The elevated child
     // remains filesystem-only and never probes another account's session.
-    if !options.as_root
-        && (cfg!(windows) || !options.force_while_running)
-        && processes.is_some_and(|snapshot| snapshot.is_running(browser))
-    {
-        return Err(Error::browser_running(format!(
-            "{} is currently running; {}",
-            browser.name(),
-            if cfg!(windows) {
-                "close it before updating Local State"
-            } else {
-                "close it first or use --force-while-running"
-            }
-        )));
-    }
+    require_closed_browser(browser, options, processes)?;
 
     let running_as_root = platform::is_running_as_root();
     let version_before = if options.as_root || running_as_root {
@@ -911,6 +898,28 @@ fn run_patch(
         duration: started.elapsed(),
         dry_run: false,
     })
+}
+
+fn require_closed_browser(
+    browser: &Browser,
+    options: &PatchOptions,
+    processes: Option<&discovery::ProcessSnapshot>,
+) -> Result<()> {
+    if !options.as_root
+        && (cfg!(windows) || !options.force_while_running)
+        && processes.is_some_and(|snapshot| snapshot.is_running(browser))
+    {
+        let action = if cfg!(windows) {
+            "close it before updating Local State"
+        } else {
+            "close it first or use --force-while-running"
+        };
+        return Err(Error::browser_running(format!(
+            "{} is currently running; {action}",
+            browser.name()
+        )));
+    }
+    Ok(())
 }
 
 fn stage_direct_root_payload(
@@ -1251,17 +1260,15 @@ fn run_patch_via_escalation(
 
     if !synthetic_noop {
         let target = patcher.cdm_target_for_candidate(browser.install_path(), cdm.version())?;
-        let _installed = ownership::validate_installed_cdm(&target).map_err(|error| {
+        let installed = ownership::validate_installed_cdm(&target).map_err(|error| {
             Error::invalid_marker(format!(
                 "elevated patch exited successfully but installed CDM validation failed: {error}"
             ))
         })?;
         #[cfg(target_os = "linux")]
-        let expected_payload = _installed.marker() == marker;
-        #[cfg(target_os = "macos")]
-        let expected_payload = _installed.matches_candidate(marker);
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let expected_payload = false;
+        let expected_payload = installed.marker() == marker;
+        #[cfg(not(target_os = "linux"))]
+        let expected_payload = installed.matches_candidate(marker);
         if !expected_payload {
             return Err(Error::invalid_marker(
                 "elevated patch installed a different CDM identity than the parent authorized",

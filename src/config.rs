@@ -135,9 +135,40 @@ pub struct HooksConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UpdatesConfig {
-    /// When `true`, the daemon applies the latest stable GitHub release via
+    /// Release channel. Preview releases require an explicit opt-in.
+    pub channel: UpdateChannel,
+    /// When `true`, the daemon applies eligible GitHub releases via
     /// the cargo-dist sidecar. Default: `false` (prompted `update self` only).
     pub auto_apply: bool,
+}
+
+/// Releases eligible for Silvervine self-updates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    /// Published stable releases only.
+    #[default]
+    Stable,
+    /// Published stable releases and prereleases.
+    Preview,
+}
+
+impl UpdateChannel {
+    /// Stable configuration and display token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Preview => "preview",
+        }
+    }
+
+    pub(crate) const fn sidecar_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Stable => &[],
+            Self::Preview => &["--prerelease"],
+        }
+    }
 }
 
 /// Top-level sections from older config schemas that should be silently
@@ -376,6 +407,19 @@ post_update = "~/.config/silvervine/hooks/post-update"
     fn parses_updates_auto_apply() {
         let cfg = Config::from_toml_str("[updates]\nauto_apply = true").expect("parses");
         assert!(cfg.updates.auto_apply);
+        assert_eq!(cfg.updates.channel, UpdateChannel::Stable);
+    }
+
+    #[test]
+    fn preview_is_explicit_and_independent_of_automatic_installation() {
+        let preview = Config::from_toml_str("[updates]\nchannel = 'preview'").unwrap();
+        assert_eq!(preview.updates.channel, UpdateChannel::Preview);
+        assert!(!preview.updates.auto_apply);
+        assert_eq!(
+            Config::from_toml_str("").unwrap().updates.channel,
+            UpdateChannel::Stable
+        );
+        assert!(Config::from_toml_str("[updates]\nchannel = 'rc'").is_err());
     }
 
     #[test]

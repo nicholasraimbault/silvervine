@@ -490,8 +490,15 @@ fn run_auto_apply_once() {
         );
         return;
     };
-    let enabled = load_config().is_ok_and(|config| config.updates.auto_apply);
-    match crate::cli::update_self::auto_apply(enabled, &lock, None, None, lifecycle::restart) {
+    let Ok(config) = load_config() else { return };
+    match crate::cli::update_self::auto_apply_with_channel(
+        config.updates.auto_apply,
+        config.updates.channel,
+        &lock,
+        None,
+        None,
+        lifecycle::restart,
+    ) {
         Ok(crate::cli::update_self::AutoApplyOutcome::Updated { latest_version }) => {
             tracing::info!(
                 target: "silvervine::daemon",

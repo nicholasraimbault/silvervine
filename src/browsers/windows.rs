@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use super::{Browser, BrowserKind};
 
 /// Explicit profile selected for this custom installation, never inferred from a fork name.
+///
+/// # Errors
+/// Returns invalid configuration and installation-path errors.
 pub fn configured_user_data_dir(install: &Path) -> crate::error::Result<Option<PathBuf>> {
     let config = crate::config::load_config()?;
     let install = std::fs::canonicalize(install).map_err(crate::Error::from)?;
@@ -23,6 +26,9 @@ pub fn configured_user_data_dir(install: &Path) -> crate::error::Result<Option<P
 }
 
 /// Resolve the profile root used by patching, probes, and diagnostics.
+///
+/// # Errors
+/// Returns configuration, product-identity, or profile-path errors.
 #[cfg(windows)]
 pub fn profile_dir(application: &Path) -> crate::error::Result<PathBuf> {
     if let Some(profile) = configured_user_data_dir(application)? {
@@ -52,12 +58,14 @@ pub fn profile_dir(application: &Path) -> crate::error::Result<PathBuf> {
 }
 
 /// Product identity from the executable's version resource, not its filename.
+#[must_use]
 #[cfg(windows)]
 pub fn product_name(executable: &Path) -> Option<String> {
     version_resource(executable, "ProductName")
 }
 
 /// Passive browser version for flat portable and installed executables.
+#[must_use]
 #[cfg(windows)]
 pub fn product_version(executable: &Path) -> Option<String> {
     version_resource(executable, "ProductVersion").filter(|version| !version.is_empty())
@@ -156,6 +164,7 @@ fn regular(path: &Path) -> bool {
 }
 
 /// Resolve only browser-shaped executable names; never search PATH or launch them.
+#[must_use]
 pub fn executable(install: &Path) -> Option<PathBuf> {
     ["helium.exe", "thorium.exe", "chromium.exe", "chrome.exe"]
         .into_iter()
@@ -173,6 +182,7 @@ fn version_parts(name: &str) -> Option<Vec<u32>> {
 }
 
 /// Highest numeric installed browser version containing Chromium's main DLL.
+#[must_use]
 pub fn version_directory(install: &Path) -> Option<PathBuf> {
     std::fs::read_dir(install)
         .ok()?
@@ -192,6 +202,7 @@ fn browser_layout(install: &Path) -> bool {
 }
 
 /// Custom entries accept an executable, an Application directory, or its parent.
+#[must_use]
 pub fn resolve_install(path: &Path) -> Option<PathBuf> {
     if !path.is_absolute() {
         return None;

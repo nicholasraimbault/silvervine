@@ -14,7 +14,11 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use crate::cli::OutputOptions;
+use crate::config::UpdateChannel;
 use crate::error::{Error, Result};
+
+#[cfg(windows)]
+mod windows;
 
 /// Env var that, when set, makes [`run`] return a no-op outcome.
 pub const NOOP_ENV: &str = "SILVERVINE_TEST_SELF_UPDATE_NOOP";
@@ -28,12 +32,13 @@ const MISSING_SIDECAR: &str =
     "silvervine-update sidecar not installed; re-run the GitHub installer";
 const MISSING_RECEIPT: &str =
     "install receipt not found; re-run the GitHub installer to obtain a cargo-dist receipt";
-const RESTART_NOTE: &str =
-    "Restart the user daemon (systemd user unit or LaunchAgent) to load the new binary.";
+const RESTART_NOTE: &str = "Restart the user daemon to load the new binary.";
 
 /// Args for `silvervine update self`.
 #[derive(Debug, Clone, Default)]
 pub struct SelfArgs {
+    /// One-time override; otherwise use the configured update channel.
+    pub channel: Option<UpdateChannel>,
     /// `--dry-run`: confirm sidecar + receipt without invoking the updater.
     pub dry_run: bool,
     /// Output flags.
@@ -61,9 +66,18 @@ pub struct SelfUpdateOutcome {
 /// * `Other` if the install receipt is missing.
 /// * `Other` if the sidecar cannot be started or exits non-zero.
 pub fn run(args: &SelfArgs) -> Result<SelfUpdateOutcome> {
+    let mut args = args.clone();
+    if args.channel.is_none() {
+        args.channel = Some(crate::config::load_config()?.updates.channel);
+    }
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    run_with(args, None, None, &mut handle)
+    let outcome = run_with(&args, None, None, &mut handle)?;
+    #[cfg(windows)]
+    if outcome.updated {
+        crate::daemon::lifecycle::restart()?;
+    }
+    Ok(outcome)
 }
 
 fn run_with(
@@ -105,7 +119,7 @@ fn run_with(
         return Ok(outcome);
     }
 
-    let captured = invoke_sidecar(&sidecar)?;
+    let captured = invoke_sidecar(&sidecar, args.channel.unwrap_or_default())?;
     let outcome = outcome_from_sidecar(&captured);
     render(args, &outcome, &captured, out)?;
     Ok(outcome)
@@ -145,11 +159,33 @@ pub fn auto_apply(
     receipt: Option<&Path>,
     restart: impl FnOnce() -> Result<()>,
 ) -> Result<AutoApplyOutcome> {
+    auto_apply_with_channel(
+        enabled,
+        UpdateChannel::Stable,
+        patch_lock,
+        sidecar,
+        receipt,
+        restart,
+    )
+}
+
+/// Apply eligible updates using an explicitly selected release channel.
+///
+/// # Errors
+/// Returns patch-lock, sidecar, or daemon-restart errors.
+pub fn auto_apply_with_channel(
+    enabled: bool,
+    channel: UpdateChannel,
+    patch_lock: &Path,
+    sidecar: Option<&Path>,
+    receipt: Option<&Path>,
+    restart: impl FnOnce() -> Result<()>,
+) -> Result<AutoApplyOutcome> {
     if !enabled {
         return Ok(AutoApplyOutcome::Disabled);
     }
     match crate::lockfile::try_with_lock(patch_lock, || {
-        apply_under_lock(sidecar, receipt, restart)
+        apply_under_lock(sidecar, receipt, channel, restart)
     })? {
         None => Ok(AutoApplyOutcome::PatchInProgress),
         Some(outcome) => Ok(outcome),
@@ -159,6 +195,7 @@ pub fn auto_apply(
 fn apply_under_lock(
     sidecar: Option<&Path>,
     receipt: Option<&Path>,
+    channel: UpdateChannel,
     restart: impl FnOnce() -> Result<()>,
 ) -> Result<AutoApplyOutcome> {
     let sidecar_path = match sidecar {
@@ -179,6 +216,7 @@ fn apply_under_lock(
         return Ok(AutoApplyOutcome::SkippedMissingInstall);
     }
     let args = SelfArgs {
+        channel: Some(channel),
         output: OutputOptions {
             quiet: true,
             ..OutputOptions::default()
@@ -223,13 +261,37 @@ fn receipt_path() -> PathBuf {
     let config_home = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
-        .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
+        .or_else(default_receipt_home)
         .unwrap_or_else(|| PathBuf::from(".config"));
     config_home.join("silvervine").join(RECEIPT_NAME)
 }
 
-fn invoke_sidecar(sidecar: &Path) -> Result<String> {
-    let output = spawn_sidecar(sidecar)?;
+fn default_receipt_home() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        dirs::data_local_dir()
+    }
+    #[cfg(not(windows))]
+    {
+        dirs::home_dir().map(|home| home.join(".config"))
+    }
+}
+
+fn invoke_sidecar(sidecar: &Path, channel: UpdateChannel) -> Result<String> {
+    #[cfg(windows)]
+    let executable = windows::ExecutableSwap::prepare()?;
+    let result = capture_sidecar(sidecar, channel);
+    #[cfg(windows)]
+    executable.finish(
+        result
+            .as_ref()
+            .is_ok_and(|text| sidecar_performed_install(text)),
+    )?;
+    result
+}
+
+fn capture_sidecar(sidecar: &Path, channel: UpdateChannel) -> Result<String> {
+    let output = spawn_sidecar(sidecar, channel)?;
     let captured = combine_captured(&output.stdout, &output.stderr);
     if output.status.success() {
         Ok(captured)
@@ -247,13 +309,13 @@ fn invoke_sidecar(sidecar: &Path) -> Result<String> {
     }
 }
 
-fn spawn_sidecar(sidecar: &Path) -> Result<Output> {
+fn spawn_sidecar(sidecar: &Path, channel: UpdateChannel) -> Result<Output> {
     let mut last_error = None;
     for delay_ms in [0_u64, 1, 2, 5, 10, 20, 50] {
         if delay_ms > 0 {
             std::thread::sleep(Duration::from_millis(delay_ms));
         }
-        match Command::new(sidecar).output() {
+        match Command::new(sidecar).args(channel.sidecar_args()).output() {
             Ok(output) => return Ok(output),
             Err(error) if is_etxtbsy(&error) => last_error = Some(error),
             Err(error) => {
@@ -415,7 +477,8 @@ mod tests {
             drop(hold);
             sidecar_for_thread
         });
-        let captured = super::invoke_sidecar(&sidecar).expect("retry past ETXTBSY");
+        let captured =
+            super::invoke_sidecar(&sidecar, UpdateChannel::Stable).expect("retry past ETXTBSY");
         worker.join().unwrap();
         assert!(captured.contains("ok"), "captured: {captured:?}");
     }
@@ -744,6 +807,56 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, AutoApplyOutcome::Disabled);
         assert_eq!(restarts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn stable_updates_skip_rcs_and_preview_updates_opt_in() {
+        let _iso = isolate_self_update();
+        let tmp = TempDir::new().unwrap();
+        // This sidecar fixture offers a newer RC only when explicitly asked.
+        let (sidecar, receipt) = seeded(&tmp,
+            "#!/bin/sh\nif [ \"$#\" = 0 ]; then echo 'Already up to date; not upgrading'; elif [ \"$#\" = 1 ] && [ \"$1\" = '--prerelease' ]; then echo 'New release 2.3.0-rc.2 installed!'; else exit 9; fi\n");
+        for (channel, expected_updated) in [
+            (UpdateChannel::Stable, false),
+            (UpdateChannel::Preview, true),
+        ] {
+            let mut request = args();
+            request.channel = Some(channel);
+            let outcome =
+                run_with(&request, Some(&sidecar), Some(&receipt), &mut Vec::new()).unwrap();
+            assert_eq!(outcome.updated, expected_updated);
+            if expected_updated {
+                assert_eq!(outcome.latest_version, "2.3.0-rc.2");
+            }
+        }
+    }
+
+    #[test]
+    fn preview_auto_apply_and_manual_updates_use_the_same_channel() {
+        let _iso = isolate_self_update();
+        let tmp = TempDir::new().unwrap();
+        let (sidecar, receipt) = seeded(&tmp,
+            "#!/bin/sh\n[ \"$1\" = '--prerelease' ] || exit 9\necho 'New release 2.3.0 installed!'\n");
+        let mut restarted = false;
+        let outcome = auto_apply_with_channel(
+            true,
+            UpdateChannel::Preview,
+            &tmp.path().join("patch.lock"),
+            Some(&sidecar),
+            Some(&receipt),
+            || {
+                restarted = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(restarted);
+        assert_eq!(
+            outcome,
+            AutoApplyOutcome::Updated {
+                latest_version: "2.3.0".into()
+            }
+        );
     }
 
     #[test]

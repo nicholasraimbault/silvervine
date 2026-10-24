@@ -1,6 +1,6 @@
 [package]
 name = "silvervine"
-version = "2.2.1"
+version = "2.3.0-rc.1"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Nicholas Raimbault <nraimbault16@gmail.com>"]
@@ -45,7 +45,7 @@ sha2 = "0.11"
 ring = "0.17"
 # CRX3 ZIP body extraction. Select only flate2-based deflate decoding;
 # zip's umbrella `deflate` feature also enables the unused Zopfli encoder.
-zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Process scanning for browser-running detection.
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
@@ -90,9 +90,8 @@ notify = "8"
 # stdin isn't a TTY (we explicit-check `is_terminal()` at the call sites
 # anyway so we can switch to defaults without prompting).
 dialoguer = { version = "0.12", default-features = false }
-# Cross-platform terminal control for `silvervine status --watch`. We use only
-# the cursor + clear primitives; no async event polling needed.
-crossterm = { version = "0.29", default-features = false, features = ["windows"] }
+# Terminal rendering and keyboard events for `tui` and `status --watch`.
+crossterm = { version = "0.29", default-features = false, features = ["events", "windows"] }
 # Shell completion script generation for `silvervine completion <shell>`.
 clap_complete = "4.6"
 # Man-page generation for `silvervine manpage`.
@@ -194,9 +193,9 @@ ci = "github"
 # does not publish to crates.io; the first crates.io publish is an explicit,
 # separately validated release step. The obsolete V1 Homebrew tap remains
 # retired rather than being reused for the renamed product.
-installers = ["shell"]
+installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-musl"]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-musl", "x86_64-pc-windows-msvc"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Whether to install an updater program
