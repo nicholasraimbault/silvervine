@@ -56,6 +56,7 @@ pub mod repair;
 pub mod setup;
 pub mod status;
 pub mod test;
+pub mod tui;
 pub mod uninstall;
 pub mod update;
 pub mod update_self;

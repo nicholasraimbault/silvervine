@@ -96,7 +96,7 @@ where
             let _ = FileExt::unlock(&file);
             Ok(Some(result))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => Ok(None),
         Err(e) => Err(
             Error::other(format!("try_lock_exclusive on {} failed", path.display())).with_source(e),
         ),

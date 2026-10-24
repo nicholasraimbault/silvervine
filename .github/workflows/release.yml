@@ -2,7 +2,7 @@
 # hardening applied by hand:
 # - default contents: read; only the final publish job may write releases
 # - plan is non-mutating (`dist plan`) so it never needs repository-write
-# - tag publishes gate on exact-SHA quality checks + all three ship targets
+# - tag publishes gate on exact-SHA quality checks + all four ship targets
 # - third-party actions pinned to full commit SHAs
 # - concurrency blocks duplicate publishes for the same ref (never cancel mid-flight)
 # - `v*` tag creation is maintainer-only; updates/deletions have no bypass
@@ -35,6 +35,7 @@ env:
   RUST_TOOLCHAIN: "1.96.0"
   CARGO_DIST_VERSION: "0.31.0"
   CARGO_DIST_INSTALLER_SHA256: e79d87e418b9d2cbe992d014985457c28a5a7c553add3da4ed1047e161c928f4
+  CARGO_DIST_POWERSHELL_SHA256: ffec5b52cfbe29465d831150b01f8a254668fc271e5102fab7aea7da5d51ec69
 
 # Don't let two publishes for the same tag race. Never cancel an in-flight
 # publish mid-upload (cancel-in-progress: false).
@@ -125,7 +126,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-14]
+        os: [ubuntu-22.04, macos-14, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -149,7 +150,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-14]
+        os: [ubuntu-22.04, macos-14, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -244,6 +245,8 @@ jobs:
             runner: macos-14
           - target: x86_64-apple-darwin
             runner: macos-15-intel
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-22.04
             packages: musl-tools
@@ -309,7 +312,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ join(matrix.targets, ',') }}
-      - name: Install checksum-pinned dist
+      - name: Install checksum-pinned dist (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           installer="$RUNNER_TEMP/cargo-dist-installer.sh"
@@ -318,6 +322,15 @@ jobs:
             "https://github.com/axodotdev/cargo-dist/releases/download/v${CARGO_DIST_VERSION}/cargo-dist-installer.sh"
           echo "${CARGO_DIST_INSTALLER_SHA256}  ${installer}" | shasum -a 256 --check
           sh "$installer"
+      - name: Install checksum-pinned dist (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'cargo-dist-installer.ps1'
+          Invoke-WebRequest "https://github.com/axodotdev/cargo-dist/releases/download/v$env:CARGO_DIST_VERSION/cargo-dist-installer.ps1" -OutFile $installer
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:CARGO_DIST_POWERSHELL_SHA256) { throw 'cargo-dist installer checksum mismatch' }
+          & $installer
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2

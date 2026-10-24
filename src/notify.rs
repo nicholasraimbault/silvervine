@@ -135,7 +135,7 @@ fn dispatch(summary: &str, body: &str, kind: NotificationKind) {
     }
 }
 
-/// Send a notification via `notify-rust`.
+/// Send a native notification via `notify-rust` (including Windows toast notifications).
 #[allow(unused_variables)] // `kind` only consumed on Linux
 fn send_native(
     summary: &str,

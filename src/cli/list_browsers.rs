@@ -64,14 +64,24 @@ pub fn build_entries(detected: &[Browser], os: Option<browsers::Os>, all: bool) 
         if let Some(os) = os {
             // Add known browsers not in `detected` (i.e. ones whose paths
             // don't currently exist on disk).
-            let known = match os {
-                browsers::Os::Linux => browsers::KNOWN_LINUX,
-                browsers::Os::Macos => browsers::KNOWN_MACOS,
+            let known: Vec<&str> = match os {
+                browsers::Os::Linux => browsers::KNOWN_LINUX
+                    .iter()
+                    .map(|browser| browser.name)
+                    .collect(),
+                browsers::Os::Macos => browsers::KNOWN_MACOS
+                    .iter()
+                    .map(|browser| browser.name)
+                    .collect(),
+                browsers::Os::Windows => browsers::windows::KNOWN_WINDOWS
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect(),
             };
-            for k in known {
-                if !entries.iter().any(|e| e.name == k.name) {
+            for name in known {
+                if !entries.iter().any(|e| e.name == name) {
                     entries.push(ListEntry {
-                        name: k.name.to_string(),
+                        name: name.to_string(),
                         install_path: None,
                         source: "known".into(),
                         installed: false,

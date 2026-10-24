@@ -1,4 +1,6 @@
-# Migrating from Neon to Silvervine
+# Legacy Neon migration
+
+This guide is for old Neon installations. Current Silvervine users do not need a migration step for 2.3; install/update normally. Legacy compatibility remains supported throughout Silvervine 2.x.
 
 Silvervine 2.0 is the renamed Rust successor to Neon. It preserves migration support for both the original Neon V1 Bash/Swift/Go distributions and Neon V2 release candidates. New commands, paths, registrations, and package names use `silvervine`.
 

@@ -144,6 +144,11 @@ fn noop_enabled() -> bool {
     std::env::var_os(NOOP_ENV).is_some()
 }
 
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows as imp;
+
 #[cfg(target_os = "linux")]
 mod linux;
 
@@ -156,7 +161,7 @@ use linux as imp;
 #[cfg(target_os = "macos")]
 use macos as imp;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod imp {
     //! Stub for unsupported platforms.
 

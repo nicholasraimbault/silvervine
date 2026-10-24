@@ -120,6 +120,7 @@ pub fn run(args: &Args) -> Result<()> {
 mod tests {
     use super::*;
     use crate::browsers::BrowserKind;
+    #[cfg(unix)]
     use std::fs;
     use tempfile::TempDir;
 

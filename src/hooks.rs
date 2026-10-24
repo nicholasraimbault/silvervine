@@ -341,7 +341,7 @@ fn resolve_hook_path(name: &str, config: &Config) -> Option<PathBuf> {
         return Some(p);
     }
     // 2. Default: <platform-config-dir>/silvervine/hooks/<name>
-    let cfg = dirs::config_dir()?;
+    let cfg = crate::platform::config_home()?;
     Some(cfg.join("silvervine").join("hooks").join(name))
 }
 
@@ -370,7 +370,7 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::test_support::{default_hook_path, write_executable_script, ScopedEnv};

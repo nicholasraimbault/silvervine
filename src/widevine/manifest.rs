@@ -177,10 +177,7 @@ pub enum PlatformEntry {
     },
 }
 
-/// Platforms Silvervine supports in V1.
-///
-/// V1 explicitly excludes Windows (planned V2) and ARM64 Linux (cut for
-/// V1 — see spec non-goals).
+/// Platforms supported by Silvervine's authenticated CDM acquisition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
     /// `Linux_x86_64-gcc3`.
@@ -189,6 +186,8 @@ pub enum Platform {
     DarwinAarch64,
     /// `Darwin_x86_64-gcc3-u-i386-x86_64` (Intel Mac).
     DarwinX86_64,
+    /// `WINNT_x86_64-msvc` (Windows x64).
+    WindowsX86_64,
 }
 
 impl Platform {
@@ -199,6 +198,7 @@ impl Platform {
             Self::LinuxX86_64 => "Linux_x86_64-gcc3",
             Self::DarwinAarch64 => "Darwin_aarch64-gcc3",
             Self::DarwinX86_64 => "Darwin_x86_64-gcc3-u-i386-x86_64",
+            Self::WindowsX86_64 => "WINNT_x86_64-msvc",
         }
     }
 }
@@ -208,7 +208,7 @@ impl Platform {
 /// # Errors
 ///
 /// Returns [`ErrorCategory::UnsupportedPlatform`] if the OS/arch combination
-/// isn't in V1's support matrix.
+/// isn't in the supported platform matrix.
 // `clippy::needless_return` fires on the cfg-guarded early returns, but
 // they're load-bearing: each `cfg` block compiles into the binary
 // independently and falls through to the next branch only when the
@@ -228,10 +228,15 @@ pub fn current_platform_key() -> Result<Platform> {
     {
         return Ok(Platform::DarwinX86_64);
     }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        return Ok(Platform::WindowsX86_64);
+    }
     #[cfg(not(any(
         all(target_os = "linux", target_arch = "x86_64"),
         all(target_os = "macos", target_arch = "aarch64"),
         all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86_64"),
     )))]
     {
         Err(Error::unsupported_platform(format!(
@@ -323,10 +328,10 @@ fn default_urls() -> Vec<Url> {
 
 /// Compute the path for the best-effort manifest diagnostic snapshot.
 ///
-/// Returns `None` if `dirs::cache_dir()` cannot be resolved.
+/// Returns `None` if `crate::platform::cache_home()` cannot be resolved.
 #[must_use]
 pub fn cached_manifest_path() -> Option<PathBuf> {
-    let cache = dirs::cache_dir()?;
+    let cache = crate::platform::cache_home()?;
     Some(cache.join("silvervine").join("last-manifest.json"))
 }
 
@@ -514,6 +519,30 @@ mod tests {
     }
 
     #[test]
+    fn windows_x64_resolves_the_authenticated_manifest_entry() {
+        let manifest = parse_manifest(&fixture_bytes()).expect("fixture");
+        let entry = manifest
+            .resolve_platform(Platform::WindowsX86_64)
+            .expect("Windows x64");
+        let PlatformEntry::Concrete {
+            file_url,
+            hash_value,
+            ..
+        } = entry
+        else {
+            panic!("Windows x64 must resolve to a concrete download");
+        };
+        assert!(file_url.contains("_win64_"));
+        assert_eq!(hash_value.len(), 128);
+        assert!(std::ptr::eq(
+            entry,
+            manifest
+                .resolve_platform_key("WINNT_x86_64-msvc-x64")
+                .expect("alias")
+        ));
+    }
+
+    #[test]
     fn parses_real_manifest_fixture() {
         let manifest = parse_manifest(&fixture_bytes()).expect("fixture parses");
         let vendor = manifest.widevine().expect("has gmp-widevinecdm");
@@ -662,7 +691,7 @@ mod tests {
                 path.display()
             );
         }
-        // If `dirs::cache_dir()` returned None (no HOME), we just don't
+        // If `crate::platform::cache_home()` returned None (no HOME), we just don't
         // assert anything — that's a valid environment for the binary.
     }
 
@@ -694,6 +723,7 @@ mod tests {
     #[test]
     fn platform_as_str_is_stable() {
         assert_eq!(Platform::LinuxX86_64.as_str(), "Linux_x86_64-gcc3");
+        assert_eq!(Platform::WindowsX86_64.as_str(), "WINNT_x86_64-msvc");
         assert_eq!(Platform::DarwinAarch64.as_str(), "Darwin_aarch64-gcc3");
         assert_eq!(
             Platform::DarwinX86_64.as_str(),

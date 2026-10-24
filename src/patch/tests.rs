@@ -48,6 +48,8 @@ fn test_platform_dir() -> &'static str {
         } else {
             "mac_x64"
         }
+    } else if cfg!(windows) {
+        "win_x64"
     } else {
         "linux_x64"
     }
@@ -56,6 +58,8 @@ fn test_platform_dir() -> &'static str {
 fn test_library_name() -> &'static str {
     if cfg!(target_os = "macos") {
         "libwidevinecdm.dylib"
+    } else if cfg!(windows) {
+        "widevinecdm.dll"
     } else {
         "libwidevinecdm.so"
     }
@@ -199,7 +203,9 @@ fn transactional_patcher_must_override_authorized_publication() {
     assert!(!target.exists());
 }
 
+#[cfg(unix)]
 struct MutatingUnknownBundleMock;
+#[cfg(unix)]
 impl PlatformPatcher for MutatingUnknownBundleMock {
     fn write_cdm(&self, target: &Path, _source: &Path) -> Result<()> {
         fs::write(target.join("partial-write"), b"damaged").map_err(Error::from)?;
@@ -246,7 +252,9 @@ impl PlatformPatcher for PartialFailMock {
     }
 }
 
+#[cfg(unix)]
 struct MarkerPoisonMock;
+#[cfg(unix)]
 impl PlatformPatcher for MarkerPoisonMock {
     fn write_cdm(&self, target: &Path, source: &Path) -> Result<()> {
         MockPatcher::default().write_cdm(target, source)?;
@@ -266,8 +274,10 @@ impl PlatformPatcher for MarkerPoisonMock {
         None
     }
 }
+#[cfg(unix)]
 struct FinalizeMutationMock;
 
+#[cfg(unix)]
 impl PlatformPatcher for FinalizeMutationMock {
     fn write_cdm(&self, target: &Path, source: &Path) -> Result<()> {
         MockPatcher::default().write_cdm(target, source)
@@ -410,6 +420,7 @@ fn explicit_targeted_replacement_preserves_an_invalid_marker() {
 }
 
 #[test]
+#[cfg(unix)]
 fn marker_commit_failure_rolls_back_the_browser_snapshot() {
     let tmp = TempDir::new().expect("tempdir");
     let install = tmp.path().join("install");
@@ -434,6 +445,7 @@ fn marker_commit_failure_rolls_back_the_browser_snapshot() {
     assert!(!install.join("WidevineCdm").exists());
 }
 #[test]
+#[cfg(unix)]
 fn finalizer_payload_mutation_rolls_back_before_commit() {
     let tmp = TempDir::new().expect("tempdir");
     let install = tmp.path().join("install");
@@ -480,6 +492,7 @@ fn dry_run_does_not_invoke_write_or_verify() {
 }
 
 #[test]
+#[cfg(unix)]
 fn write_failure_restores_from_snapshot() {
     let tmp = TempDir::new().expect("tempdir");
     let install = tmp.path().join("install");
@@ -513,6 +526,7 @@ fn write_failure_restores_from_snapshot() {
 }
 
 #[test]
+#[cfg(unix)]
 fn unknown_bundle_write_failure_still_restores_snapshot() {
     let tmp = TempDir::new().expect("tempdir");
     let install = tmp.path().join("install");
@@ -539,6 +553,7 @@ fn unknown_bundle_write_failure_still_restores_snapshot() {
 }
 
 #[test]
+#[cfg(unix)]
 fn verify_failure_restores_from_snapshot() {
     let tmp = TempDir::new().expect("tempdir");
     let install = tmp.path().join("install");
@@ -669,7 +684,7 @@ fn default_patch_lock_path_resolves_to_silvervine_subdir() {
 #[test]
 fn host_patcher_returns_ok_on_supported_host() {
     let r = host_patcher();
-    if cfg!(any(target_os = "linux", target_os = "macos")) {
+    if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
         assert!(r.is_ok());
     } else {
         assert!(r.is_err());
@@ -809,6 +824,7 @@ fn take_snapshot_prefers_explicit_backups_dir_over_as_root_default() {
 /// When `as_root` is set and no `backups_dir` is provided, the snapshot
 /// uses an exclusively-created random sibling under `<install-parent>` so
 /// `atomic_rename` rollback works on a single filesystem.
+#[cfg(unix)]
 #[test]
 fn take_snapshot_uses_sibling_when_as_root_and_no_override() {
     let tmp = TempDir::new().expect("tempdir");
@@ -1001,6 +1017,7 @@ fn run_patch_escalates_when_install_path_is_not_writable() {
 /// and proceeds normally — the elevated child trusts that it has
 /// permission already.
 #[test]
+#[cfg(unix)]
 fn privileged_handoff_carries_exact_parent_selection() {
     let tmp = TempDir::new().unwrap();
     let root = canonical_fixture_root(tmp.path());
@@ -1049,6 +1066,7 @@ fn privileged_handoff_carries_exact_parent_selection() {
 }
 
 #[test]
+#[cfg(unix)]
 fn privileged_handoff_preserves_known_browser_kind_token() {
     let tmp = TempDir::new().unwrap();
     let root = canonical_fixture_root(tmp.path());
@@ -1167,7 +1185,13 @@ fn patch_batch_refreshes_processes_before_each_browser() {
         if capture == 0 {
             discovery::ProcessSnapshot::from_executables([])
         } else {
-            discovery::ProcessSnapshot::from_executables([thorium.install_path().join("thorium")])
+            discovery::ProcessSnapshot::from_executables([thorium.install_path().join(
+                if cfg!(windows) {
+                    "thorium.exe"
+                } else {
+                    "thorium"
+                },
+            )])
         }
     });
 

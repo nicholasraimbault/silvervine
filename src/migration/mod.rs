@@ -359,7 +359,12 @@ fn preflight_pairs(pairs: &[(&'static str, PathBuf, PathBuf)]) -> Result<()> {
     Ok(())
 }
 
+// Keep the fallible transport-check contract on platforms without Unix sockets.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 fn refuse_connectable_legacy_socket(paths: &DataMigrationPaths) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = paths;
+    #[cfg(unix)]
     let socket = paths.cache.0.join("daemon.sock");
     #[cfg(unix)]
     if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
@@ -501,7 +506,13 @@ fn no_replace_rename(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn no_replace_rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    // Windows directory rename refuses an existing destination.
+    std::fs::rename(from, to)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn no_replace_rename(_from: &Path, _to: &Path) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
@@ -1226,5 +1237,5 @@ fn remove_path(path: &Path) -> std::io::Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;

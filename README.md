@@ -2,104 +2,77 @@
 
 [![CI](https://github.com/nicholasraimbault/silvervine/actions/workflows/ci.yml/badge.svg)](https://github.com/nicholasraimbault/silvervine/actions/workflows/ci.yml)
 
-Silvervine installs and maintains Widevine L3 for compatible Chromium-family browsers that do not bundle it, enabling DRM-protected media on Linux and macOS.
+Silvervine installs and maintains Widevine for Chromium-family browsers that do not bundle it. It runs on Linux and macOS, with Windows x64 joining in the **2.3 preview**.
+
+Close your browser, run setup once, and the user-session tray daemon keeps Widevine in place after browser updates. Silvervine supports software-only Widevine L3; streaming services decide playback quality and access.
 
 ## Install
+
+Stable release for Linux x64 and macOS (Intel or Apple Silicon):
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/nicholasraimbault/silvervine/releases/latest/download/silvervine-installer.sh | sh
 silvervine setup
+silvervine status
 ```
 
-The installer places `silvervine` in `$CARGO_HOME/bin` (usually `~/.cargo/bin`). If the command is not found, add that directory to `PATH` or run `~/.cargo/bin/silvervine setup`.
+The installer adds the binary and updater to `$CARGO_HOME/bin` (normally `~/.cargo/bin`). Reopen your terminal if the command is not found. Linux system-owned browser installations may prompt for administrator approval; the daemon runs as your user.
 
-Setup detects browsers, downloads Widevine through Mozilla's distribution manifest, verifies its SHA-512 digest, attempts to patch each browser, and registers a user-session daemon. Run `silvervine status` afterward to verify the result.
+[Release archives and checksums](https://github.com/nicholasraimbault/silvervine/releases) are also available.
 
-On Linux, system-owned browsers may require administrator approval for patching. The registered daemon remains in your user session.
+## Try 2.3 RC
 
-Release archives and checksums are available from [GitHub Releases](https://github.com/nicholasraimbault/silvervine/releases).
+2.3 adds **Windows x64**, a **terminal control panel**, and explicit **Stable / Preview update preferences**. RCs require an intentional install; stable users are not automatically moved to them.
 
-## Supported browsers
+Linux / macOS:
 
-Built-in detection covers [Helium](https://helium.computer), [Thorium](https://thorium.rocks), [ungoogled-chromium](https://ungoogled-software.github.io/ungoogled-chromium-binaries/), and [Chromium](https://www.chromium.org/). Silvervine also scans standard application directories for compatible Chromium layouts.
-
-Custom installations can be added to the configuration file:
-
-- Linux: `~/.config/silvervine/config.toml`
-- macOS: `~/Library/Application Support/silvervine/config.toml`
-
-```toml
-[[browsers]]
-name = "My Browser"
-install_path = "/home/me/my-browser" # Linux
-# bundle_path = "/Users/me/Applications/My Browser.app" # macOS
-
-[updates]
-# Off by default. When true, the daemon applies the latest *stable* GitHub
-# release via silvervine-update (cargo-dist sidecar + receipt). Never mid-patch.
-auto_apply = false
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/nicholasraimbault/silvervine/releases/download/v2.3.0-rc.1/silvervine-installer.sh | sh
 ```
 
-Chrome, Edge, Brave, and Firefox already manage Widevine and do not need Silvervine.
+Windows x64, from PowerShell:
 
-## Behavior and limitations
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://github.com/nicholasraimbault/silvervine/releases/download/v2.3.0-rc.1/silvervine-installer.ps1 | iex"
+```
 
-Silvervine provides software-only Widevine L3. Playback quality is controlled by each streaming service and may be lower than in an officially supported browser. Silvervine does not provide hardware-backed L1 DRM or guarantee HD, 4K, or HDR playback.
+Then reopen your terminal, close the browser, and run:
 
-Silvervine refuses to patch a running browser unless forced. It stages and verifies a complete CDM tree before atomically publishing it. On macOS, Silvervine installs the component in the browser's per-user profile and leaves the vendor application bundle and its code signature unchanged. The user-session daemon watches for browser updates and CDM changes.
+```text
+silvervine setup
+silvervine tui
+```
 
-## Commands
+No GitHub account, Rust installation, or source checkout is needed. See the [Windows guide and test checklist](docs/windows.md). RCs are for testing; Windows streaming-service playback and sleep/resume still need verification on real PCs.
+
+## Browsers
+
+Built-in detection covers Helium, Thorium, ungoogled-chromium, and Chromium where their supported platform layouts are recognized. Add other compatible installations in the terminal UI or [configuration file](docs/usage.md#configuration). Chrome, Edge, Brave, and Firefox manage their own DRM components.
+
+On macOS and Windows, Widevine is installed in the browser's per-user component directory. On Windows the browser must be closed, including when using `--force`.
+
+## Everyday use
 
 | Command | Purpose |
 |---|---|
+| `silvervine tui` | Manage browsers, diagnostics, updates, logs, and settings |
 | `silvervine` | Run the tray daemon |
-| `silvervine setup` | Configure browsers and the daemon |
-| `silvervine init` | Run the interactive setup wizard |
-| `silvervine patch [browser]` | Patch one or all detected browsers |
-| `silvervine status` | Show browser and daemon status |
-| `silvervine list-browsers` | List detected browsers |
-| `silvervine doctor [error-code] [--media-stack]` | Run diagnostics, collect passive media evidence, or explain an EME error |
-| `silvervine test [--browser <name>]` | Run an explicit browser-reported EME capability check |
-| `silvervine update widevine` | Update or roll back the CDM |
-| `silvervine launch <browser>` | Verify, patch if needed, then launch |
-| `silvervine repair` | Rebuild Silvervine's local state |
-| `silvervine uninstall [--purge]` | Remove the daemon and cache; `--purge` also removes config; the binary and browser changes remain |
+| `silvervine status` | Check browser and daemon state |
+| `silvervine doctor --media-stack` | Inspect local browser, CDM, and media evidence |
+| `silvervine test --browser Helium` | Open an explicit browser capability test |
+| `silvervine update widevine` | Refresh Widevine and patch browsers |
+| `silvervine update self` | Update Silvervine using the saved release channel |
 
-Run `silvervine --help` or `silvervine <command> --help` for all options, JSON output, shell completions, and man-page generation.
+Automatic self-updates default to **off**. The update channel defaults to **Stable**, even when an RC was installed manually. Choose Preview in Settings to receive later RCs; this does not turn on automatic installation. See [updates and terminal controls](docs/usage.md).
 
-`silvervine doctor --media-stack` does not launch a browser or access the network. It
-inspects local browser/CDM versions, binary architecture, Silvervine ownership
-and digest provenance, and a fixed allowlist of optional graphics utilities.
-`silvervine test` is the explicit live mode: it opens the selected browser with
-its normal profile against a tokenized `127.0.0.1` page, then caches the result
-only for the exact browser version and verified CDM digest. Use
-`silvervine test --url <url>` to open a manual test page without an automated
-result. Browser capability evidence is not proof of certified L1, HD/4K access,
-or streaming-service entitlement.
+## More
 
-## Upgrading an existing installation
+[Usage and configuration](docs/usage.md) · [Troubleshooting](docs/troubleshooting.md) · [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
-Silvervine automatically migrates configuration, cache, logs, and user-daemon registration created by earlier releases of this project. `silvervine setup` also detects legacy Bash, Homebrew, AUR, `.deb`, and `.rpm` installations and provides package-manager-specific cleanup guidance.
+Linux ARM64, Windows ARM64/32-bit, hardware-backed L1, and guaranteed HD/4K/HDR streaming are outside current support. Existing Neon users can consult the [legacy migration guide](MIGRATION.md).
 
-The former Homebrew tap is retired. See [MIGRATION.md](MIGRATION.md) for paths, conflict handling, and recovery instructions.
+Windows support builds on [paparei's Windows port](https://github.com/paparei/silvervine-window), preserved with its original authorship.
 
-## Platform support
-
-Silvervine supports x86_64 Linux and Intel or Apple Silicon macOS. Linux ARM64 and Windows are unsupported in V2. Linux receives native CI and maintainer testing on Arch; macOS receives native CI with contributor-led hardware verification.
-
-Linux tray integration uses the StatusNotifierItem protocol. Desktops without a compatible tray host can run Silvervine in notifications-only mode.
-
-## Documentation
-
-- [Migration](MIGRATION.md)
-- [Roadmap](ROADMAP.md)
-- [Contributing](CONTRIBUTING.md)
-- [Experimental bridge research](https://github.com/nicholasraimbault/silvervine/tree/experimental-bridge) — unsupported and excluded from releases
-- [Security policy](SECURITY.md)
-- [Changelog](CHANGELOG.md)
-- [Code of conduct](CODE_OF_CONDUCT.md)
-
-## License
-
-[MIT](LICENSE)
+[MIT license](LICENSE)

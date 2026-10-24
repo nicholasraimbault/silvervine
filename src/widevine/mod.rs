@@ -164,6 +164,7 @@ fn ipv6_is_non_public(address: std::net::Ipv6Addr) -> bool {
 }
 
 /// CDM directory installed into a Chromium-family browser.
+#[cfg(unix)]
 pub(crate) const CDM_BUNDLE_DIRECTORY: &str = "WidevineCdm";
 /// Manifest filename at the root of an extracted or installed CDM.
 pub(crate) const CDM_MANIFEST_FILENAME: &str = "manifest.json";
@@ -176,6 +177,7 @@ pub(crate) const fn platform_directory(platform: Platform) -> &'static str {
         Platform::LinuxX86_64 => "linux_x64",
         Platform::DarwinAarch64 => "mac_arm64",
         Platform::DarwinX86_64 => "mac_x64",
+        Platform::WindowsX86_64 => "win_x64",
     }
 }
 
@@ -184,6 +186,7 @@ pub(crate) const fn platform_library(platform: Platform) -> &'static str {
     match platform {
         Platform::LinuxX86_64 => "libwidevinecdm.so",
         Platform::DarwinAarch64 | Platform::DarwinX86_64 => "libwidevinecdm.dylib",
+        Platform::WindowsX86_64 => "widevinecdm.dll",
     }
 }
 

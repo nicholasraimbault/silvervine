@@ -254,7 +254,8 @@ pub enum CacheLookup {
 /// Default capability-report cache root.
 #[must_use]
 pub fn default_store_root() -> Option<PathBuf> {
-    dirs::cache_dir().map(|root| root.join("silvervine").join("diagnostics").join("probes"))
+    crate::platform::cache_home()
+        .map(|root| root.join("silvervine").join("diagnostics").join("probes"))
 }
 
 /// Persist `report` beneath `root` using a same-directory atomic rename.
@@ -452,6 +453,9 @@ fn atomic_write_report(path: &Path, bytes: &[u8]) -> Result<()> {
     drop(file);
 
     fs::rename(&temp, path).map_err(Error::from)?;
+    // Windows cannot open/fsync directories through File::open; the file was
+    // flushed before publication. Keep Unix directory durability where supported.
+    #[cfg(unix)]
     fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(Error::from)?;
@@ -475,8 +479,20 @@ mod tests {
     use crate::widevine::ownership::OwnershipAssessment;
     use crate::widevine::sha512_hex;
 
+    fn absolute_fixture(path: &str) -> String {
+        if cfg!(windows) && !Path::new(path).is_absolute() {
+            format!("C:{path}")
+        } else {
+            path.to_owned()
+        }
+    }
+
     fn cdm_entry(path: &str, digest: &str) -> CdmFingerprintEntry {
-        CdmFingerprintEntry::new(path, Some("4.10.0.0".into()), Some(digest.into()))
+        CdmFingerprintEntry::new(
+            absolute_fixture(path),
+            Some("4.10.0.0".into()),
+            Some(digest.into()),
+        )
     }
 
     fn fingerprint(
@@ -487,7 +503,7 @@ mod tests {
         digest: &str,
     ) -> ProbeFingerprint {
         ProbeFingerprint::new(
-            executable,
+            absolute_fixture(executable),
             Some(browser_version.into()),
             len,
             modified,
@@ -647,7 +663,7 @@ mod tests {
     fn cdm_path_or_digest_change_invalidates_cached_evidence() {
         let tmp = TempDir::new().expect("tempdir");
         let old = ProbeFingerprint::new(
-            "/opt/test-browser/chromium",
+            absolute_fixture("/opt/test-browser/chromium"),
             Some("150.0".into()),
             100,
             1,
@@ -657,7 +673,7 @@ mod tests {
         save_report(tmp.path(), &stored(old)).expect("save");
 
         let path_changed = ProbeFingerprint::new(
-            "/opt/test-browser/chromium",
+            absolute_fixture("/opt/test-browser/chromium"),
             Some("150.0".into()),
             100,
             1,
@@ -665,7 +681,7 @@ mod tests {
             vec![cdm_entry("/opt/new/libwidevinecdm.so", "old-digest")],
         );
         let digest_changed = ProbeFingerprint::new(
-            "/opt/test-browser/chromium",
+            absolute_fixture("/opt/test-browser/chromium"),
             Some("150.0".into()),
             100,
             1,
@@ -704,7 +720,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.canonical_path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["/a/lib.so", "/z/lib.so"]
+            vec![absolute_fixture("/a/lib.so"), absolute_fixture("/z/lib.so")]
         );
     }
     #[test]

@@ -9,7 +9,7 @@
 //!   publication from the orchestration above.
 //!
 //! Platform-specific implementations of [`PlatformPatcher`] live in the
-//! Platform team's `src/patch/linux.rs` and `src/patch/macos.rs` modules.
+//! `src/patch/linux.rs`, `src/patch/macos.rs`, and `src/patch/windows.rs` modules.
 //! Core engine **does not** reach into those files; the contract here is the
 //! whole interface.
 //!
@@ -38,6 +38,12 @@
 //! the browser installation; macOS targets Chromium's per-user component
 //! directory. The shared trait keeps orchestration testable.
 //!
+//! Windows publishes immutable numeric version directories in the user's browser
+//! profile. It verifies payload and marker before renaming into an absent target,
+//! retains older versions, and moves a failed publication back to staging. An
+//! existing version is never exchanged or overwritten; a differing same-version
+//! payload fails closed. Profile installation never requests elevation.
+//!
 //! ## What this module does NOT do
 //!
 //! * No platform syscalls — those live in the Platform team's modules.
@@ -46,6 +52,7 @@
 
 use std::fs;
 use std::io::ErrorKind;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -67,8 +74,13 @@ pub mod backup;
 pub mod linux;
 
 /// macOS platform impl. Pure bundle tests also compile it on other hosts.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 pub mod macos;
+
+#[cfg(windows)]
+pub mod windows;
+#[cfg(windows)]
+pub use windows::WindowsPatcher;
 
 pub use backup::{prune_backups, BackupHandle};
 
@@ -100,22 +112,26 @@ pub fn host_patcher() -> Result<Box<dyn PlatformPatcher>> {
     {
         Ok(Box::new(MacosPatcher::new()))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        Ok(Box::new(WindowsPatcher::new()))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         Err(Error::unsupported_platform(
-            "patching is only implemented for Linux and macOS",
+            "patching is only implemented for Linux, macOS, and Windows",
         ))
     }
 }
 
 /// Default lockfile path for patch operations.
 ///
-/// Per spec: `~/.cache/silvervine/patch.lock`. Returns `None` if `dirs::cache_dir()`
+/// Per spec: `~/.cache/silvervine/patch.lock`. Returns `None` if `crate::platform::cache_home()`
 /// is unresolvable (e.g. no `$HOME`); callers in that case should surface a
 /// `StateCorrupted` error or use a caller-supplied path.
 #[must_use]
 pub fn default_patch_lock() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("silvervine").join("patch.lock"))
+    crate::platform::cache_home().map(|d| d.join("silvervine").join("patch.lock"))
 }
 
 /// Options for [`patch_browser`].
@@ -124,6 +140,8 @@ pub fn default_patch_lock() -> Option<PathBuf> {
 pub struct PatchOptions {
     /// If `true`, patch even when the browser is currently running. Spec
     /// recommends against this; reserved for `silvervine patch --force-while-running`.
+    /// Windows always requires the browser to be stopped because publication
+    /// also updates Chromium's Local State component registration.
     pub force_while_running: bool,
     /// Permit replacement of an unmarked CDM classified as externally
     /// managed. Invalid Silvervine markers are never bypassed.
@@ -261,14 +279,7 @@ impl TargetAuthorization {
             Err(error) if error.kind() == ErrorKind::NotFound => None,
             Err(error) => return Err(Error::from(error)),
         };
-        let identity = handle
-            .as_ref()
-            .map(fs::File::metadata)
-            .transpose()?
-            .map(|metadata| TargetIdentity {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            });
+        let identity = handle.as_ref().map(target_identity).transpose()?;
         Ok(Self {
             identity,
             _handle: handle,
@@ -286,6 +297,7 @@ impl TargetAuthorization {
     }
 }
 
+#[cfg(unix)]
 fn open_target_handle(target: &Path) -> std::io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options
@@ -294,12 +306,59 @@ fn open_target_handle(target: &Path) -> std::io::Result<fs::File> {
     options.open(target)
 }
 
+#[cfg(unix)]
+fn target_identity(handle: &fs::File) -> std::io::Result<TargetIdentity> {
+    let metadata = handle.metadata()?;
+    Ok(TargetIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn open_target_handle(target: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(target)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "CDM target must be a non-reparse directory",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn target_identity(handle: &fs::File) -> std::io::Result<TargetIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle remains live and info points to writable storage.
+    if unsafe { GetFileInformationByHandle(handle.as_raw_handle(), &raw mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(TargetIdentity {
+        device: u64::from(info.dwVolumeSerialNumber),
+        inode: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    })
+}
+
 /// Remove transaction state only while it still has the authorized identity.
 ///
 /// # Errors
 ///
 /// Preserves the entire staging directory and returns `StateCorrupted` when
 /// another process replaced the path that cleanup would recursively remove.
+#[cfg(unix)]
 pub(crate) fn close_authorized_staging(
     staging: tempfile::TempDir,
     staged: &Path,
@@ -614,8 +673,8 @@ where
     browsers
         .iter()
         .map(|browser| {
-            let processes =
-                (!options.as_root && !options.force_while_running).then(&mut capture_processes);
+            let processes = (!options.as_root && (cfg!(windows) || !options.force_while_running))
+                .then(&mut capture_processes);
             match run_patch(browser, cdm, patcher, options, processes.as_ref()) {
                 Ok(outcome) => PatchReport::success(&outcome),
                 Err(error) => PatchReport::failure(browser.name(), options.dry_run, &error),
@@ -681,7 +740,8 @@ pub fn patch_browser(
     }
     let lock = patch_lock_path(options)?;
     lockfile::with_lock(&lock, || {
-        let processes = (!options.force_while_running).then(discovery::ProcessSnapshot::capture);
+        let processes = (cfg!(windows) || !options.force_while_running)
+            .then(discovery::ProcessSnapshot::capture);
         run_patch(browser, cdm, patcher, options, processes.as_ref())
     })
 }
@@ -745,15 +805,7 @@ fn run_patch(
 
     // The locked parent performs process inspection once. The elevated child
     // remains filesystem-only and never probes another account's session.
-    if !options.as_root
-        && !options.force_while_running
-        && processes.is_some_and(|snapshot| snapshot.is_running(browser))
-    {
-        return Err(Error::browser_running(format!(
-            "{} is currently running; close it first or use --force-while-running",
-            browser.name()
-        )));
-    }
+    require_closed_browser(browser, options, processes)?;
 
     let running_as_root = platform::is_running_as_root();
     let version_before = if options.as_root || running_as_root {
@@ -848,6 +900,28 @@ fn run_patch(
     })
 }
 
+fn require_closed_browser(
+    browser: &Browser,
+    options: &PatchOptions,
+    processes: Option<&discovery::ProcessSnapshot>,
+) -> Result<()> {
+    if !options.as_root
+        && (cfg!(windows) || !options.force_while_running)
+        && processes.is_some_and(|snapshot| snapshot.is_running(browser))
+    {
+        let action = if cfg!(windows) {
+            "close it before updating Local State"
+        } else {
+            "close it first or use --force-while-running"
+        };
+        return Err(Error::browser_running(format!(
+            "{} is currently running; {action}",
+            browser.name()
+        )));
+    }
+    Ok(())
+}
+
 fn stage_direct_root_payload(
     browser: &Browser,
     cdm: &CachedCdm,
@@ -936,6 +1010,7 @@ pub fn target_writable(path: &Path) -> bool {
     }
 }
 
+#[cfg(unix)]
 fn select_privileged_snapshot_parent(install_path: &Path) -> Result<PathBuf> {
     use std::os::unix::fs::MetadataExt;
 
@@ -968,6 +1043,7 @@ fn select_privileged_snapshot_parent(install_path: &Path) -> Result<PathBuf> {
     Ok(parent.to_path_buf())
 }
 
+#[cfg(unix)]
 fn validate_privileged_path_ancestry(path: &Path, expected_uid: u32) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -996,6 +1072,7 @@ fn validate_privileged_path_ancestry(path: &Path, expected_uid: u32) -> Result<(
 ///
 /// Rejects non-canonical, symlinked, writable, differently-owned,
 /// non-direct, cross-filesystem, or root-untrusted ancestor paths.
+#[cfg(unix)]
 pub fn validate_privileged_snapshot_parent(install_path: &Path, parent: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -1047,6 +1124,24 @@ pub fn validate_privileged_snapshot_parent(install_path: &Path, parent: &Path) -
         ));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn select_privileged_snapshot_parent(_install_path: &Path) -> Result<PathBuf> {
+    Err(Error::permission_denied(
+        "Windows profile CDM installation must not elevate",
+    ))
+}
+
+/// Reject privileged snapshot requests: Windows installs into the user's profile.
+///
+/// # Errors
+/// Always returns permission denied; elevation cannot authorize profile writes.
+#[cfg(windows)]
+pub fn validate_privileged_snapshot_parent(_install_path: &Path, _parent: &Path) -> Result<()> {
+    Err(Error::permission_denied(
+        "Windows profile CDM installation must not elevate",
+    ))
 }
 
 /// Resolve and hash the exact executable image authorized for elevation.
@@ -1172,10 +1267,8 @@ fn run_patch_via_escalation(
         })?;
         #[cfg(target_os = "linux")]
         let expected_payload = installed.marker() == marker;
-        #[cfg(target_os = "macos")]
+        #[cfg(not(target_os = "linux"))]
         let expected_payload = installed.matches_candidate(marker);
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let expected_payload = false;
         if !expected_payload {
             return Err(Error::invalid_marker(
                 "elevated patch installed a different CDM identity than the parent authorized",

@@ -731,7 +731,10 @@ fn inspect_external_hint(
     }
     if metadata.is_file() {
         let name = candidate.file_name()?.to_string_lossy();
-        if !(name == "libwidevinecdm.so" || name == "libwidevinecdm.dylib") {
+        if !(name == "libwidevinecdm.so"
+            || name == "libwidevinecdm.dylib"
+            || name == "widevinecdm.dll")
+        {
             return None;
         }
         if metadata.len() == 0 || metadata.len() > 64 * 1024 * 1024 {
@@ -849,6 +852,14 @@ fn push_component_path_value(
     }
 }
 
+#[cfg(windows)]
+fn default_profile_roots(browser: &Browser) -> Option<Vec<PathBuf>> {
+    crate::browsers::windows::profile_dir(browser.install_path())
+        .ok()
+        .map(|root| vec![root])
+}
+
+#[cfg(not(windows))]
 fn default_profile_roots(browser: &Browser) -> Option<Vec<PathBuf>> {
     if browser.kind != crate::browsers::BrowserKind::Known {
         return None;

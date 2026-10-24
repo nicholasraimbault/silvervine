@@ -4,12 +4,12 @@
 
 | Version | Supported |
 |---|---|
-| V2.0.x and newer | Yes (security fixes backported to latest minor) |
-| V1.x (bash + Swift + Go) | No (V1 is end-of-life as of V2.0 ship) |
-| V2.2 pre-releases (`v2.2.0-rc.*`) | Yes during the rc; superseded by `v2.2.0` |
-| V2.0 pre-releases (`v2.0.0-rc.*`) | Yes during the rc; superseded by `v2.0.0` |
+| Latest stable release (currently 2.2.1) | Yes; fixes ship in the current release line |
+| Latest 2.3 RC | During the RC cycle; superseded by later RCs / 2.3 stable |
+| Earlier releases, including Neon V1 | Upgrade to the current release |
 
-V2.1 supersedes V2.0 once shipped — I don't commit to maintaining multiple LTS branches. Supported release versions cover the focused Widevine L3 helper shipped from master.
+There are no multiple LTS/backport branches. Release support covers the focused
+Widevine L3 helper. The archived bridge experiment is unsupported.
 
 ## Reporting a vulnerability
 
@@ -20,7 +20,7 @@ Please **do not** file security issues on GitHub Issues. Public disclosure befor
 In your report, please include:
 
 - Affected version (output of `silvervine --version`).
-- Affected platform + version (`uname -a` on Linux; `sw_vers` on macOS).
+- Affected platform + version (`uname -a` on Linux; `sw_vers` on macOS; Windows version/build on Windows).
 - A description of the vulnerability — what's the impact, who's affected, what's the attack surface.
 - Reproduction steps, ideally including a minimal proof-of-concept.
 - Whether you've disclosed to anyone else, and whether there's a public timeline (CVE filing, conference talk, blog post, etc.) I need to coordinate around.
@@ -39,7 +39,7 @@ In scope:
 - Code execution outside the user's session via a Silvervine-controlled file (configs, hooks, cache).
 - Privilege escalation paths that don't require a sudo prompt the user can refuse.
 - CDM-publication paths that can escape the selected Linux browser root or
-  macOS user-profile component root.
+  macOS/Windows user-profile component root.
 - Race conditions in the atomic-patch protocol that can leave the active CDM
   target destroyed.
 - Network paths that fetch unauthenticated content and act on it (Widevine CDM
@@ -58,7 +58,8 @@ Out of scope:
 ## Scope: privilege model
 
 Silvervine V2 runs **entirely in the user session** — the daemon is a
-LaunchAgent (macOS) or systemd-user unit (Linux), not a root daemon.
+LaunchAgent (macOS), systemd-user unit (Linux), or per-user Startup shortcut
+(Windows), not a root daemon.
 
 On macOS, Silvervine publishes Widevine under the current user's
 `~/Library/Application Support/<browser-id>/.../WidevineCdm/<version>/`
@@ -76,6 +77,15 @@ logging, migration, or hooks. Its auditable arguments carry the parent's exact
 browser path, bounded parent-authenticated CDM staging payload and version,
 trusted same-filesystem backup parent, browser display name, and force
 decision.
+
+On Windows, Silvervine publishes immutable verified CDM version directories
+under the selected browser profile and atomically replaces component registration
+in `Local State`. It refuses to patch while the browser runs and does not elevate.
+Profile/component ancestor handles reject reparse points and deny deletion while
+a publication is in progress. Local named-pipe IPC rejects remote clients and
+restricts access to the current user; clients also verify the server owner.
+Self-updates preserve the running executable until the installer succeeds, with
+rollback on failed/no-op installation.
 
 User-owned Linux browser installations do not require elevation. A custom
 macOS bundle path is used only to validate the browser identity and derive its
@@ -107,8 +117,9 @@ go through GitHub Issues only when the user chooses to share them.
 
 ## Known limitations
 
-- **No SBOM yet.** V2 ships a list of dependencies via `cargo metadata`;
-  CycloneDX SBOM generation is queued for V2.2.
+- Tagged releases include a CycloneDX SBOM and GitHub artifact attestations.
+- Windows RC hardware validation is pending; native CI is not evidence of actual
+  streaming playback or physical sleep/resume behavior.
 - **No reproducible builds.** cargo-dist artifacts are deterministic-ish but not bit-reproducible. Working on it.
 
 ## Bug bounty

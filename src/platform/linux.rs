@@ -29,21 +29,21 @@ use super::PlatformPaths;
 
 /// Linux implementation of [`PlatformPaths`].
 ///
-/// XDG-compliant: cache and config dirs come from `dirs::cache_dir()` /
-/// `dirs::config_dir()` (which honor `$XDG_CACHE_HOME` / `$XDG_CONFIG_HOME`
+/// XDG-compliant: cache and config dirs come from `crate::platform::cache_home()` /
+/// `crate::platform::config_home()` (which honor `$XDG_CACHE_HOME` / `$XDG_CONFIG_HOME`
 /// when set) with a `silvervine` suffix appended. Applications dirs are the
 /// canonical Linux Chromium-family install locations.
 pub struct LinuxPaths;
 
 impl PlatformPaths for LinuxPaths {
     fn cache_dir() -> PathBuf {
-        dirs::cache_dir()
+        crate::platform::cache_home()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join("silvervine")
     }
 
     fn config_dir() -> PathBuf {
-        dirs::config_dir()
+        crate::platform::config_home()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join("silvervine")
     }

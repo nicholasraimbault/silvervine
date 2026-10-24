@@ -91,10 +91,10 @@ impl VerifiedCrx {
 
 /// Default download cache directory: `~/.cache/silvervine/downloads/`.
 ///
-/// Returns `None` if `dirs::cache_dir()` is unresolvable.
+/// Returns `None` if `crate::platform::cache_home()` is unresolvable.
 #[must_use]
 pub fn default_download_dir() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("silvervine").join("downloads"))
+    crate::platform::cache_home().map(|d| d.join("silvervine").join("downloads"))
 }
 
 /// Download the CRX3 described by `entry` and verify its SHA-512.
@@ -282,6 +282,11 @@ fn read_verified_path(
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
     let mut file = options.open(path).map_err(Error::from)?;
     read_verified_file(&mut file, path, expected_hash, expected_size, max_size)
 }
@@ -294,6 +299,13 @@ fn read_verified_file(
     max_size: u64,
 ) -> Result<Vec<u8>> {
     let metadata = file.metadata().map_err(Error::from)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(Error::hash_mismatch("CRX file is a reparse point"));
+        }
+    }
     if !metadata.is_file() {
         return Err(Error::hash_mismatch(format!(
             "{} is not a regular CRX file",
@@ -862,7 +874,7 @@ mod tests {
     }
 
     /// `download_to_cache` (the public default-path variant) doesn't panic;
-    /// it surfaces a categorized error if `dirs::cache_dir()` is None.
+    /// it surfaces a categorized error if `crate::platform::cache_home()` is None.
     #[test]
     fn download_to_cache_does_not_panic() {
         let entry = PlatformEntry::Concrete {

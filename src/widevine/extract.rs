@@ -79,6 +79,7 @@ const UNIX_S_IFREG: u32 = 0o100_000;
 /// Directory type bit in a Unix mode.
 const UNIX_S_IFDIR: u32 = 0o040_000;
 /// Permission bits preserved when applying Unix modes from ZIP metadata.
+#[cfg(any(unix, test))]
 const UNIX_PERMISSION_BITS: u32 = 0o777;
 
 /// Extract the ZIP body of a CRX3 file at `crx_path` into `out_dir`.
@@ -261,10 +262,10 @@ fn validate_archive_metadata(archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]
             Error::unknown_bundle_structure(format!("zip entry {index}")).with_source(error)
         })?;
         let rel = validate_zip_entry_metadata(&entry, &mut declared_total)?;
-        if !output_paths.insert(rel) {
+        if !output_paths.insert(zip_output_key(&rel)) {
             return Err(Error::unknown_bundle_structure(format!(
                 "CRX3 ZIP contains duplicate normalized output path {}",
-                entry.name()
+                entry.name().unwrap_or_default()
             )));
         }
     }
@@ -305,7 +306,7 @@ pub(super) fn extract_zip_body(zip: &[u8], out_dir: &Path) -> Result<()> {
         if !entry_is_regular_file(&entry) {
             return Err(Error::unknown_bundle_structure(format!(
                 "zip entry {} is not a regular file",
-                entry.name()
+                entry.name().unwrap_or_default()
             )));
         }
 
@@ -319,7 +320,7 @@ pub(super) fn extract_zip_body(zip: &[u8], out_dir: &Path) -> Result<()> {
             let n = entry.read(&mut buf).map_err(|e| {
                 Error::unknown_bundle_structure(format!(
                     "zip entry {} failed while streaming",
-                    entry.name()
+                    entry.name().unwrap_or_default()
                 ))
                 .with_source(e)
             })?;
@@ -330,13 +331,13 @@ pub(super) fn extract_zip_body(zip: &[u8], out_dir: &Path) -> Result<()> {
             written = written.checked_add(n_u64).ok_or_else(|| {
                 Error::unknown_bundle_structure(format!(
                     "zip entry {} expanded past the per-entry size limit",
-                    entry.name()
+                    entry.name().unwrap_or_default()
                 ))
             })?;
             if written > declared_size || written > MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES {
                 return Err(Error::unknown_bundle_structure(format!(
                     "zip entry {} expanded past its declared size limit",
-                    entry.name()
+                    entry.name().unwrap_or_default()
                 )));
             }
             written_total = written_total.checked_add(n_u64).ok_or_else(|| {
@@ -354,7 +355,7 @@ pub(super) fn extract_zip_body(zip: &[u8], out_dir: &Path) -> Result<()> {
         if written != declared_size {
             return Err(Error::unknown_bundle_structure(format!(
                 "zip entry {} expanded to {written} bytes, expected {declared_size}",
-                entry.name()
+                entry.name().unwrap_or_default()
             )));
         }
         // Preserve the executable bit on Unix — the CDM `.so`/`.dylib`
@@ -371,11 +372,41 @@ pub(super) fn extract_zip_body(zip: &[u8], out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn normalized_zip_entry_path(entry: &zip::read::ZipFile<'_>) -> Result<PathBuf> {
+pub(super) fn normalized_zip_entry_path<R: Read + ?Sized>(
+    entry: &zip::read::ZipFile<'_, R>,
+) -> Result<PathBuf> {
+    let name = entry.name().map_err(|error| {
+        Error::unknown_bundle_structure("ZIP entry name could not be decoded").with_source(error)
+    })?;
+    // Widevine package paths are ASCII. Reject Windows device-name Unicode
+    // aliases as well as ordinary names that Win32 maps to the same file.
+    #[cfg(windows)]
+    if !name.is_ascii() {
+        return Err(Error::unknown_bundle_structure(
+            "non-ASCII Windows ZIP entry path",
+        ));
+    }
+    #[cfg(windows)]
+    for segment in name.split(['/', '\\']) {
+        let stem = segment.split('.').next().unwrap_or("").to_ascii_uppercase();
+        if segment.contains(':')
+            || segment.ends_with([' ', '.']) && segment != "."
+            || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (stem.len() == 4
+                && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+        {
+            return Err(Error::unknown_bundle_structure(
+                "unsafe Windows ZIP entry path",
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = name;
     let Some(enclosed) = entry.enclosed_name() else {
         return Err(Error::unknown_bundle_structure(format!(
             "zip entry {} has unsafe path",
-            entry.name()
+            entry.name().unwrap_or_default()
         )));
     };
     let mut normalized = PathBuf::new();
@@ -386,7 +417,7 @@ pub(super) fn normalized_zip_entry_path(entry: &zip::read::ZipFile<'_>) -> Resul
             _ => {
                 return Err(Error::unknown_bundle_structure(format!(
                     "zip entry {} has unsafe path",
-                    entry.name()
+                    entry.name().unwrap_or_default()
                 )));
             }
         }
@@ -394,16 +425,27 @@ pub(super) fn normalized_zip_entry_path(entry: &zip::read::ZipFile<'_>) -> Resul
     if normalized.as_os_str().is_empty() {
         return Err(Error::unknown_bundle_structure(format!(
             "zip entry {} has an empty output path",
-            entry.name()
+            entry.name().unwrap_or_default()
         )));
     }
     Ok(normalized)
 }
 
+pub(super) fn zip_output_key(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        path.as_os_str().to_ascii_lowercase().into()
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
 /// Reject unsupported entry kinds, normalize its output path, and accumulate
 /// declared uncompressed sizes.
-pub(super) fn validate_zip_entry_metadata(
-    entry: &zip::read::ZipFile<'_>,
+pub(super) fn validate_zip_entry_metadata<R: Read + ?Sized>(
+    entry: &zip::read::ZipFile<'_, R>,
     declared_total: &mut u64,
 ) -> Result<PathBuf> {
     let normalized = normalized_zip_entry_path(entry)?;
@@ -413,7 +455,7 @@ pub(super) fn validate_zip_entry_metadata(
             if file_type != 0 && file_type != UNIX_S_IFDIR {
                 return Err(Error::unknown_bundle_structure(format!(
                     "zip directory entry {} has non-directory unix mode {mode:#o}",
-                    entry.name()
+                    entry.name().unwrap_or_default()
                 )));
             }
         }
@@ -422,7 +464,7 @@ pub(super) fn validate_zip_entry_metadata(
     if !entry_is_regular_file(entry) {
         return Err(Error::unknown_bundle_structure(format!(
             "zip entry {} is a symlink or special file",
-            entry.name()
+            entry.name().unwrap_or_default()
         )));
     }
 
@@ -430,7 +472,7 @@ pub(super) fn validate_zip_entry_metadata(
     if size > MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES {
         return Err(Error::unknown_bundle_structure(format!(
             "zip entry {} declares {size} uncompressed bytes, exceeding the {MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES} byte limit",
-            entry.name()
+            entry.name().unwrap_or_default()
         )));
     }
     *declared_total = declared_total.checked_add(size).ok_or_else(|| {
@@ -447,7 +489,7 @@ pub(super) fn validate_zip_entry_metadata(
 }
 
 /// Returns true when the entry is a plain regular file (not a dir/symlink/special).
-fn entry_is_regular_file(entry: &zip::read::ZipFile<'_>) -> bool {
+fn entry_is_regular_file<R: Read + ?Sized>(entry: &zip::read::ZipFile<'_, R>) -> bool {
     if entry.is_dir() || entry.is_symlink() || !entry.is_file() {
         return false;
     }
@@ -502,10 +544,14 @@ pub fn verify_widevine_layout(extracted: &Path) -> Result<PathBuf> {
 
 /// Returns `true` if `dir` contains a supported Widevine shared library.
 fn has_widevine_so(dir: &Path) -> bool {
-    [Platform::LinuxX86_64, Platform::DarwinAarch64]
-        .into_iter()
-        .map(platform_library)
-        .any(|library| dir.join(library).exists())
+    [
+        Platform::LinuxX86_64,
+        Platform::DarwinAarch64,
+        Platform::WindowsX86_64,
+    ]
+    .into_iter()
+    .map(platform_library)
+    .any(|library| dir.join(library).exists())
 }
 
 #[cfg(test)]
@@ -1030,5 +1076,46 @@ mod tests {
                 "wrote {wrote} bytes past the declared uncompressed limit"
             );
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_path_tests {
+    use super::*;
+    #[test]
+    fn rejects_windows_device_and_stream_paths() {
+        for name in [
+            "NUL",
+            "dir/COM1.dll",
+            "dir/COM¹.dll",
+            "file:stream",
+            "dir/trailing.",
+        ] {
+            let mut bytes = Vec::new();
+            {
+                let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+                zip.start_file(name, zip::write::SimpleFileOptions::default())
+                    .expect("entry");
+                zip.finish().expect("ZIP");
+            }
+            let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("archive");
+            assert!(
+                normalized_zip_entry_path(&zip.by_index(0).expect("entry")).is_err(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_case_aliases_before_extraction() {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for name in ["manifest.json", "MANIFEST.JSON"] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"payload").unwrap();
+        }
+        let bytes = zip.finish().unwrap().into_inner();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+        assert!(validate_archive_metadata(&mut archive).is_err());
     }
 }

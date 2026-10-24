@@ -39,13 +39,41 @@ use crate::error::{Error, Result};
 
 pub mod process;
 
+/// Base for Silvervine configuration, with an explicit Windows XDG override.
+pub(crate) fn config_home() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(path) = absolute_env_path("XDG_CONFIG_HOME") {
+        return Some(path);
+    }
+    dirs::config_dir()
+}
+
+/// Base for Silvervine caches, with an explicit Windows XDG override.
+pub(crate) fn cache_home() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(path) = absolute_env_path("XDG_CACHE_HOME") {
+        return Some(path);
+    }
+    dirs::cache_dir()
+}
+
+#[cfg(windows)]
+fn absolute_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
 #[cfg(target_os = "linux")]
 use linux as imp;
 
 #[cfg(target_os = "macos")]
 use macos as imp;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+use windows as imp;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 use unsupported as imp;
 
 /// Cross-platform "where do I put files" trait.
@@ -309,7 +337,10 @@ pub fn format_exit_status(status: std::process::ExitStatus) -> String {
 
 /// Construct a no-op [`Output`] used when `SILVERVINE_TEST_ESCALATE_NOOP=1`.
 fn noop_output() -> Output {
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
     Output {
         status: std::process::ExitStatus::from_raw(0),
         stdout: Vec::new(),
@@ -329,7 +360,10 @@ pub use linux::LinuxPaths;
 #[cfg(target_os = "macos")]
 pub use macos::MacosPaths;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+mod windows;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod unsupported {
     //! Stub implementation for platforms outside V1's scope (e.g. Windows,
     //! BSD). All operations return `UnsupportedPlatform` errors.
@@ -395,6 +429,7 @@ mod tests {
         assert!(r.is_err(), "empty command must error");
     }
 
+    #[cfg(unix)]
     #[test]
     fn format_exit_status_normal_exit() {
         use std::os::unix::process::ExitStatusExt;
@@ -402,6 +437,7 @@ mod tests {
         assert_eq!(format_exit_status(s), "exit 0");
     }
 
+    #[cfg(unix)]
     #[test]
     fn format_exit_status_nonzero_exit() {
         use std::os::unix::process::ExitStatusExt;
@@ -410,6 +446,7 @@ mod tests {
         assert_eq!(format_exit_status(s), "exit 1");
     }
 
+    #[cfg(unix)]
     #[test]
     fn format_exit_status_signal_killed() {
         use std::os::unix::process::ExitStatusExt;

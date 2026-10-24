@@ -490,8 +490,15 @@ fn run_auto_apply_once() {
         );
         return;
     };
-    let enabled = load_config().is_ok_and(|config| config.updates.auto_apply);
-    match crate::cli::update_self::auto_apply(enabled, &lock, None, None, lifecycle::restart) {
+    let Ok(config) = load_config() else { return };
+    match crate::cli::update_self::auto_apply_with_channel(
+        config.updates.auto_apply,
+        config.updates.channel,
+        &lock,
+        None,
+        None,
+        lifecycle::restart,
+    ) {
         Ok(crate::cli::update_self::AutoApplyOutcome::Updated { latest_version }) => {
             tracing::info!(
                 target: "silvervine::daemon",
@@ -599,7 +606,7 @@ fn run_event_loop(
         }
         // Bounded wait so the stop flag is observed at least every 100 ms.
         let cmd = {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             {
                 if let Some(cmd) = tray.try_recv() {
                     Some(cmd)
@@ -608,7 +615,7 @@ fn run_event_loop(
                     tray.try_recv()
                 }
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", windows)))]
             {
                 tray.recv_timeout(Duration::from_millis(100))
             }
@@ -1040,7 +1047,7 @@ fn install_tracing_subscriber() {
         .try_init();
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::test_support::{default_hook_path, write_executable_script, ScopedEnv};

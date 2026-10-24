@@ -48,7 +48,11 @@ use crate::error::{Error, Result};
 /// callers should treat this as "no config file" (i.e. use defaults).
 #[must_use]
 pub fn default_config_path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("silvervine").join("config.toml"))
+    Some(
+        crate::platform::config_home()?
+            .join("silvervine")
+            .join("config.toml"),
+    )
 }
 
 /// Top-level config schema.
@@ -91,7 +95,7 @@ impl Default for NotificationsConfig {
 /// One `[[browsers]]` entry in the config.
 ///
 /// The schema is intentionally union-style: macOS users set `bundle_path`;
-/// Linux users set `install_path`. The browsers module consumes this to extend
+/// Linux and Windows users set `install_path`. The browsers module consumes this to extend
 /// the auto-discovered list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -105,9 +109,13 @@ pub struct CustomBrowserConfig {
     /// Profile-scoped CDM placement ignores this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub framework_name: Option<String>,
-    /// Linux: absolute path to the install directory.
+    /// Linux/Windows: absolute path to the install directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_path: Option<PathBuf>,
+    /// Explicit Chromium user-data root for a custom Windows browser.
+    /// Must be absolute; no profile location is inferred for custom browsers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_data_dir: Option<PathBuf>,
 }
 
 /// `[hooks]` section.
@@ -131,9 +139,40 @@ pub struct HooksConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UpdatesConfig {
-    /// When `true`, the daemon applies the latest stable GitHub release via
+    /// Release channel. Preview releases require an explicit opt-in.
+    pub channel: UpdateChannel,
+    /// When `true`, the daemon applies eligible GitHub releases via
     /// the cargo-dist sidecar. Default: `false` (prompted `update self` only).
     pub auto_apply: bool,
+}
+
+/// Releases eligible for Silvervine self-updates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    /// Published stable releases only.
+    #[default]
+    Stable,
+    /// Published stable releases and prereleases.
+    Preview,
+}
+
+impl UpdateChannel {
+    /// Stable configuration and display token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Preview => "preview",
+        }
+    }
+
+    pub(crate) const fn sidecar_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Stable => &[],
+            Self::Preview => &["--prerelease"],
+        }
+    }
 }
 
 /// Top-level sections from older config schemas that should be silently
@@ -167,7 +206,20 @@ impl Config {
                 }
             }
         }
-        value.try_into().map_err(Error::from)
+        let config: Self = value.try_into().map_err(Error::from)?;
+        for browser in &config.browsers {
+            if browser
+                .user_data_dir
+                .as_ref()
+                .is_some_and(|path| !path.is_absolute())
+            {
+                return Err(Error::state_corrupted(format!(
+                    "browser {:?} user_data_dir must be an absolute path",
+                    browser.name
+                )));
+            }
+        }
+        Ok(config)
     }
 
     /// Serialize back to a TOML string. Useful for round-trip tests and
@@ -280,6 +332,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn custom_user_data_dir_requires_an_absolute_path() {
+        for path in ["", "relative/profile", "../profile"] {
+            let input = format!("[[browsers]]\nname = 'Custom'\nuser_data_dir = '{path}'\n");
+            assert!(Config::from_toml_str(&input).is_err(), "{path}");
+        }
+        let tmp = tempfile::TempDir::new().expect("temporary profile");
+        let input = format!(
+            "[[browsers]]\nname = 'Custom'\nuser_data_dir = '{}'\n",
+            tmp.path().display()
+        );
+        let config = Config::from_toml_str(&input).expect("absolute profile");
+        assert_eq!(
+            config.browsers[0].user_data_dir.as_deref(),
+            Some(tmp.path())
+        );
+        let serialized = config.to_toml_string().expect("serialize");
+        assert_eq!(
+            Config::from_toml_str(&serialized).expect("round trip"),
+            config
+        );
+    }
+
+    #[test]
     fn default_config_has_sensible_defaults() {
         let cfg = Config::default();
         assert!(cfg.notifications.on_success);
@@ -336,6 +411,19 @@ post_update = "~/.config/silvervine/hooks/post-update"
     fn parses_updates_auto_apply() {
         let cfg = Config::from_toml_str("[updates]\nauto_apply = true").expect("parses");
         assert!(cfg.updates.auto_apply);
+        assert_eq!(cfg.updates.channel, UpdateChannel::Stable);
+    }
+
+    #[test]
+    fn preview_is_explicit_and_independent_of_automatic_installation() {
+        let preview = Config::from_toml_str("[updates]\nchannel = 'preview'").unwrap();
+        assert_eq!(preview.updates.channel, UpdateChannel::Preview);
+        assert!(!preview.updates.auto_apply);
+        assert_eq!(
+            Config::from_toml_str("").unwrap().updates.channel,
+            UpdateChannel::Stable
+        );
+        assert!(Config::from_toml_str("[updates]\nchannel = 'rc'").is_err());
     }
 
     #[test]
@@ -428,6 +516,7 @@ typo_field = false
                 bundle_path: None,
                 framework_name: None,
                 install_path: Some(PathBuf::from("/opt/x")),
+                user_data_dir: None,
             }],
             hooks: HooksConfig {
                 post_patch: Some("/tmp/post-patch".into()),

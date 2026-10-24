@@ -114,7 +114,7 @@ pub fn collect_host_checks() -> Vec<DiagnosticCheck> {
             failure_domain: FailureDomain::BrowserMediaStack,
             summary: "Host media acceleration diagnostics are unavailable on this platform.".into(),
             action: None,
-            details: Default::default(),
+            details: std::collections::BTreeMap::default(),
         }]
     }
 }

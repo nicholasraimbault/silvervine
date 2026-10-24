@@ -105,11 +105,11 @@ pub fn detect_tray_availability() -> TrayAvailability {
             )),
         }
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         TrayAvailability::Available
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         TrayAvailability::Unavailable("tray icon not supported on this platform".into())
     }
@@ -306,8 +306,9 @@ struct TrayInner {
     /// drops) shuts the `StatusNotifierItem` service down cleanly.
     handle: ksni::blocking::Handle<SilvervineKsniTray>,
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 struct TrayInner {
+    #[cfg(target_os = "macos")]
     application: objc2::rc::Retained<objc2_app_kit::NSApplication>,
     tray: std::cell::RefCell<tray_icon::TrayIcon>,
     routes: std::sync::Arc<Mutex<std::collections::HashMap<String, TrayCommand>>>,
@@ -550,7 +551,7 @@ impl Tray {
             TrayInner { handle }
         };
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         let inner = build_tray_icon(&initial_state, tx.clone())?;
 
         Ok(Self {
@@ -591,7 +592,7 @@ impl Tray {
         reason = "Linux branch moves `state` into the ksni update closure; macOS branch only stores a clone. Borrow-only signature would require caller-side cloning on every call."
     )]
     pub fn set_state(&self, state: MenuState) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if let Some(inner) = &self.inner {
             inner.replace_menu(&state);
         }
@@ -666,7 +667,7 @@ impl Tray {
         )
     )]
     pub(crate) fn wait_for_platform_event(&self, timeout: std::time::Duration) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if let Some(inner) = &self.inner {
             inner.pump_events(timeout);
             return;
@@ -750,17 +751,22 @@ fn menu_item_id(generation: u64, index: usize, item: &MenuItemSpec) -> String {
 /// then installs one shared generation-scoped route handler.
 ///
 /// Tests do **not** call this; they use [`Tray::headless`].
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[allow(clippy::needless_pass_by_value)] // `tx` is moved into the click handler closure
 fn build_tray_icon(state: &MenuState, tx: Sender<TrayCommand>) -> Result<TrayInner> {
+    #[cfg(target_os = "macos")]
     use objc2::rc::autoreleasepool;
+    #[cfg(target_os = "macos")]
     use objc2::MainThreadMarker;
+    #[cfg(target_os = "macos")]
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
     use tray_icon::TrayIconBuilder;
 
+    #[cfg(target_os = "macos")]
     let mtm = MainThreadMarker::new().ok_or_else(|| {
         Error::unsupported_platform("macOS tray initialization requires the process main thread")
     })?;
+    #[cfg(target_os = "macos")]
     let application = autoreleasepool(|_| {
         let application = NSApplication::sharedApplication(mtm);
         if !application.setActivationPolicy(NSApplicationActivationPolicy::Accessory) {
@@ -815,6 +821,7 @@ fn build_tray_icon(state: &MenuState, tx: Sender<TrayCommand>) -> Result<TrayInn
     })?;
 
     Ok(TrayInner {
+        #[cfg(target_os = "macos")]
         application,
         tray: std::cell::RefCell::new(tray),
         routes,
@@ -824,7 +831,7 @@ fn build_tray_icon(state: &MenuState, tx: Sender<TrayCommand>) -> Result<TrayInn
 
 /// Build the Cocoa menu for a given generation so initial render and
 /// live replacement share identical `MenuId`s with [`build_routes`].
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn build_macos_menu(state: &MenuState, generation: u64) -> tray_icon::menu::Menu {
     use tray_icon::menu::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem};
 
@@ -849,7 +856,7 @@ fn build_macos_menu(state: &MenuState, generation: u64) -> tray_icon::menu::Menu
     menu
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 impl TrayInner {
     fn replace_menu(&self, state: &MenuState) {
         let next_generation = self
@@ -865,6 +872,31 @@ impl TrayInner {
         self.generation.set(next_generation);
     }
 
+    // Shares the instance-method interface with the macOS event pump.
+    #[cfg(windows)]
+    #[allow(clippy::unused_self)]
+    fn pump_events(&self, timeout: std::time::Duration) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, MsgWaitForMultipleObjects, PeekMessageW, TranslateMessage, PM_REMOVE,
+            QS_ALLINPUT,
+        };
+        unsafe {
+            let mut message = std::mem::zeroed();
+            while PeekMessageW(&raw mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                TranslateMessage(&raw const message);
+                DispatchMessageW(&raw const message);
+            }
+            MsgWaitForMultipleObjects(
+                0,
+                std::ptr::null(),
+                0,
+                u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
+                QS_ALLINPUT,
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn pump_events(&self, timeout: std::time::Duration) {
         use objc2::rc::autoreleasepool;
         use objc2_app_kit::NSEventMask;

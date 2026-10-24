@@ -525,7 +525,11 @@ fn find_contained_library(root: &Path) -> Option<PathBuf> {
         if !is_contained(&platform_root, &platform) {
             continue;
         }
-        for name in ["libwidevinecdm.so", "libwidevinecdm.dylib"] {
+        for name in [
+            "libwidevinecdm.so",
+            "libwidevinecdm.dylib",
+            "widevinecdm.dll",
+        ] {
             let library = platform.join(name);
             let Ok(lib_meta) = fs::symlink_metadata(&library) else {
                 continue;
@@ -673,6 +677,7 @@ fn format_name(format: BinaryFormat) -> &'static str {
     match format {
         BinaryFormat::Elf => "elf",
         BinaryFormat::MachO => "mach_o",
+        BinaryFormat::Pe => "pe",
     }
 }
 

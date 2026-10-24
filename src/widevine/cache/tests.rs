@@ -336,12 +336,13 @@ fn validated_cache_requires_the_requested_platform_layout() {
     for (version, platform, directory) in [
         ("1.0.0", Platform::DarwinAarch64, "mac_arm64"),
         ("2.0.0", Platform::DarwinX86_64, "mac_x64"),
+        ("3.0.0", Platform::WindowsX86_64, "win_x64"),
     ] {
         let cdm = tmp.path().join(version);
         let platform_dir = cdm.join("_platform_specific").join(directory);
         fs::create_dir_all(&platform_dir).expect("platform dir");
         let library = b"non-empty";
-        fs::write(platform_dir.join("libwidevinecdm.dylib"), library).expect("library");
+        fs::write(platform_dir.join(platform_library(platform)), library).expect("library");
         let manifest_body = format!(r#"{{"version":"{version}"}}"#);
         fs::write(cdm.join("manifest.json"), &manifest_body).expect("manifest");
         let cached = CachedCdm::new(version.into(), cdm);
@@ -358,6 +359,7 @@ fn validated_cache_requires_the_requested_platform_layout() {
     assert!(validate_cached_cdm(&linux, Platform::DarwinX86_64).is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn current_in_rejects_absolute_or_symlinked_external_targets() {
     let tmp = TempDir::new().expect("tempdir");
@@ -374,6 +376,7 @@ fn current_in_rejects_absolute_or_symlinked_external_targets() {
     assert!(current_in(tmp.path()).is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn validated_cache_rejects_symlinked_platform_tree() {
     let tmp = TempDir::new().expect("tempdir");
@@ -403,8 +406,10 @@ fn advance_current_creates_symlink_chain() {
     advance_current(tmp.path(), "2.0.0").expect("second");
     let cur2 = current_in(tmp.path()).expect("read").expect("some");
     assert_eq!(cur2.version(), "2.0.0");
-    let prev = std::fs::read_link(tmp.path().join("previous")).expect("read");
-    assert_eq!(prev.file_name().and_then(|s| s.to_str()), Some("1.0.0"));
+    let prev = resolve_cache_link(tmp.path(), "previous")
+        .expect("read")
+        .expect("previous");
+    assert_eq!(prev.version(), "1.0.0");
 }
 
 #[test]
@@ -419,8 +424,10 @@ fn rollback_in_swaps_current_and_previous() {
     let cur = current_in(tmp.path()).expect("read").expect("some");
     assert_eq!(cur.version(), "1.0.0");
     // After rollback, previous now points at 2.0.0.
-    let prev = std::fs::read_link(tmp.path().join("previous")).expect("read");
-    assert_eq!(prev.file_name().and_then(|s| s.to_str()), Some("2.0.0"));
+    let prev = resolve_cache_link(tmp.path(), "previous")
+        .expect("read")
+        .expect("previous");
+    assert_eq!(prev.version(), "2.0.0");
 }
 
 #[test]
@@ -448,11 +455,10 @@ fn cache_rollback_rejects_tampered_previous_version() {
             .version(),
         "2.0.0"
     );
-    let previous_link = fs::read_link(tmp.path().join("previous")).expect("read previous");
-    assert_eq!(
-        previous_link.file_name().and_then(|name| name.to_str()),
-        Some("1.0.0")
-    );
+    let previous = resolve_cache_link(tmp.path(), "previous")
+        .expect("read")
+        .expect("previous");
+    assert_eq!(previous.version(), "1.0.0");
 }
 
 #[test]
@@ -668,7 +674,7 @@ fn ensure_cdm_for_with_reuses_only_vendor_authenticated_cache_bytes() {
 
     assert_eq!(cdm.version(), "1.0.0");
     assert!(cdm.cdm_dir().ends_with("1.0.0"));
-    assert!(tmp.path().join("current").exists());
+    assert!(current_in(tmp.path()).expect("selection").is_some());
 }
 
 #[test]
@@ -1108,7 +1114,39 @@ fn prune_in_with_missing_root_is_noop() {
 #[test]
 fn default_accessors_dont_panic() {
     let _ = default_cache_root();
-    // `prune` calls default_cache_root then short-circuits on missing.
-    let _ = prune(0);
     let _ = current();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_selection_is_a_regular_file_and_rejects_traversal() {
+    let tmp = TempDir::new().expect("tempdir");
+    make_cached_version(tmp.path(), "1.0");
+    advance_current(tmp.path(), "1.0").expect("advance");
+    let path = tmp.path().join("selection.json");
+    assert!(fs::symlink_metadata(&path).expect("metadata").is_file());
+    assert!(!tmp.path().join("current").exists());
+    fs::write(path, br#"{"current":"../outside","previous":null}"#).expect("tamper");
+    assert!(current_in(tmp.path()).is_err());
+}
+
+#[test]
+fn windows_payload_digests_select_the_dll() {
+    use std::io::{Cursor, Write};
+    let mut body = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(Cursor::new(&mut body));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("manifest.json", options).expect("manifest");
+        zip.write_all(b"{}").expect("manifest bytes");
+        zip.start_file("_platform_specific/win_x64/widevinecdm.dll", options)
+            .expect("DLL");
+        zip.write_all(b"MZ-test").expect("DLL bytes");
+        zip.finish().expect("ZIP");
+    }
+    let digests = authenticated_payload_digests_from_zip(&body, Platform::WindowsX86_64)
+        .expect("Windows payload");
+    assert_eq!(digests.library_sha512, download::sha512_hex(b"MZ-test"));
+    assert_eq!(digests.manifest_sha512, download::sha512_hex(b"{}"));
+    assert!(authenticated_payload_digests_from_zip(&body, Platform::LinuxX86_64).is_err());
 }

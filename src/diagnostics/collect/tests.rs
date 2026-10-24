@@ -56,6 +56,8 @@ fn test_platform_dir() -> &'static str {
         } else {
             "mac_x64"
         }
+    } else if cfg!(windows) {
+        "win_x64"
     } else {
         "linux_x64"
     }
@@ -64,6 +66,8 @@ fn test_platform_dir() -> &'static str {
 fn test_library_name() -> &'static str {
     if cfg!(target_os = "macos") {
         "libwidevinecdm.dylib"
+    } else if cfg!(windows) {
+        "widevinecdm.dll"
     } else {
         "libwidevinecdm.so"
     }

@@ -42,9 +42,9 @@ pub struct FilesystemRoots {
     /// macOS: directories whose `*.app` children we'll inspect.
     /// Real default: `/Applications`.
     pub macos_applications: Vec<PathBuf>,
-    /// Linux: directories we'll walk one level deep, looking for
-    /// `chrome-sandbox` / `chromium-sandbox` markers.
-    /// Real default: `/opt`, `/usr/lib`, `/usr/lib64`, `/usr/local/lib`.
+    /// Linux search roots (one level deep); on Windows, installation search
+    /// roots (up to three levels for vendor/Application layouts).
+    /// Windows defaults include Program Files and LocalAppData.
     pub linux_search: Vec<PathBuf>,
     /// Optional chroot-style prefix for known-list path resolution.
     /// `None` in production; `Some(<TempDir>)` in tests.
@@ -56,6 +56,10 @@ impl FilesystemRoots {
     #[must_use]
     pub fn default_for(os: Os) -> Self {
         match os {
+            Os::Windows => Self {
+                linux_search: super::windows::default_roots(),
+                ..Self::default()
+            },
             Os::Macos => Self {
                 macos_applications: vec![PathBuf::from("/Applications")],
                 linux_search: vec![],
@@ -85,6 +89,7 @@ pub fn discover_filesystem(os: Os, roots: &FilesystemRoots) -> Vec<Browser> {
     match os {
         Os::Linux => discover_linux(roots),
         Os::Macos => discover_macos(roots),
+        Os::Windows => super::windows::discover(&roots.linux_search),
     }
 }
 
@@ -281,7 +286,34 @@ impl ProcessSnapshot {
 
     #[must_use]
     fn is_running_under(&self, install: &Path) -> bool {
-        self.executables.iter().any(|exe| exe.starts_with(install))
+        self.executables
+            .iter()
+            .any(|exe| executable_under(exe, install))
+    }
+}
+
+fn executable_under(executable: &Path, install: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        // A missing/locked executable can still have an observable process.
+        // Canonicalize its parent too, so a regular path and a verbatim
+        // Windows installation path remain comparable in that case.
+        let executable = std::fs::canonicalize(executable)
+            .ok()
+            .or_else(|| {
+                Some(
+                    std::fs::canonicalize(executable.parent()?)
+                        .ok()?
+                        .join(executable.file_name()?),
+                )
+            })
+            .unwrap_or_else(|| executable.to_path_buf());
+        let install = std::fs::canonicalize(install).unwrap_or_else(|_| install.to_path_buf());
+        executable.starts_with(install)
+    }
+    #[cfg(not(windows))]
+    {
+        executable.starts_with(install)
     }
 }
 
@@ -299,7 +331,7 @@ pub fn is_running(browser: &Browser) -> bool {
         .processes()
         .values()
         .filter_map(sysinfo::Process::exe)
-        .any(|executable| executable.starts_with(browser.install_path()))
+        .any(|executable| executable_under(executable, browser.install_path()))
 }
 
 #[cfg(test)]
@@ -340,6 +372,7 @@ mod tests {
         assert_eq!(found[0].kind, BrowserKind::Detected);
     }
 
+    #[cfg(unix)]
     #[test]
     fn linux_discovery_deduplicates_alias_roots_and_preserves_first_path() {
         let tmp = TempDir::new().expect("tempdir");
@@ -362,6 +395,7 @@ mod tests {
         assert_eq!(found[0].install_path, alias.join("chromium"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn linux_discovery_follows_browser_directory_symlinks() {
         let tmp = TempDir::new().expect("tempdir");

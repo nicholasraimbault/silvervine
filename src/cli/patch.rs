@@ -287,7 +287,9 @@ pub fn run_privileged(args: &PrivilegedArgs) -> Result<()> {
 mod tests {
     use super::*;
     use crate::browsers::BrowserKind;
-    use crate::test_support::{default_hook_path, write_executable_script, ScopedEnv};
+    use crate::test_support::ScopedEnv;
+    #[cfg(unix)]
+    use crate::test_support::{default_hook_path, write_executable_script};
     use std::cell::RefCell;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -416,6 +418,8 @@ mod tests {
             } else {
                 "mac_x64"
             }
+        } else if cfg!(windows) {
+            "win_x64"
         } else {
             "linux_x64"
         }
@@ -424,6 +428,8 @@ mod tests {
     fn test_library_name() -> &'static str {
         if cfg!(target_os = "macos") {
             "libwidevinecdm.dylib"
+        } else if cfg!(windows) {
+            "widevinecdm.dll"
         } else {
             "libwidevinecdm.so"
         }

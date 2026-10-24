@@ -5,6 +5,7 @@
 //! `launchctl bootstrap gui/<uid>`. On Linux it writes a `systemd --user`
 //! service unit into `~/.config/systemd/user/silvervine.service` and enables it
 //! via `systemctl --user enable --now`.
+//! Windows uses a per-user Startup shortcut and a hidden detached restart helper.
 //!
 //! Both impls are user-domain only — no `sudo`/`pkexec` required. The
 //! `register()` / `unregister()` functions are idempotent: re-registering
@@ -224,6 +225,11 @@ fn noop_enabled() -> bool {
     std::env::var_os(NOOP_ENV).is_some()
 }
 
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows as imp;
+
 #[cfg(target_os = "linux")]
 mod linux;
 
@@ -236,7 +242,7 @@ use linux as imp;
 #[cfg(target_os = "macos")]
 use macos as imp;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod imp {
     //! Stub for unsupported platforms.
 
@@ -350,6 +356,7 @@ mod tests {
     /// `is_registered()` returns `true` when the unit file exists at the
     /// expected path, `false` otherwise. Exercised under non-NOOP env so
     /// the underlying `registration_path()` -> `is_file()` plumbing runs.
+    #[cfg(unix)]
     #[test]
     fn is_registered_reflects_file_presence() {
         let _guard = crate::test_support::env_lock();

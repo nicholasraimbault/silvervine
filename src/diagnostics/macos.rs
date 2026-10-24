@@ -481,7 +481,7 @@ pub fn fourcc_label(fourcc: &str) -> &'static str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt as _;
