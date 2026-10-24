@@ -80,6 +80,10 @@ All sections are optional. The default file locations are:
 | macOS | `~/Library/Application Support/silvervine/config.toml` |
 | Windows | `%APPDATA%\silvervine\config.toml` |
 
+On Windows, explicit absolute `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` values override
+Silvervine's data locations. They do not relocate browser profiles or the user
+Startup folder.
+
 ```toml
 [notifications]
 on_success = true

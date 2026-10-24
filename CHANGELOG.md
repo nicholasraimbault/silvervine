@@ -36,7 +36,8 @@ required before 2.3 stable.
 ### Fixed
 
 - Windows self-updates make the mapped executable's filename replaceable,
-  restore the previous binary after failed or no-op installation, and restart
+  require a receipt matching that installation, restore the previous binary and
+  receipt after failed or no-op installation, and restart
   the registered daemon after a manual update.
 - Treat Windows lock contention as a skipped busy lock rather than an I/O failure.
 - Preserve authenticated ZIP read/expansion failures as invalid bundle structure.
@@ -48,6 +49,8 @@ required before 2.3 stable.
 - Include Windows in dependency auditing. Three documented temporary exceptions
   cover D-Bus unmaintained-package notices only, pending tray/notification
   upstream migration; review by 2027-01-23. Vulnerability checks remain enforced.
+- Reject case-alias duplicate ZIP outputs and Unicode Windows device-name aliases
+  before extraction or authenticated payload selection.
 
 ### Changed
 

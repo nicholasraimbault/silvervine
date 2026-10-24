@@ -119,7 +119,16 @@ fn run_with(
         return Ok(outcome);
     }
 
-    let captured = invoke_sidecar(&sidecar, args.channel.unwrap_or_default())?;
+    #[cfg(windows)]
+    let transaction = windows::ExecutableSwap::prepare(&receipt)?;
+    let result = invoke_sidecar(&sidecar, args.channel.unwrap_or_default());
+    #[cfg(windows)]
+    transaction.finish(
+        result
+            .as_ref()
+            .is_ok_and(|text| sidecar_performed_install(text)),
+    )?;
+    let captured = result?;
     let outcome = outcome_from_sidecar(&captured);
     render(args, &outcome, &captured, out)?;
     Ok(outcome)
@@ -278,19 +287,6 @@ fn default_receipt_home() -> Option<PathBuf> {
 }
 
 fn invoke_sidecar(sidecar: &Path, channel: UpdateChannel) -> Result<String> {
-    #[cfg(windows)]
-    let executable = windows::ExecutableSwap::prepare()?;
-    let result = capture_sidecar(sidecar, channel);
-    #[cfg(windows)]
-    executable.finish(
-        result
-            .as_ref()
-            .is_ok_and(|text| sidecar_performed_install(text)),
-    )?;
-    result
-}
-
-fn capture_sidecar(sidecar: &Path, channel: UpdateChannel) -> Result<String> {
     let output = spawn_sidecar(sidecar, channel)?;
     let captured = combine_captured(&output.stdout, &output.stderr);
     if output.status.success() {

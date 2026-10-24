@@ -16,10 +16,13 @@ pub(super) struct ExecutableSwap {
     original: PathBuf,
     backup: PathBuf,
     directory: Option<tempfile::TempDir>,
+    receipt_path: PathBuf,
+    receipt_bytes: Vec<u8>,
 }
 
 impl ExecutableSwap {
-    pub(super) fn prepare() -> Result<Self> {
+    pub(super) fn prepare(receipt_path: &std::path::Path) -> Result<Self> {
+        use std::io::Read;
         let original = std::env::current_exe()?.canonicalize()?;
         if !original
             .file_name()
@@ -28,6 +31,37 @@ impl ExecutableSwap {
             return Err(Error::other(
                 "Run the installed silvervine.exe to update on Windows",
             ));
+        }
+        let mut receipt_bytes = Vec::new();
+        std::fs::File::open(receipt_path)?
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut receipt_bytes)?;
+        if receipt_bytes.len() > 1024 * 1024 {
+            return Err(Error::other("Install receipt exceeds 1 MiB"));
+        }
+        let receipt: serde_json::Value = serde_json::from_slice(&receipt_bytes)?;
+        let prefix = receipt
+            .get("install_prefix")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| {
+                Error::other("Install receipt has no absolute install prefix; re-run the installer")
+            })?;
+        let installed = match receipt
+            .get("install_layout")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("cargo-home") => prefix.join("bin/silvervine.exe"),
+            Some("flat") => prefix.join("silvervine.exe"),
+            _ => {
+                return Err(Error::other(
+                    "Unrecognized Windows install receipt layout; re-run the installer",
+                ));
+            }
+        };
+        if installed.canonicalize()? != original {
+            return Err(Error::other("Install receipt belongs to a different Silvervine executable; run that installation or re-run the installer"));
         }
         let parent = original
             .parent()
@@ -42,6 +76,8 @@ impl ExecutableSwap {
             original,
             backup,
             directory: Some(directory),
+            receipt_path: receipt_path.to_path_buf(),
+            receipt_bytes,
         })
     }
 
@@ -80,6 +116,11 @@ impl ExecutableSwap {
             )));
         }
         self.directory.take();
+        if std::fs::read(&self.receipt_path).ok().as_deref() != Some(self.receipt_bytes.as_slice())
+        {
+            crate::platform::atomic_write(&self.receipt_path, &self.receipt_bytes)
+                .map_err(|error| error.with_context("Executable restored, but install receipt could not be restored; re-run the installer"))?;
+        }
         Ok(())
     }
 }

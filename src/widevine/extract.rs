@@ -262,7 +262,7 @@ fn validate_archive_metadata(archive: &mut zip::ZipArchive<std::io::Cursor<&[u8]
             Error::unknown_bundle_structure(format!("zip entry {index}")).with_source(error)
         })?;
         let rel = validate_zip_entry_metadata(&entry, &mut declared_total)?;
-        if !output_paths.insert(rel) {
+        if !output_paths.insert(zip_output_key(&rel)) {
             return Err(Error::unknown_bundle_structure(format!(
                 "CRX3 ZIP contains duplicate normalized output path {}",
                 entry.name().unwrap_or_default()
@@ -378,6 +378,14 @@ pub(super) fn normalized_zip_entry_path<R: Read + ?Sized>(
     let name = entry.name().map_err(|error| {
         Error::unknown_bundle_structure("ZIP entry name could not be decoded").with_source(error)
     })?;
+    // Widevine package paths are ASCII. Reject Windows device-name Unicode
+    // aliases as well as ordinary names that Win32 maps to the same file.
+    #[cfg(windows)]
+    if !name.is_ascii() {
+        return Err(Error::unknown_bundle_structure(
+            "non-ASCII Windows ZIP entry path",
+        ));
+    }
     #[cfg(windows)]
     for segment in name.split(['/', '\\']) {
         let stem = segment.split('.').next().unwrap_or("").to_ascii_uppercase();
@@ -421,6 +429,17 @@ pub(super) fn normalized_zip_entry_path<R: Read + ?Sized>(
         )));
     }
     Ok(normalized)
+}
+
+pub(super) fn zip_output_key(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        path.as_os_str().to_ascii_lowercase().into()
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
 }
 
 /// Reject unsupported entry kinds, normalize its output path, and accumulate
@@ -1065,7 +1084,13 @@ mod windows_path_tests {
     use super::*;
     #[test]
     fn rejects_windows_device_and_stream_paths() {
-        for name in ["NUL", "dir/COM1.dll", "file:stream", "dir/trailing."] {
+        for name in [
+            "NUL",
+            "dir/COM1.dll",
+            "dir/COM¹.dll",
+            "file:stream",
+            "dir/trailing.",
+        ] {
             let mut bytes = Vec::new();
             {
                 let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
@@ -1079,5 +1104,18 @@ mod windows_path_tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_case_aliases_before_extraction() {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for name in ["manifest.json", "MANIFEST.JSON"] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"payload").unwrap();
+        }
+        let bytes = zip.finish().unwrap().into_inner();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+        assert!(validate_archive_metadata(&mut archive).is_err());
     }
 }

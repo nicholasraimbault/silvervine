@@ -695,7 +695,7 @@ fn authenticated_payload_digests_from_zip(
             Error::unknown_bundle_structure(format!("zip entry {index}")).with_source(error)
         })?;
         let rel = extract::validate_zip_entry_metadata(&entry, &mut declared_total)?;
-        if !archive_paths.insert(rel) {
+        if !archive_paths.insert(extract::zip_output_key(&rel)) {
             return Err(Error::unknown_bundle_structure(format!(
                 "CRX3 contains duplicate normalized ZIP path {}",
                 entry.name().unwrap_or_default()

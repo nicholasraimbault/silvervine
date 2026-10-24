@@ -28,6 +28,10 @@ silvervine status
 silvervine tui
 ```
 
+When re-running the installer over an existing Windows installation, first quit
+Silvervine from its tray menu and close any TUI sessions. Normal `update self`
+handles a running executable and restarts a registered daemon itself.
+
 If the command is not found, try:
 
 ```powershell
