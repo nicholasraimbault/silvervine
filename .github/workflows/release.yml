@@ -175,7 +175,7 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2
         with:
           # deny.toml restricts the graph to the Linux/macOS release targets,
           # so Windows-only transitive dependencies do not create false
